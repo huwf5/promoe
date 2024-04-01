@@ -5,6 +5,7 @@ from accelerate.hooks import AlignDevicesHook, SequentialHook, ModelHook
 from accelerate.utils import set_module_tensor_to_device
 from torch.nn import Module
 from expert_selection_tracer.call_tracer import report_called
+from collections import OrderedDict
 
 def _handle_acc_hook_offload(hook):
   if hasattr(hook, "_old_offload"):
@@ -39,6 +40,20 @@ def recursively_replace_pre_forward(module):
     recursively_replace_pre_forward(m)
 
 
+class LRUPolicy:
+  def __init__(self):
+    # from old to new
+    self.last_use_order = OrderedDict()
+    pass
+  def _choose_to_evict(self):
+    return next(iter(self.last_use_order))
+  def _evict(self, key):
+    self.last_use_order.pop(key)
+  def _access(self, key):
+    if key in self.last_use_order:
+      self.last_use_order.move_to_end(key)
+    else:
+      self.last_use_order[key] = None
 
 '''
 Currently supports single device
@@ -46,7 +61,7 @@ Currently supports single device
 
 class ExpertCacheMngr:
   _inst = None
-  
+
   @staticmethod
   def set(o) :
     ExpertCacheMngr._inst = o
@@ -61,20 +76,22 @@ class ExpertCacheMngr:
     self.cached_map = {}
     self.cache_len = cache_len
     self.exec_device = exec_device
+    self.policy = LRUPolicy()
   def get(self, key : str) -> None:
     if key in self.cached_map:
-      self._on_hit(key)
-      return
-    self._on_miss(key)
+      self._handle_hit(key)
+    else:
+      self._handle_miss(key)
+    self._access(key)
 
 
   def _locate_key_to_evict(self) -> str:
-    # todo: remove correct entry
-    return list(self.cached_map.keys())[0]
+    return self.policy._choose_to_evict()
 
   def _evict(self, key, _) -> None:
     module = self.module_map[key]
     self.cached_map.pop(key)
+    self.policy._evict(key)
     for name, _ in module.named_parameters():
       set_module_tensor_to_device(module, name, "meta")
 
@@ -82,10 +99,13 @@ class ExpertCacheMngr:
     for k in self.cached_map.keys():
       self._evict(k, self.cached_map[k])
 
-  def _on_hit(self, key: str)-> None:
+  def _access(self, key: str) -> None:
+    self.policy._access(key)
+
+  def _handle_hit(self, key: str)-> None:
     pass
 
-  def _on_miss(self, key : str) -> None:
+  def _handle_miss(self, key : str) -> None:
     module = self.module_map[key]
     weights_map = self.hook_map[key].weights_map
     if len(self.cached_map) >= self.cache_len:
