@@ -1,6 +1,11 @@
+from bisect import bisect
 from dataclasses import dataclass
-import heapq
 import json
+from math import inf
+import os
+import tqdm
+
+from sortedcontainers import SortedList
 
 @dataclass
 class Config:
@@ -34,12 +39,12 @@ def meta_to_module_key(config: Config, moe_layer_id, e_id, fc):
   else:
     e_or_d_str = "decoder"
   layer_id = config.moe_layer_id_to_full_layer_id(moe_layer_id)
-  return f'model.{e_or_d_str}.layers.{layer_id}.ffn.experts.expert_{e_id}.fc{fc}.',
+  return f'model.{e_or_d_str}.layers.{layer_id}.ffn.experts.expert_{e_id}.fc{fc+1}.'
 
 def record_one_seq_time_key(seq_id, key, time):
   print(seq_id, time, key)
 
-def traverse_one_seq_time(j, seq_id, config: Config):
+def traverse_one_seq_time(j, seq_id, config: Config, recorder):
   seq_time = 0
 
   for encoder_moe_layer_id in range(config.num_encoder_moe_layer()):
@@ -53,7 +58,7 @@ def traverse_one_seq_time(j, seq_id, config: Config):
       for fc in range(config.n_fc):
         # time = (encoder_moe_layer_id, prompt_token_idx, eid, fc)
         key = meta_to_module_key(config, encoder_moe_layer_id, eid, fc)
-        record_one_seq_time_key(seq_id, key, seq_time)
+        recorder(seq_id, key, seq_time)
         seq_time += 1
 
   for rply_token_idx in range(get_rply_len(j, seq_id, config)):
@@ -62,7 +67,7 @@ def traverse_one_seq_time(j, seq_id, config: Config):
         for fc in range(config.n_fc):
           # time = (rply_token_idx, decoder_moe_layer_id, eid, fc)
           key = meta_to_module_key(config, decoder_moe_layer_id, eid, fc)
-          record_one_seq_time_key(seq_id, key, seq_time)
+          recorder(seq_id, key, seq_time)
           seq_time += 1
 
 
@@ -70,3 +75,86 @@ def traverse_one_seq_time(j, seq_id, config: Config):
 def get_rply_len(j, seq_id, config : Config):
   return len(j[seq_id][str(config.num_encoder_moe_layer())])
 
+class OraclePolicy:
+  @staticmethod
+  def tqdm_wrapper(o):
+    if 'DISABLE_MOE_CACHE_TQDM' in os.environ:
+      return o
+    else:
+      return tqdm.tqdm(o)
+  def __init__(self) -> None:
+
+    self.next_use_time_map = {}
+    self.cur_time = 0
+    self.cur_seq_id = None
+
+    # list of tuple(next_use_time, key)
+    self.next_use_time_queue = SortedList()
+
+  def set_cur_seq_id(self, seq_id):
+    self.cur_seq_id = seq_id
+    self.cur_time = -1
+    self.next_use_time_queue.clear()
+    for key in self.next_use_time_map:
+      self.next_use_time_map[key] = self._find_next_use_time(key, -1)
+      self.next_use_time_queue.add((self.next_use_time_map[key], key))
+
+  def load_expert_trace(self, fname):
+    with open(fname) as f:
+      self.original_expert_history = json.load(f)
+    if "nllb" in fname:
+      self.config = nllb_config
+    else:
+      raise RuntimeError("Unimplemented")
+    self.module_use_time = {}
+    def recorder(seq_id, key, time):
+      if seq_id not in self.module_use_time:
+        self.module_use_time[seq_id] = {}
+      if key not in self.module_use_time[seq_id]:
+        self.module_use_time[seq_id][key] = []
+      self.module_use_time[seq_id][key].append(time)
+    for seq_id in self.tqdm_wrapper(self.original_expert_history):
+      traverse_one_seq_time(self.original_expert_history, seq_id, self.config, recorder)
+
+  def _choose_to_evict(self):
+    item = self.next_use_time_queue[-1]
+    return item[1]
+
+  def _evict(self, key):
+    assert(self._choose_to_evict() == key)
+    self.next_use_time_queue.pop(-1)
+    self.next_use_time_map.pop(key)
+
+  def _find_next_use_time(self, key, cur_time):
+    if key not in self.module_use_time[self.cur_seq_id]:
+      return inf
+    history_time = self.module_use_time[self.cur_seq_id][key]
+    idx = bisect(history_time, cur_time)
+    assert(idx == len(history_time) or history_time[idx] > cur_time)
+    assert(idx == 0 or history_time[idx - 1] <= cur_time)
+    if idx == len(history_time):
+      return inf
+    else:
+      return history_time[idx]
+
+  def _access(self, key):
+    # self.cur_time = self._find_next_use_time(key, self.cur_time)
+    if key in self.next_use_time_map:
+      # is in cache, hit
+      # must be the nearest one
+      assert(self.next_use_time_queue[0][0] == self.cur_time)
+      assert(self.next_use_time_queue[0][1] == key)
+
+      self.cur_time = self.next_use_time_map[key]
+
+      next_use_time = self._find_next_use_time(key, self.cur_time)
+
+      self.next_use_time_map[key] = next_use_time
+      self.next_use_time_queue.pop(0)
+      self.next_use_time_queue.add((next_use_time, key))
+    else:
+      assert(self.cur_time + 1 == self._find_next_use_time(key, self.cur_time))
+      self.cur_time = self._find_next_use_time(key, self.cur_time)
+      next_use_time = self._find_next_use_time(key, self.cur_time)
+      self.next_use_time_map[key] = next_use_time
+      self.next_use_time_queue.add((next_use_time, key))
