@@ -138,11 +138,10 @@ class OraclePolicy:
       return history_time[idx]
 
   def _access(self, key):
-    # self.cur_time = self._find_next_use_time(key, self.cur_time)
     if key in self.next_use_time_map:
       # is in cache, hit
       # must be the nearest one
-      assert(self.next_use_time_queue[0][0] == self.cur_time)
+      assert(self.next_use_time_queue[0][0] == self.cur_time + 1)
       assert(self.next_use_time_queue[0][1] == key)
 
       self.cur_time = self.next_use_time_map[key]
@@ -158,3 +157,7 @@ class OraclePolicy:
       next_use_time = self._find_next_use_time(key, self.cur_time)
       self.next_use_time_map[key] = next_use_time
       self.next_use_time_queue.add((next_use_time, key))
+
+  def clear(self):
+    self.next_use_time_map.clear()
+    self.next_use_time_queue.clear()

@@ -27,17 +27,33 @@ def _replace_one_hook_offload(hook: AlignDevicesHook, module):
     ExpertCacheMngr.inst().hook_map[hook.weights_map.prefix] = hook
     module._hf_hook = SequentialHook(module._hf_hook, CacheOffloadHook(hook.weights_map))
 
-def recursively_replace_pre_forward(module):
-  if hasattr(module, "_hf_hook"):
-    if isinstance(module._hf_hook, AlignDevicesHook):
-      _replace_one_hook_offload(module._hf_hook, module)
-    elif isinstance(module._hf_hook, SequentialHook):
-      for hook in module._hf_hook.hooks:
-        if isinstance(hook, AlignDevicesHook):
-          _replace_one_hook_offload(hook, module)
-  for n,m in module.named_modules():
+# def recursively_replace_pre_forward(module):
+#   did_replace = False
+#   if hasattr(module, "_hf_hook"):
+#     if isinstance(module._hf_hook, AlignDevicesHook):
+#       did_replace = _replace_one_hook_offload(module._hf_hook, module) or did_replace
+#     elif isinstance(module._hf_hook, SequentialHook):
+#       for hook in module._hf_hook.hooks:
+#         if isinstance(hook, AlignDevicesHook):
+#           did_replace = _replace_one_hook_offload(hook, module) or did_replace
+#   for n,m in module.named_modules():
+#     if n == "": continue
+#     did_replace = recursively_replace_pre_forward(m) or did_replace
+#     if did_replace:
+#       print(n)
+#   return did_replace
+
+def replace_pre_forward(model):
+  # fixed: named_module is already recursive
+  for n,module in model.named_modules():
     if n == "": continue
-    recursively_replace_pre_forward(m)
+    if hasattr(module, "_hf_hook"):
+      if isinstance(module._hf_hook, AlignDevicesHook):
+        _replace_one_hook_offload(module._hf_hook, module)
+      elif isinstance(module._hf_hook, SequentialHook):
+        for hook in module._hf_hook.hooks:
+          if isinstance(hook, AlignDevicesHook):
+            _replace_one_hook_offload(hook, module)
 
 
 class LRUPolicy:
@@ -54,6 +70,8 @@ class LRUPolicy:
       self.last_use_order.move_to_end(key)
     else:
       self.last_use_order[key] = None
+  def clear(self):
+    self.last_use_order.clear()
 
 '''
 Currently supports single device
@@ -70,13 +88,13 @@ class ExpertCacheMngr:
   def inst():
     return ExpertCacheMngr._inst
 
-  def __init__(self, cache_len = 24, exec_device = 0):
+  def __init__(self, cache_len = 24, exec_device = 0, policy_cls = LRUPolicy):
     self.module_map = {}
     self.hook_map = {}
     self.cached_map = {}
     self.cache_len = cache_len
     self.exec_device = exec_device
-    self.policy = LRUPolicy()
+    self.policy = policy_cls()
   def get(self, key : str) -> None:
     if key in self.cached_map:
       self._handle_hit(key)
@@ -95,9 +113,13 @@ class ExpertCacheMngr:
     for name, _ in module.named_parameters():
       set_module_tensor_to_device(module, name, "meta")
 
-  def clear_cache(self) -> None:
-    for k in self.cached_map.keys():
-      self._evict(k, self.cached_map[k])
+  def clear_cache(self, simulate_evict = False) -> None:
+    if simulate_evict:
+      while len(self.cached_map) > 0:
+        self._evict(self._locate_key_to_evict())
+    else:
+      self.cached_map.clear()
+      self.policy.clear()
 
   def _access(self, key: str) -> None:
     self.policy._access(key)
