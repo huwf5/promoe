@@ -91,7 +91,7 @@ class ExpertCacheMngr:
   def __init__(self, cache_len = 24, exec_device = 0, policy_cls = LRUPolicy):
     self.module_map = {}
     self.hook_map = {}
-    self.cached_map = {}
+    self.cached_map : dict[str, any] = {}
     self.cache_len = cache_len
     self.exec_device = exec_device
     self.policy = policy_cls()
