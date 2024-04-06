@@ -38,14 +38,14 @@ class UntypedBuffer:
   @staticmethod
   def record_possible_len(module: torch.nn.Module):
     UntypedBuffer.max_len = max(UntypedBuffer.max_len, UntypedBuffer.required_len(module))
-  
+
   def separate_by(self, module: torch.nn.Module) -> dict[str, torch.Tensor]:
     storage = self.buffer.storage().untyped()
     tensors = {}
     for n, p in module.named_parameters():
-      t = torch.tensor(storage, dtype=p.dtype, device=storage.device)
+      t = torch.empty((0), dtype=p.dtype, device=storage.device)
       offset_in_bytes = UntypedBuffer.cls_to_name_to_offset[type(module)][n]
-      offset_in_nelem = offset_in_bytes // t.element_size()
+      offset_in_nelem = offset_in_bytes // p.element_size()
       t.set_(source=storage,
              storage_offset = offset_in_nelem,
              size=p.size(),
