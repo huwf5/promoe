@@ -29,6 +29,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     .def("init_gpu_mem_buffer", &PrefetchMngr::init_gpu_mem_buffer)
     .def("wait_and_lock_expert", &PrefetchMngr::wait_and_lock_expert)
     .def("try_release_expert", &PrefetchMngr::try_release_expert)
+    .def("try_release_expert_in_layer", &PrefetchMngr::try_release_expert_in_layer)
     .def("add_one_layer_task", &PrefetchMngr::add_one_layer_task)
     .def("preempt_one_layer", &PrefetchMngr::preempt_one_layer)
   ;

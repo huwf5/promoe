@@ -1,7 +1,7 @@
 #include "prefetcher.hpp"
 #include "logging.hpp"
 
-void PrefetchMngr::preempt_one_layer_(int layer_idx, int *expert_idxs,
+void PrefetchMngr::preempt_one_layer_(int layer_idx, int64_t *expert_idxs,
                                       size_t num_expert) {
   {
     int prev_layer_idx = (layer_idx + 1) % metas->num_layer;
@@ -62,7 +62,7 @@ void PrefetchMngr::preempt_one_layer_(int layer_idx, int *expert_idxs,
   }
   unlock_queue();
 }
-void PrefetchMngr::add_one_layer_task_(int layer_idx, int *expert_idxs,
+void PrefetchMngr::add_one_layer_task_(int layer_idx, int64_t *expert_idxs,
                                        size_t num_expert) {
   CHECK(per_layer_job_queues[layer_idx].empty());
   for (int i = 0; i < num_expert; i++) {
@@ -174,10 +174,10 @@ void PrefetchMngr::init_gpu_mem_buffer(size_t num_buffers) {
   }
 }
 void PrefetchMngr::add_one_layer_task(int layer_idx, torch::Tensor experts) {
-  add_one_layer_task_(layer_idx, experts.data_ptr<int>(), experts.size(0));
+  add_one_layer_task_(layer_idx, experts.data_ptr<int64_t>(), experts.size(0));
 }
 void PrefetchMngr::preempt_one_layer(int layer_idx, torch::Tensor experts) {
-  preempt_one_layer_(layer_idx, experts.data_ptr<int>(), experts.size(0));
+  preempt_one_layer_(layer_idx, experts.data_ptr<int64_t>(), experts.size(0));
 }
 void PrefetchMngr::wait_and_lock_expert(int layer_id, int expert_id) {
   LOG(DEBUG) << "try locking expert " << layer_id << "." << expert_id;
@@ -188,6 +188,12 @@ void PrefetchMngr::wait_and_lock_expert(int layer_id, int expert_id) {
 void PrefetchMngr::try_release_expert(int layer_id, int expert_id) {
   model_loader->get_source(layer_id, expert_id)
       ->expert_status.try_unlock(kUsing, kReady);
+}
+void PrefetchMngr::try_release_expert_in_layer(int layer_id) {
+  for (int expert_id = 0; expert_id < metas->num_expert; expert_id++) {
+  model_loader->get_source(layer_id, expert_id)
+      ->expert_status.try_unlock(kUsing, kReady);
+  }
 }
 void PrefetchMngr::launch_prefetch_thread() {
   prefetch_thread = std::thread([this]() { this->thread_func(); });

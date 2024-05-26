@@ -68,9 +68,9 @@ class PrefetchMngr {
     queue_lock.unlock();
   }
 
-  void preempt_one_layer_(int layer_idx, int *expert_idxs, size_t num_expert);
+  void preempt_one_layer_(int layer_idx, int64_t *expert_idxs, size_t num_expert);
 
-  void add_one_layer_task_(int layer_idx, int *expert_idxs, size_t num_expert);
+  void add_one_layer_task_(int layer_idx, int64_t *expert_idxs, size_t num_expert);
 
 public:
   PrefetchMngr(std::shared_ptr<ModuleMeta> metas,
@@ -82,6 +82,7 @@ public:
 
   void wait_and_lock_expert(int layer_id, int expert_id);
   void try_release_expert(int layer_id, int expert_id);
+  void try_release_expert_in_layer(int layer_id);
 
   void launch_prefetch_thread();
 };
