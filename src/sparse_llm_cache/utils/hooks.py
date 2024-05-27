@@ -169,6 +169,55 @@ def remove_hook_from_module(module: torch.nn.Module, recurse=False):
 
     return module
 
+class ExpertHook(ModelHook):
+  def __init__(self, prefetch_mngr):
+    self.prefetch_mngr = prefetch_mngr
+    pass
+  # def init_hook(self, module):
+  #   return super().init_hook(module)
+  def pre_forward(self, module, *args, **kwargs):
+    # self.prefetch_mngr.add_one_layer_task(module._layer_id, torch.asarray([module._expert_id], dtype=torch.int32))
+    self.prefetch_mngr.wait_and_lock_expert(module._layer_id, module._expert_id)
+
+    # fixme: point all expert param to the same cuda tensor to eliminate this overhead
+    # def update_child_param(child_module, child_name, match):
+    #   for n,_ in child_module.named_parameters():
+    #     child_module._parameters[n] = model_loader.ref_one_expert_param(module._layer_id, module._expert_id, child_name + '.' + n)
+    # recursive_traverse_childrens_leaf_only(module, update_child_param)
+    return args, kwargs
+  # def post_forward(self, module, output):
+  #   return output
+  # def detach_hook(self, module):
+  #   return super().detach_hook(module)
+
+# class GateHook(hooks.ModelHook):
+#   def __init__(self):
+#     pass
+#   # def init_hook(self, module):
+#   #   return super().init_hook(module)
+#   # def pre_forward(self, module, *args, **kwargs):
+#   #   return args, kwargs
+#   # def post_forward(self, module, output):
+#   #   return output
+#   # def detach_hook(self, module):
+#   #   return super().detach_hook(module)
+
+# class SharedExpertHook(hooks.ModelHook):
+#   def __init__(self, num_moe_layer, num_expert):
+#     self.num_moe_layer = num_moe_layer
+#     self.num_expert = num_expert
+#   # def init_hook(self, module):
+#   #   return super().init_hook(module)
+#   def pre_forward(self, module, *args, **kwargs):
+#     pre_layer_id = (module._layer_id + 1) % self.num_moe_layer
+#     for e in range(self.num_expert):
+#       prefetch_mngr.try_release_expert(pre_layer_id, e)
+#     return args, kwargs
+#   # def post_forward(self, module, output):
+#   #   return output
+#   # def detach_hook(self, module):
+#   #   return super().detach_hook(module)
+
 # from functools import wraps
 
 # class Hook:
