@@ -119,7 +119,12 @@ void PrefetchMngr::do_one_task(PrefetchTask *task) {
       task->expert->gpu_data->mem_buffers[task->mem_buf_idx].ptr(),
       task->expert->host_data.mem_buffers[task->mem_buf_idx].ptr(),
       task->expert->host_data.mem_buffers[task->mem_buf_idx].len(),
-      cudaMemcpyHostToDevice, this->stream))
+      cudaMemcpyHostToDevice, this->stream));
+  {
+    auto gpu_tensor = task->expert->gpu_data->mem_buffers[task->mem_buf_idx].get_tensor();
+    auto expert_param = task->expert->reference_to_model_param.mem_buffers[task->mem_buf_idx].get_tensor();
+    expert_param.set_(gpu_tensor, 0, gpu_tensor.sizes(), gpu_tensor.strides());
+  }
   if (task->mem_buf_idx == metas->num_per_expert_param - 1) {
     // for (int i = 0; i < metas->num_per_expert_param; i++) {
     //   task->expert->expert_module->register_parameter(

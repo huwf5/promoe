@@ -32,6 +32,7 @@ class ExpertHandler {
  public:
   // std::shared_ptr<torch::nn::Module> expert_module;
   ExpertMemHanlder host_data;
+  ExpertMemHanlder reference_to_model_param;
   ExpertMemHanlder* gpu_data = nullptr;
   int layer_idx, expert_idx;
   // SpinLock lock;
@@ -68,26 +69,14 @@ class ModelLoader {
   void add_one_expert_param(torch::Tensor param, int layer_id, int expert_id, std::string param_name) {
     return add_one_expert_param(param, layer_id, expert_id, metas->param_name_to_id[param_name]);
   }
-  void add_one_expert_param(torch::Tensor param, int layer_id, int expert_id, int param_id) {
-    ExpertHandler* expert_handler = nullptr;
-    if (param_id == 0) {
-      expert_handler = new ExpertHandler();
-      expert_handler->expert_idx = expert_id;
-      expert_handler->layer_idx = layer_id;
-      expert_handler->host_data.mem_buffers.resize(metas->num_per_expert_param);
-      source_list[metas->squeeze_expert_idx(layer_id, expert_id)] = expert_handler;
-    } else {
-      expert_handler = source_list[metas->squeeze_expert_idx(layer_id, expert_id)];
-    }
-    // expert_handler->host_data.mem_buffers[param_id].set_tensor(param.pin_memory());
-    expert_handler->host_data.mem_buffers[param_id].set_tensor(param);
-  }
+  void add_one_expert_param(torch::Tensor param, int layer_id, int expert_id, int param_id);
   torch::Tensor ref_one_expert_param(int layer_id, int expert_id, std::string param_name) {
     return ref_one_expert_param(layer_id, expert_id, metas->param_name_to_id[param_name]);
   }
   torch::Tensor ref_one_expert_param(int layer_id, int expert_id, int param_id) {
-    return source_list[metas->squeeze_expert_idx(layer_id, expert_id)]->gpu_data->mem_buffers[param_id].get_tensor();
+    return source_list[metas->squeeze_expert_idx(layer_id, expert_id)]->reference_to_model_param.mem_buffers[param_id].get_tensor();
   }
+  void pin_memory();
   ExpertHandler* get_source(int layer_id, int expert_id) {
     return source_list[metas->squeeze_expert_idx(layer_id, expert_id)];
   }
