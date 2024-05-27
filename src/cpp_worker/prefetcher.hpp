@@ -47,6 +47,7 @@ class PrefetchMngr {
   std::shared_ptr<ModuleMeta> metas;
   std::shared_ptr<ModelLoader> model_loader;
   std::vector<Queue> per_layer_job_queues; // the fetching thread takes out the first task from queue, then execute it.
+  Queue precise_job_queue;
   std::vector<std::unordered_map<int, ExpertHandler*>> prefetched_experts; // the ongoing job also lives in here.
   std::thread prefetch_thread;
   std::vector<ExpertMemHanlder*> unused_mems;
@@ -56,7 +57,7 @@ class PrefetchMngr {
   PrefetchTask previous_task;
   // ExpertHandler * previous_task = nullptr;
 
-  void add_tasks_for_one_expert(int layer_idx, int exper_idx,
+  void add_tasks_for_one_expert(int layer_idx, int exper_idx, Queue* queue,
                                 int starting_mem_buffer = 0);
 
   void thread_func();

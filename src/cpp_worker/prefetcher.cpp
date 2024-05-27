@@ -26,7 +26,7 @@ void PrefetchMngr::preempt_one_layer_(int layer_idx, int64_t *expert_idxs,
         continue;
       }
       LOG(DEBUG) << "preempting one layer " << layer_idx << ", add task for [" << i << "]=" << expert_idxs[i];
-      add_tasks_for_one_expert(layer_idx, expert_idxs[i]);
+      add_tasks_for_one_expert(layer_idx, expert_idxs[i], &precise_job_queue);
     }
   } else {
     auto first_task = per_layer_job_queues[layer_idx].front();
@@ -41,7 +41,7 @@ void PrefetchMngr::preempt_one_layer_(int layer_idx, int64_t *expert_idxs,
             prefetched_experts[layer_idx].end()) {
           continue;
         }
-        add_tasks_for_one_expert(layer_idx, expert_idxs[i]);
+        add_tasks_for_one_expert(layer_idx, expert_idxs[i], &precise_job_queue);
       }
     } else {
       LOG(DEBUG) << "preempting one layer " << layer_idx << ", first task is correctly predicted and started";
@@ -51,11 +51,11 @@ void PrefetchMngr::preempt_one_layer_(int layer_idx, int64_t *expert_idxs,
             prefetched_experts[layer_idx].end()) {
           continue;
         }
-        add_tasks_for_one_expert(layer_idx, expert_idxs[i]);
+        add_tasks_for_one_expert(layer_idx, expert_idxs[i], &precise_job_queue);
       }
 
       CHECK(first_task.expert_idx == expert_idxs[i]);
-      add_tasks_for_one_expert(layer_idx, expert_idxs[i],
+      add_tasks_for_one_expert(layer_idx, expert_idxs[i], &precise_job_queue,
                                first_task.mem_buf_idx);
       i++;
 
@@ -64,7 +64,7 @@ void PrefetchMngr::preempt_one_layer_(int layer_idx, int64_t *expert_idxs,
             prefetched_experts[layer_idx].end()) {
           continue;
         }
-        add_tasks_for_one_expert(layer_idx, expert_idxs[i]);
+        add_tasks_for_one_expert(layer_idx, expert_idxs[i], &precise_job_queue);
       }
     }
   }
@@ -79,9 +79,10 @@ void PrefetchMngr::add_one_layer_task_(int layer_idx, int64_t *expert_idxs,
     if (prefetched_experts[layer_idx].find(expert_idxs[i]) !=
         prefetched_experts[layer_idx].end()) {
       LOG(DEBUG) << "skip add prefetch task " << layer_idx << "," << expert_idxs[i];
+      unlock_queue();
       continue;
     }
-    add_tasks_for_one_expert(layer_idx, expert_idxs[i]);
+    add_tasks_for_one_expert(layer_idx, expert_idxs[i], &per_layer_job_queues[layer_idx]);
     unlock_queue();
   }
 }
@@ -134,18 +135,18 @@ void PrefetchMngr::do_one_task(PrefetchTask *task) {
 void PrefetchEngine::init_prefetch_worker() {
   prefetch_worker = std::make_shared<PrefetchMngr>(metas, model_loader);
 }
-void PrefetchMngr::add_tasks_for_one_expert(int layer_idx, int exper_idx,
+void PrefetchMngr::add_tasks_for_one_expert(int layer_idx, int expert_idx, Queue* queue,
                                             int starting_mem_buffer) {
-  auto expert_handler = model_loader->get_source(layer_idx, exper_idx);
+  auto expert_handler = model_loader->get_source(layer_idx, expert_idx);
   for (int j = starting_mem_buffer;
        j < expert_handler->host_data.mem_buffers.size(); j++) {
     PrefetchTask task;
     task.layer_idx = layer_idx;
-    task.expert_idx = exper_idx;
+    task.expert_idx = expert_idx;
     task.mem_buf_idx = j;
     task.expert = expert_handler;
-    per_layer_job_queues[layer_idx].push(task);
-    LOG(DEBUG) << "add prefetch task for one param " << layer_idx << "," << exper_idx << "," << j;
+    queue->push(task);
+    LOG(DEBUG) << "add prefetch task for one param " << layer_idx << "," << expert_idx << "," << j;
   }
 }
 void PrefetchMngr::thread_func() {
@@ -153,17 +154,24 @@ void PrefetchMngr::thread_func() {
     PrefetchTask task;
     bool found = false;
     lock_queue();
-    int i = 0;
-    for (; i < metas->num_layer; i++) {
-      if (per_layer_job_queues[i].empty()) {
-        continue;
-      }
-      task = per_layer_job_queues[i].front();
+    if (!precise_job_queue.empty()) {
+      task = precise_job_queue.front();
+      precise_job_queue.pop();
       found = true;
-      break;
+    } else {
+      int i = 0;
+      for (; i < metas->num_layer; i++) {
+        if (per_layer_job_queues[i].empty()) {
+          continue;
+        }
+        task = per_layer_job_queues[i].front();
+        per_layer_job_queues[i].pop();
+        found = true;
+        break;
+      }
     }
-    if (i < metas->num_layer) {
-      per_layer_job_queues[i].pop();
+
+    if (found) {
       do_one_task(&task);
       unlock_queue();
     } else {
@@ -227,7 +235,7 @@ void PrefetchMngr::launch_prefetch_thread() {
   prefetch_thread = std::thread([this]() { this->thread_func(); });
 }
 void PrefetchEngine::init_predictor(std::string model_path) {
-  predictor = std::make_shared<Predictor>();
+  predictor = std::make_shared<Predictor>(this->metas);
   predictor->load_model(model_path);
 }
 PrefetchMngr::PrefetchMngr(std::shared_ptr<ModuleMeta> metas,

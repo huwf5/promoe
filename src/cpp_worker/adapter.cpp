@@ -9,9 +9,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   ;
 
   py::class_<Predictor, std::shared_ptr<Predictor>>(m, "Predictor")
-    .def(py::init<>())
+    .def(py::init<std::shared_ptr<ModuleMeta>>())
     .def("load_model", &Predictor::load_model)
     .def("predict", &Predictor::predict)
+    // .def("init_expert_access_buffer", &Predictor::init_expert_access_buffer)
+    .def("clear_access_buffer", &Predictor::clear_access_buffer)
+    .def("add_one_layer", static_cast<void (Predictor::*)(int, int64_t*, size_t)>(&Predictor::add_one_layer))
+    .def("add_one_layer", static_cast<void (Predictor::*)(int, torch::Tensor)>(&Predictor::add_one_layer))
   ;
 
   py::class_<ModelLoader, std::shared_ptr<ModelLoader>>(m, "ModelLoader")
