@@ -1,3 +1,4 @@
+#pragma once
 #include <torch/script.h>
 #include "utils.hpp"
 
@@ -15,25 +16,12 @@ class Predictor {
   Predictor(std::shared_ptr<ModuleMeta> metas) : metas(metas) {
     init_expert_access_buffer();
   }
-  void load_model(std::string model_path) {
-    c10::Device cpu_device(c10::DeviceType::CPU);
-    predict_model = torch::jit::load(model_path, cpu_device);
-    predict_model.eval();
-  }
+  void load_model(std::string model_path);
 
-  torch::Tensor predict() {
-    std::vector<torch::jit::IValue> inputs{this->expert_access_buffer.flatten().unsqueeze(0)};
-    return predict_model.forward(inputs).toTensor();
-  }
+  torch::Tensor predict();
 
-  void add_one_layer(int layer_id, torch::Tensor experts) {
-    add_one_layer(layer_id, experts.data_ptr<int64_t>(), experts.numel());
-  }
-  void add_one_layer(int layer_id, int64_t* experts, size_t num_expert) {
-    for (int i = 0; i < num_expert; i++) {
-      expert_access_buffer[layer_id][experts[i]] = 1;
-    }
-  }
+  void add_one_layer(int layer_id, torch::Tensor experts);
+  void add_one_layer(int layer_id, int64_t *experts, size_t num_expert);
   void clear_access_buffer() {
     expert_access_buffer.fill_(0);
   }

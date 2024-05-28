@@ -46,6 +46,7 @@ class PrefetchMngr {
   cudaStream_t stream;
   std::shared_ptr<ModuleMeta> metas;
   std::shared_ptr<ModelLoader> model_loader;
+  std::shared_ptr<Predictor> predictor;
   std::vector<Queue> per_layer_job_queues; // the fetching thread takes out the first task from queue, then execute it.
   Queue precise_job_queue;
   std::vector<std::unordered_map<int, ExpertHandler*>> prefetched_experts; // the ongoing job also lives in here.
@@ -76,11 +77,15 @@ class PrefetchMngr {
 
 public:
   PrefetchMngr(std::shared_ptr<ModuleMeta> metas,
-               std::shared_ptr<ModelLoader> model_loader);
+               std::shared_ptr<ModelLoader> model_loader,
+               std::shared_ptr<Predictor> predictor);
   void init_gpu_mem_buffer(size_t num_buffers);
 
   void add_one_layer_task(int layer_idx, torch::Tensor experts);
+  void add_multi_layer_task(torch::Tensor experts);
   void preempt_one_layer(int layer_idx, torch::Tensor experts);
+
+  void record_then_predict_and_launch(int layer_id, torch::Tensor experts);
 
   void wait_and_lock_expert(int layer_id, int expert_id);
   void try_release_expert(int layer_id, int expert_id);

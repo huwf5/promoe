@@ -101,12 +101,13 @@ class LogMessage {
 
   template<typename T>
   LogMessage & operator<<(T v) {
-    static LogLevel min_log_level = MinLogLevelFromEnv();
-    if (severity_ >= min_log_level) {
+    if (should_output_) {
       osstream << v;
     }
     return *this;
   }
+
+  bool should_output_;
 
  protected:
   void GenerateLogMessage(bool log_time);

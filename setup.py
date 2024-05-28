@@ -9,6 +9,7 @@ setup(
             'src/cpp_worker/logging.cc',
             'src/cpp_worker/model_loader.cpp',
             'src/cpp_worker/prefetcher.cpp',
+            'src/cpp_worker/predictor.cpp',
             'src/cpp_worker/utils.cpp',
         ], extra_compile_args={'cxx': ['-g'], 'nvcc': ['-g']}),
     ],

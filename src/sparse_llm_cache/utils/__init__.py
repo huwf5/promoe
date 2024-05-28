@@ -50,7 +50,7 @@ def add_metadata_to_submodules(model, parse_expert_meta_from_name):
 
 def register_expert_params(model, model_loader, filter=RegexFilter(r'.*layers\.(\d+)\.mlp\.experts\.(\d+)$')):
   def f(module, name):
-    print(f'registering expert {name}')
+    # print(f'registering expert {name}')
     for k,v in module.named_parameters():
       model_loader.add_one_expert_param(v, module._layer_id, module._expert_id, k)
 
@@ -63,24 +63,27 @@ def register_expert_params(model, model_loader, filter=RegexFilter(r'.*layers\.(
 
 def move_non_moe_to_gpu(model, device='cuda', filter=RegexFilter(r'.*layers\.(\d+)\.mlp\.experts\.(\d+)').reverse()):
   def f(module : torch.nn.Module, name:str):
-      print(f'moving {name} to gpu')
+      # print(f'moving {name} to gpu')
       module.to(device)
   recursive_traverse_childrens_leaf_only(model, f, filter)
 
 def replace_mlp_report_experts(model, prefetch_mngr, predictor, num_moe_layer, num_expert, num_predict_expert, filter=RegexFilter(r'.*layers\.([1-9]\d*)\.mlp$')):
   def f(module, name):
     def new_report_experts(experts):
-      print(module._layer_id, experts)
+      # print(module._layer_id, experts)
       prefetch_mngr.preempt_one_layer(module._layer_id, experts)
-      predictor.add_one_layer(module._layer_id, experts)
-      if module._layer_id == num_moe_layer-1:
-        predicted_prob = predictor.predict()
-        print(predicted_prob.shape)
-        predicted_prob = predicted_prob.reshape(num_moe_layer, num_expert)
-        _, _predict_idx = predicted_prob.sort(dim=-1, descending=True)
-        for i in range(num_moe_layer):
-          prefetch_mngr.add_one_layer_task(i, _predict_idx[i][:num_predict_expert])
-        predictor.clear_access_buffer()
+
+      prefetch_mngr.record_then_predict_and_launch(module._layer_id, experts)
+      # predictor.add_one_layer(module._layer_id, experts)
+      # if module._layer_id == num_moe_layer-1:
+      #   predicted_prob = predictor.predict()
+      #   # print(predicted_prob.shape)
+      #   predicted_prob = predicted_prob.reshape(num_moe_layer, num_expert)
+      #   _, _predict_idx = predicted_prob.sort(dim=-1, descending=True)
+      #   for i in range(num_moe_layer):
+      #     prefetch_mngr.add_one_layer_task(i, _predict_idx[i][:num_predict_expert])
+      #   predictor.clear_access_buffer()
+
       return experts
     module.report_experts = new_report_experts
   recursive_traverse_childrens(model, f, filter)
@@ -88,7 +91,7 @@ def replace_mlp_report_experts(model, prefetch_mngr, predictor, num_moe_layer, n
 def add_hook_to_experts(model, prefetch_mngr, filter=RegexFilter(r'.*layers\.(\d+)\.mlp\.experts\.(\d+)$')):
   hook = ExpertHook(prefetch_mngr)
   def f(module, name):
-    print(f'adding hook to {name}')
+    # print(f'adding hook to {name}')
     hooks.add_hook_to_module(module, hook)
   recursive_traverse_childrens(model, f, filter)
 

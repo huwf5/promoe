@@ -33,3 +33,12 @@ void AtomicLock::lock() {
   };
 }
 bool AtomicLock::is_locked() { return lock_.load(); }
+
+std::string tensor_to_str(torch::Tensor t) {
+  std::stringstream ss;
+  t = t.flatten();
+  for (int i = 0; i < t.numel(); i++) {
+    ss << t[i].item() << ",";
+  }
+  return ss.str();
+}

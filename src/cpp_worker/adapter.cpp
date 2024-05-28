@@ -5,6 +5,7 @@
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   py::class_<ModuleMeta, std::shared_ptr<ModuleMeta>>(m, "ModuleMeta")
     .def(py::init<int,int>())
+    .def_readwrite("num_predict_expert_per_layer", &ModuleMeta::num_predict_expert_per_layer)
     .def("init_param_list", &ModuleMeta::init_param_list)
   ;
 
@@ -29,7 +30,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   ;
 
   py::class_<PrefetchMngr, std::shared_ptr<PrefetchMngr>>(m, "PrefetchMngr")
-    .def(py::init<std::shared_ptr<ModuleMeta>, std::shared_ptr<ModelLoader>>())
+    .def(py::init<std::shared_ptr<ModuleMeta>, std::shared_ptr<ModelLoader>, std::shared_ptr<Predictor>>())
     .def("launch_prefetch_thread", &PrefetchMngr::launch_prefetch_thread)
     .def("init_gpu_mem_buffer", &PrefetchMngr::init_gpu_mem_buffer)
     .def("wait_and_lock_expert", &PrefetchMngr::wait_and_lock_expert)
@@ -37,6 +38,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     .def("try_release_expert_in_layer", &PrefetchMngr::try_release_expert_in_layer)
     .def("add_one_layer_task", &PrefetchMngr::add_one_layer_task)
     .def("preempt_one_layer", &PrefetchMngr::preempt_one_layer)
+    .def("record_then_predict_and_launch", &PrefetchMngr::record_then_predict_and_launch)
   ;
 
   py::class_<PrefetchEngine, std::shared_ptr<PrefetchEngine>>(m, "PrefetchEngine")

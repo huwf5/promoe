@@ -5,6 +5,7 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+#include <torch/extension.h>
 
 class SpinLock {
     pthread_spinlock_t _spinlock;
@@ -58,6 +59,7 @@ class ModuleMeta {
   int num_per_expert_param;
   std::vector<std::string> param_name_list;
   std::unordered_map<std::string, int> param_name_to_id;
+  int num_predict_expert_per_layer;
 
   ModuleMeta(int num_layer, int num_expert) : num_layer(num_layer), num_expert(num_expert) {}
 
@@ -77,5 +79,6 @@ class ModuleMeta {
   }
 };
 
+std::string tensor_to_str(torch::Tensor t);
 
 // inline void CHECK(bool exp) { assert(exp); }

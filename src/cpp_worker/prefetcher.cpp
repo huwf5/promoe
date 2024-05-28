@@ -87,10 +87,10 @@ void PrefetchMngr::add_one_layer_task_(int layer_idx, int64_t *expert_idxs,
   }
 }
 void PrefetchMngr::do_one_task(PrefetchTask *task) {
-  LOG(TRACE) << "do one prefetch task " << task->layer_idx << "," << task->expert_idx << "," << task->mem_buf_idx;
+  LOG(DEBUG) << "do one prefetch task " << task->layer_idx << "," << task->expert_idx << "," << task->mem_buf_idx;
   if (previous_task.expert != nullptr && previous_task.expert != task->expert &&
       previous_task.mem_buf_idx != metas->num_per_expert_param-1) {
-    LOG(TRACE) << "removing partially fetched expert " << previous_task.layer_idx << "," << previous_task.expert_idx;
+    LOG(DEBUG) << "removing partially fetched expert " << previous_task.layer_idx << "," << previous_task.expert_idx;
     prefetched_experts[previous_task.layer_idx].erase(
         previous_task.expert_idx);
     unused_mems_lock.lock();
@@ -131,20 +131,19 @@ void PrefetchMngr::do_one_task(PrefetchTask *task) {
     //       metas->param_name_list[i],
     //       task->expert->gpu_data->mem_buffers[i].get_tensor());
     // }
-    LOG(TRACE) << "all fetch job done for expert " << task->layer_idx << "," << task->expert_idx << "," << task->mem_buf_idx;
+    LOG(DEBUG) << "all fetch job done for expert " << task->layer_idx << "," << task->expert_idx << "," << task->mem_buf_idx;
 
     CUDA_CALL(cudaStreamSynchronize(this->stream));
     task->expert->expert_status.unlock(kFetching, kReady);
   }
 }
 void PrefetchEngine::init_prefetch_worker() {
-  prefetch_worker = std::make_shared<PrefetchMngr>(metas, model_loader);
+  prefetch_worker = std::make_shared<PrefetchMngr>(metas, model_loader, predictor);
 }
 void PrefetchMngr::add_tasks_for_one_expert(int layer_idx, int expert_idx, Queue* queue,
                                             int starting_mem_buffer) {
   auto expert_handler = model_loader->get_source(layer_idx, expert_idx);
-  for (int j = starting_mem_buffer;
-       j < expert_handler->host_data.mem_buffers.size(); j++) {
+  for (int j = starting_mem_buffer; j < expert_handler->host_data.mem_buffers.size(); j++) {
     PrefetchTask task;
     task.layer_idx = layer_idx;
     task.expert_idx = expert_idx;
@@ -205,10 +204,10 @@ void PrefetchMngr::preempt_one_layer(int layer_idx, torch::Tensor experts) {
   preempt_one_layer_(layer_idx, experts.data_ptr<int64_t>(), experts.size(0));
 }
 void PrefetchMngr::wait_and_lock_expert(int layer_id, int expert_id) {
-  LOG(TRACE) << "waiting expert " << layer_id << "." << expert_id;
+  LOG(DEBUG) << "waiting expert " << layer_id << "." << expert_id;
   model_loader->get_source(layer_id, expert_id)
       ->expert_status.lock(kReady, kUsing);
-  LOG(TRACE) << "waiting expert " << layer_id << "." << expert_id << " success";
+  LOG(DEBUG) << "waiting expert " << layer_id << "." << expert_id << " success";
 }
 void PrefetchMngr::try_release_expert(int layer_id, int expert_id) {
   LOG(TRACE) << "try unlocking expert " << layer_id << "." << expert_id;
@@ -244,9 +243,53 @@ void PrefetchEngine::init_predictor(std::string model_path) {
   predictor->load_model(model_path);
 }
 PrefetchMngr::PrefetchMngr(std::shared_ptr<ModuleMeta> metas,
-                           std::shared_ptr<ModelLoader> model_loader)
-    : metas(metas), model_loader(model_loader) {
+                           std::shared_ptr<ModelLoader> model_loader,
+                           std::shared_ptr<Predictor> predictor)
+    : metas(metas), model_loader(model_loader), predictor(predictor) {
   per_layer_job_queues.resize(metas->num_layer);
   prefetched_experts.resize(metas->num_layer);
   CUDA_CALL(cudaStreamCreate(&stream))
+}
+void PrefetchMngr::record_then_predict_and_launch(int layer_id, torch::Tensor experts) {
+  LOG(DEBUG) << "actual " << layer_id << ":" << tensor_to_str(experts);
+  predictor->add_one_layer(layer_id, experts);
+  if (layer_id == metas->num_layer - 1) {
+    auto prob = predictor->predict().reshape({metas->num_layer, metas->num_expert});
+    auto sorted = prob.sort(-1, true);
+    auto predicted_expert_prob = std::get<0>(sorted).slice(1, 0, metas->num_predict_expert_per_layer);
+    auto predicted_expert = std::get<1>(sorted).slice(1, 0, metas->num_predict_expert_per_layer);
+
+    // for (int l = 0; l < metas->num_layer; l++) {
+    //   // auto cur_layer_predicted_expert = predicted_expert[l].slice(0, 0, metas->num_predict_expert_per_layer);
+    //   auto cur_layer_predicted_expert = predicted_expert[l];
+    //   LOG(DEBUG) << "predicted expert" << l << ":" << tensor_to_str(cur_layer_predicted_expert);
+    //   // LOG(DEBUG) << "predicted prob  " << l << ":" << tensor_to_str(predicted_expert_prob[l]);
+    //   this->add_one_layer_task(l, cur_layer_predicted_expert);
+    // }
+
+    for (int l = 0; l < metas->num_layer; l++) {
+      LOG(DEBUG) << "predicted expert" << l << ":" << tensor_to_str(predicted_expert[l]);
+    }
+    this->add_multi_layer_task(predicted_expert);
+
+    predictor->clear_access_buffer();
+  }
+}
+void PrefetchMngr::add_multi_layer_task(torch::Tensor experts) {
+  size_t per_layer_num_expert = experts.size(1);
+  lock_queue();
+  for (int layer_idx = 0; layer_idx < metas->num_layer; layer_idx++) {
+    CHECK(per_layer_job_queues[layer_idx].empty());
+    int64_t* expert_idxs = experts[layer_idx].data_ptr<int64_t>();
+    for (int i = 0; i < per_layer_num_expert; i++) {
+      LOG(TRACE) << "adding prefetch task " << layer_idx << "," << expert_idxs[i];
+      if (prefetched_experts[layer_idx].find(expert_idxs[i]) !=
+          prefetched_experts[layer_idx].end()) {
+        LOG(TRACE) << "skip add prefetch task " << layer_idx << "," << expert_idxs[i];
+        continue;
+      }
+      add_tasks_for_one_expert(layer_idx, expert_idxs[i], &per_layer_job_queues[layer_idx]);
+    }
+  }
+  unlock_queue();
 }
