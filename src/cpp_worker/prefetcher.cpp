@@ -17,6 +17,9 @@ void PrefetchMngr::preempt_one_layer_(int layer_idx, int64_t *expert_idxs,
     }
   }
   std::unordered_set<int> expert_idxs_set;
+  std::vector<int64_t> correct_experts, wrong_experts;
+  correct_experts.reserve(num_expert);
+  wrong_experts.reserve(num_expert);
   for (int i = 0; i < num_expert; i++) {
     expert_idxs_set.insert(expert_idxs[i]);
   }
@@ -25,55 +28,63 @@ void PrefetchMngr::preempt_one_layer_(int layer_idx, int64_t *expert_idxs,
   if (per_layer_job_queues[layer_idx].empty()) {
     LOG(TRACE) << "preempting one layer " << layer_idx << ", queue is empty";
     for (int i = 0; i < num_expert; i++) {
-      if (prefetched_experts[layer_idx].find(expert_idxs[i]) !=
-          prefetched_experts[layer_idx].end()) {
+      if (prefetched_experts[layer_idx].find(expert_idxs[i]) != prefetched_experts[layer_idx].end()) {
         LOG(TRACE) << "preempting one layer " << layer_idx << ", skipping [" << i << "]=" << expert_idxs[i] << " since it's in gpu";
+        correct_experts.push_back(expert_idxs[i]);
         continue;
       }
       LOG(TRACE) << "preempting one layer " << layer_idx << ", add task for [" << i << "]=" << expert_idxs[i];
       add_tasks_for_one_expert(layer_idx, expert_idxs[i], &precise_job_queue);
+      wrong_experts.push_back(expert_idxs[i]);
     }
   } else {
     auto first_task = per_layer_job_queues[layer_idx].front();
     LOG(TRACE) << "preempting one layer " << layer_idx << ", queue is not empty, first task is " << first_task.layer_idx << "." << first_task.expert_idx << "." << first_task.mem_buf_idx;
     per_layer_job_queues[layer_idx].clear();
     //// queue with pending tasks, but the first task is wrongly predicted
-    if (expert_idxs_set.find(first_task.expert_idx) == expert_idxs_set.end() ||
-        first_task.mem_buf_idx == 0) {
+    if (expert_idxs_set.find(first_task.expert_idx) == expert_idxs_set.end() || first_task.mem_buf_idx == 0) {
       LOG(TRACE) << "preempting one layer " << layer_idx << ", first task is miss predicted or not started. just clear entire queue.";
       for (int i = 0; i < num_expert; i++) {
-        if (prefetched_experts[layer_idx].find(expert_idxs[i]) !=
-            prefetched_experts[layer_idx].end()) {
+        if (prefetched_experts[layer_idx].find(expert_idxs[i]) != prefetched_experts[layer_idx].end()) {
+          correct_experts.push_back(expert_idxs[i]);
           continue;
         }
         add_tasks_for_one_expert(layer_idx, expert_idxs[i], &precise_job_queue);
+        wrong_experts.push_back(expert_idxs[i]);
       }
     } else {
       LOG(TRACE) << "preempting one layer " << layer_idx << ", first task is correctly predicted and started";
       int i = 0;
       for (; i < num_expert && expert_idxs[i] < first_task.expert_idx; i++) {
-        if (prefetched_experts[layer_idx].find(expert_idxs[i]) !=
-            prefetched_experts[layer_idx].end()) {
+        if (prefetched_experts[layer_idx].find(expert_idxs[i]) != prefetched_experts[layer_idx].end()) {
+          correct_experts.push_back(expert_idxs[i]);
           continue;
         }
         add_tasks_for_one_expert(layer_idx, expert_idxs[i], &precise_job_queue);
+        wrong_experts.push_back(expert_idxs[i]);
       }
 
       CHECK(first_task.expert_idx == expert_idxs[i]);
-      add_tasks_for_one_expert(layer_idx, expert_idxs[i], &precise_job_queue,
-                               first_task.mem_buf_idx);
+      add_tasks_for_one_expert(layer_idx, expert_idxs[i], &precise_job_queue, first_task.mem_buf_idx);
+      wrong_experts.push_back(expert_idxs[i]);
       i++;
 
       for (; i < num_expert; i++) {
-        if (prefetched_experts[layer_idx].find(expert_idxs[i]) !=
-            prefetched_experts[layer_idx].end()) {
+        if (prefetched_experts[layer_idx].find(expert_idxs[i]) != prefetched_experts[layer_idx].end()) {
+          correct_experts.push_back(expert_idxs[i]);
           continue;
         }
         add_tasks_for_one_expert(layer_idx, expert_idxs[i], &precise_job_queue);
+        wrong_experts.push_back(expert_idxs[i]);
       }
     }
   }
   unlock_queue();
+  memcpy(expert_idxs,                          correct_experts.data(), correct_experts.size() * sizeof(*expert_idxs));
+  memcpy(expert_idxs + correct_experts.size(),   wrong_experts.data(),   wrong_experts.size() * sizeof(*expert_idxs));
+  LOG_BLOCK(DEBUG, logger, {
+    logger << "reordered expert to " << array_to_str(expert_idxs, num_expert);
+  });
 }
 void PrefetchMngr::add_one_layer_task_(int layer_idx, int64_t *expert_idxs,
                                        size_t num_expert) {
