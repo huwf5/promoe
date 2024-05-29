@@ -1,6 +1,11 @@
 #include <torch/extension.h>
 #include "model_loader.hpp"
 #include "prefetcher.hpp"
+#include "profiler.hpp"
+
+std::string dump_trace_event_collector_singleton() {
+  return TraceEventCollector::singleton().dump_json_to_string();
+}
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   py::class_<ModuleMeta, std::shared_ptr<ModuleMeta>>(m, "ModuleMeta")
@@ -49,4 +54,19 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     .def_readwrite("predictor", &PrefetchEngine::predictor)
     .def("init_prefetch_worker", &PrefetchEngine::init_prefetch_worker)
   ;
+
+  py::class_<TraceEventGuard, std::shared_ptr<TraceEventGuard>>(m, "TraceEventGuard")
+    .def(py::init<>())
+    .def("init", &TraceEventGuard::init)
+    .def("release", &TraceEventGuard::release)
+  ;
+
+  m.def("dump_trace_event_collector_singleton", &dump_trace_event_collector_singleton);
+
+  py::enum_<ThreadType>(m, "ThreadType")
+    .value("kPythonMain", ThreadType::kPythonMain)
+    .value("kCacheLib", ThreadType::kCacheLib)
+    .value("kPrefetch", ThreadType::kPrefetch)
+    .value("kGPU", ThreadType::kGPU)
+    .export_values();
 };

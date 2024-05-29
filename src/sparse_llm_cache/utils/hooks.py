@@ -3,6 +3,7 @@ Hook from huggingface accerlerate
 '''
 import functools
 import torch
+from .. import cpp_worker
 
 class ModelHook:
     """
@@ -180,6 +181,21 @@ class ExpertHook(ModelHook):
     return args, kwargs
   # def post_forward(self, module, output):
   #   return output
+  # def detach_hook(self, module):
+  #   return super().detach_hook(module)
+
+class TimingHook(ModelHook):
+  def __init__(self):
+    self.trace_guard_stack = []
+  # def init_hook(self, module):
+  #   return super().init_hook(module)
+  def pre_forward(self, module, *args, **kwargs):
+    self.trace_guard_stack.append(cpp_worker.TraceEventGuard())
+    self.trace_guard_stack[-1].init(cpp_worker.kPythonMain, module._prefix)
+    return args, kwargs
+  def post_forward(self, module, output):
+    self.trace_guard_stack.pop().release()
+    return output
   # def detach_hook(self, module):
   #   return super().detach_hook(module)
 

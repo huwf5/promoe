@@ -1,8 +1,10 @@
 #include "prefetcher.hpp"
+#include "profiler.hpp"
 #include "logging.hpp"
 
 void PrefetchMngr::preempt_one_layer_(int layer_idx, int64_t *expert_idxs,
                                       size_t num_expert) {
+  TRACE_EVENT_GURAD(kCacheLib, "preempt_one_layer_");
   LOG(TRACE) << "preempting one layer " << layer_idx;
   {
     int prev_layer_idx = (layer_idx + metas->num_layer - 1) % metas->num_layer;
@@ -72,6 +74,7 @@ void PrefetchMngr::preempt_one_layer_(int layer_idx, int64_t *expert_idxs,
 }
 void PrefetchMngr::add_one_layer_task_(int layer_idx, int64_t *expert_idxs,
                                        size_t num_expert) {
+  TRACE_EVENT_GURAD(kCacheLib, "add_one_layer_task_");
   CHECK(per_layer_job_queues[layer_idx].empty());
   for (int i = 0; i < num_expert; i++) {
     LOG(TRACE) << "adding prefetch task " << layer_idx << "," << expert_idxs[i];
@@ -87,6 +90,7 @@ void PrefetchMngr::add_one_layer_task_(int layer_idx, int64_t *expert_idxs,
   }
 }
 void PrefetchMngr::do_one_task(PrefetchTask *task) {
+  TRACE_EVENT_GURAD(kPrefetch, "do_one_task:" + task->toString());
   LOG(DEBUG) << "do one prefetch task " << task->layer_idx << "," << task->expert_idx << "," << task->mem_buf_idx;
   if (previous_task.expert != nullptr && previous_task.expert != task->expert &&
       previous_task.mem_buf_idx != metas->num_per_expert_param-1) {
@@ -203,24 +207,34 @@ void PrefetchMngr::preempt_one_layer(int layer_idx, torch::Tensor experts) {
   preempt_one_layer_(layer_idx, experts.data_ptr<int64_t>(), experts.size(0));
 }
 void PrefetchMngr::wait_and_lock_expert(int layer_id, int expert_id) {
+  TRACE_EVENT_GURAD(kCacheLib, "wait_and_lock_expert");
   LOG(DEBUG) << "waiting expert " << layer_id << "." << expert_id;
   model_loader->get_source(layer_id, expert_id)->expert_status.lock(kReady, kUsing);
   LOG(DEBUG) << "waiting expert " << layer_id << "." << expert_id << " success";
 }
 void PrefetchMngr::try_release_expert(int layer_id, int expert_id) {
+  TRACE_EVENT_GURAD(kCacheLib, "try_release_expert");
   LOG(TRACE) << "try unlocking expert " << layer_id << "." << expert_id;
   auto expert_handler = model_loader->get_source(layer_id, expert_id);
   if (expert_handler->expert_status.is_locked(kUsing) == false) {
     LOG(TRACE) << "try unlocking expert " << layer_id << "." << expert_id << ": it's not locked";
     return;
   }
-  lock_queue();
-  prefetched_experts[layer_id].erase(expert_id);
-  unlock_queue();
+  {
+    {
+      TRACE_EVENT_GURAD(kCacheLib, "try_release_expert.lock_queue");
+      lock_queue();
+    }
+    prefetched_experts[layer_id].erase(expert_id);
+    unlock_queue();
+  }
   // fixme: the memory may should not be released here. add a cache module
   if (expert_handler->gpu_data != nullptr) {
     LOG(TRACE) << "try unlocking expert " << layer_id << "." << expert_id << ": returning it's gpu memory " << expert_handler->gpu_data;
-    unused_mems_lock.lock();
+    {
+      TRACE_EVENT_GURAD(kCacheLib, "try_release_expert.lock_unused_mems");
+      unused_mems_lock.lock();
+    }
     unused_mems.push_back(expert_handler->gpu_data);
     unused_mems_lock.unlock();
     expert_handler->gpu_data = nullptr;
@@ -249,6 +263,7 @@ PrefetchMngr::PrefetchMngr(std::shared_ptr<ModuleMeta> metas,
   CUDA_CALL(cudaStreamCreate(&stream))
 }
 void PrefetchMngr::record_then_predict_and_launch(int layer_id, torch::Tensor experts) {
+  TRACE_EVENT_GURAD(kCacheLib, "record_then_predict_and_launch");
   LOG(DEBUG) << "actual " << layer_id << ":" << tensor_to_str(experts);
   predictor->add_one_layer(layer_id, experts);
   if (layer_id == metas->num_layer - 1) {
@@ -274,6 +289,7 @@ void PrefetchMngr::record_then_predict_and_launch(int layer_id, torch::Tensor ex
   }
 }
 void PrefetchMngr::add_multi_layer_task(torch::Tensor experts) {
+  TRACE_EVENT_GURAD(kCacheLib, "add_multi_layer_task");
   size_t per_layer_num_expert = experts.size(1);
   lock_queue();
   for (int layer_idx = 0; layer_idx < metas->num_layer; layer_idx++) {

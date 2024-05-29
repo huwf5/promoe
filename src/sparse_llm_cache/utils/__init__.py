@@ -95,6 +95,12 @@ def add_hook_to_experts(model, prefetch_mngr, filter=RegexFilter(r'.*layers\.(\d
     hooks.add_hook_to_module(module, hook)
   recursive_traverse_childrens(model, f, filter)
 
+def add_hook_to_some_modules(model, hook, filter=RegexFilter(r'.*'), append=False):
+  def f(module, name):
+    # print(f'adding hook to {name}')
+    hooks.add_hook_to_module(module, hook, append)
+  recursive_traverse_childrens(model, f, filter)
+
 '''
 Legacy
 '''
