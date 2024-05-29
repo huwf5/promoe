@@ -11,6 +11,7 @@ setup(
             'src/cpp_worker/prefetcher.cpp',
             'src/cpp_worker/predictor.cpp',
             'src/cpp_worker/utils.cpp',
+            'src/cpp_worker/profiler.cpp',
         ], extra_compile_args={'cxx': ['-g'], 'nvcc': ['-g']}),
     ],
     cmdclass={

@@ -161,7 +161,7 @@ void PrefetchMngr::add_tasks_for_one_expert(int layer_idx, int expert_idx, Queue
   }
 }
 void PrefetchMngr::thread_func() {
-  while (true) {
+  while (thread_exit_mark == false) {
     PrefetchTask task;
     bool found = false;
     lock_queue();

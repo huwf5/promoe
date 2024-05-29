@@ -57,6 +57,7 @@ class PrefetchMngr {
   Queue precise_job_queue;
   std::vector<std::unordered_map<int, ExpertHandler*>> prefetched_experts; // the ongoing job also lives in here.
   std::thread prefetch_thread;
+  volatile bool thread_exit_mark = false;
   std::vector<ExpertMemHanlder*> unused_mems;
   AtomicQueueLock unused_mems_lock;
   AtomicQueueLock queue_lock;
@@ -80,6 +81,11 @@ class PrefetchMngr {
   void preempt_one_layer_(int layer_idx, int64_t *expert_idxs, size_t num_expert);
 
   void add_one_layer_task_(int layer_idx, int64_t *expert_idxs, size_t num_expert);
+
+  ~PrefetchMngr() {
+    thread_exit_mark = true;
+    prefetch_thread.join();
+  }
 
 public:
   PrefetchMngr(std::shared_ptr<ModuleMeta> metas,
