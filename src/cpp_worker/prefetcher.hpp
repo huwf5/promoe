@@ -58,8 +58,8 @@ class PrefetchMngr {
   std::vector<std::unordered_map<int, ExpertHandler*>> prefetched_experts; // the ongoing job also lives in here.
   std::thread prefetch_thread;
   std::vector<ExpertMemHanlder*> unused_mems;
-  AtomicLock unused_mems_lock;
-  AtomicLock queue_lock;
+  AtomicQueueLock unused_mems_lock;
+  AtomicQueueLock queue_lock;
 
   PrefetchTask previous_task;
   // ExpertHandler * previous_task = nullptr;

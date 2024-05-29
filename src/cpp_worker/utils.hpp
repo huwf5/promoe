@@ -50,6 +50,22 @@ class AtomicLock {
   // bool is_locked();
 };
 
+class AtomicQueueLock {
+  // std::atomic_bool lock_;
+  std::atomic_int num_req, num_locked;
+ public:
+  AtomicQueueLock() : num_req(0), num_locked(0) {}
+  void lock() {
+    int handle = num_req.fetch_add(1);
+    while (num_locked.load() != handle) {}
+  }
+  void unlock() {
+    num_locked.fetch_add(1);
+  }
+  // bool is_locked() {}
+};
+
+
 
 class ModuleMeta {
   // std::unordered_map<std::string, std::pair<int,int>> module_name_to_expert_idx;
