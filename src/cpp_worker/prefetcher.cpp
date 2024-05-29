@@ -5,7 +5,10 @@
 void PrefetchMngr::preempt_one_layer_(int layer_idx, int64_t *expert_idxs,
                                       size_t num_expert) {
   TRACE_EVENT_GURAD(kCacheLib, "preempt_one_layer_");
-  LOG(TRACE) << "preempting one layer " << layer_idx;
+  LOG_BLOCK(DEBUG, logger, {
+    logger << "preempting one layer " << layer_idx << " with expert " << array_to_str(expert_idxs, num_expert);
+  });
+  // LOG(TRACE) << "preempting one layer " << layer_idx;
   {
     int prev_layer_idx = (layer_idx + metas->num_layer - 1) % metas->num_layer;
     LOG(TRACE) << "preempting one layer " << layer_idx << ", releasing previous layer " << prev_layer_idx << " first";
@@ -269,7 +272,9 @@ PrefetchMngr::PrefetchMngr(std::shared_ptr<ModuleMeta> metas,
 }
 void PrefetchMngr::record_then_predict_and_launch(int layer_id, torch::Tensor experts) {
   TRACE_EVENT_GURAD(kCacheLib, "record_then_predict_and_launch");
-  LOG(DEBUG) << "actual " << layer_id << ":" << tensor_to_str(experts);
+  LOG_BLOCK(DEBUG, logger, {
+    logger << "actual " << layer_id << ":" << tensor_to_str(experts);
+  });
   predictor->add_one_layer(layer_id, experts);
   if (layer_id == metas->num_layer - 1) {
     auto prob = predictor->predict().reshape({metas->num_layer, metas->num_expert});
@@ -285,9 +290,11 @@ void PrefetchMngr::record_then_predict_and_launch(int layer_id, torch::Tensor ex
     //   this->add_one_layer_task(l, cur_layer_predicted_expert);
     // }
 
-    for (int l = 0; l < metas->num_layer; l++) {
-      LOG(DEBUG) << "predicted expert" << l << ":" << tensor_to_str(predicted_expert[l]);
-    }
+    LOG_BLOCK(DEBUG, logger, {
+      for (int l = 0; l < metas->num_layer; l++) {
+        logger << "predicted expert" << l << ":" << tensor_to_str(predicted_expert[l]);
+      }
+    });
     this->add_multi_layer_task(predicted_expert);
 
     predictor->clear_access_buffer();

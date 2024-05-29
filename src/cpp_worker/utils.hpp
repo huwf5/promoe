@@ -97,4 +97,13 @@ class ModuleMeta {
 
 std::string tensor_to_str(torch::Tensor t);
 
+template<typename T>
+std::string array_to_str(T* array, size_t len) {
+  std::stringstream ss;
+  for (int i = 0; i < len; i++) {
+    ss << array[i] << ",";
+  }
+  return ss.str();
+}
+
 // inline void CHECK(bool exp) { assert(exp); }
