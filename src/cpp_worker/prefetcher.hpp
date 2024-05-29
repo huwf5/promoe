@@ -82,12 +82,12 @@ class PrefetchMngr {
 
   void add_one_layer_task_(int layer_idx, int64_t *expert_idxs, size_t num_expert);
 
+public:
   ~PrefetchMngr() {
     thread_exit_mark = true;
     prefetch_thread.join();
   }
 
-public:
   PrefetchMngr(std::shared_ptr<ModuleMeta> metas,
                std::shared_ptr<ModelLoader> model_loader,
                std::shared_ptr<Predictor> predictor);

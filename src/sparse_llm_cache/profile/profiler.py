@@ -7,10 +7,15 @@ from torch.profiler import profile, record_function, ProfilerActivity
 _global_profiler : profile = None
 # profile_fname = "nllb-transformer-trace-stack-short.json"
 
-def create_profile(record_shapes=True,profile_memory=True,with_stack=True):
+def create_profile(record_shapes=True,profile_memory=True,with_stack=True, with_cpu=True, with_cuda=True):
   global _global_profiler
+  activities = []
+  if with_cpu:
+    activities.append(ProfilerActivity.CPU)
+  if with_cuda:
+    activities.append(ProfilerActivity.CUDA)
   _global_profiler = profile(
-    activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+    activities=activities,
     with_stack=with_stack,
     record_shapes=record_shapes,
     profile_memory=profile_memory,
