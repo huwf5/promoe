@@ -265,7 +265,7 @@ PrefetchMngr::PrefetchMngr(std::shared_ptr<ModuleMeta> metas,
     : metas(metas), model_loader(model_loader), predictor(predictor) {
   per_layer_job_queues.resize(metas->num_layer);
   prefetched_experts.resize(metas->num_layer);
-  CUDA_CALL(cudaStreamCreate(&stream))
+  CUDA_CALL(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
 }
 void PrefetchMngr::record_then_predict_and_launch(int layer_id, torch::Tensor experts) {
   TRACE_EVENT_GURAD(kCacheLib, "record_then_predict_and_launch");
