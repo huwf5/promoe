@@ -91,7 +91,7 @@ void PrefetchMngr::add_one_layer_task_(int layer_idx, int64_t *expert_idxs,
 }
 void PrefetchMngr::do_one_task(PrefetchTask *task) {
   TRACE_EVENT_GURAD(kPrefetch, "do_one_task:" + task->toString());
-  LOG(DEBUG) << "do one prefetch task " << task->layer_idx << "," << task->expert_idx << "," << task->mem_buf_idx;
+  LOG(DEBUG) << "do one prefetch task " << task->layer_idx << "," << task->expert_idx << "," << task->mem_buf_idx << ", precise " << task->is_precise;
   if (previous_task.expert != nullptr && previous_task.expert != task->expert &&
       previous_task.mem_buf_idx != metas->num_per_expert_param-1) {
     LOG(DEBUG) << "removing partially fetched expert " << previous_task.layer_idx << "," << previous_task.expert_idx;
@@ -163,6 +163,7 @@ void PrefetchMngr::thread_func() {
     lock_queue();
     if (!precise_job_queue.empty()) {
       task = precise_job_queue.front();
+      task.is_precise = true;
       precise_job_queue.pop();
       found = true;
     } else {

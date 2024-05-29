@@ -15,7 +15,13 @@
 class PrefetchTask {
  public:
   int layer_idx, expert_idx, mem_buf_idx;
+  bool is_precise = false;
   ExpertHandler* expert = nullptr;
+  std::string toString() const {
+    std::stringstream ss;
+    ss << layer_idx << "." << expert_idx << "." << mem_buf_idx;
+    return ss.str();
+  }
 };
 
 class Queue {
