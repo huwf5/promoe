@@ -103,6 +103,10 @@ void PrefetchMngr::do_one_task(PrefetchTask *task) {
     unused_mems_lock.unlock();
   }
   previous_task = *task;
+  if (task->expert->expert_status.is_locked(kFetching) == false) {
+    LOG(TRACE) << "a duplicated task, skip it: expert " << task->layer_idx << "," << task->expert_idx << "," << task->mem_buf_idx;
+    return;
+  }
   if (task->expert->gpu_data == nullptr) {
     LOG(TRACE) << "assigning gpu mem for expert " << task->layer_idx << "," << task->expert_idx << "," << task->mem_buf_idx;
     unused_mems_lock.lock();
@@ -180,8 +184,8 @@ void PrefetchMngr::thread_func() {
     }
 
     if (found) {
-      do_one_task(&task);
       unlock_queue();
+      do_one_task(&task);
     } else {
       unlock_queue();
       usleep(10);
