@@ -91,8 +91,7 @@ void PrefetchMngr::do_one_task(PrefetchTask *task) {
   if (previous_task.expert != nullptr && previous_task.expert != task->expert &&
       previous_task.mem_buf_idx != metas->num_per_expert_param-1) {
     LOG(DEBUG) << "removing partially fetched expert " << previous_task.layer_idx << "," << previous_task.expert_idx;
-    prefetched_experts[previous_task.layer_idx].erase(
-        previous_task.expert_idx);
+    prefetched_experts[previous_task.layer_idx].erase(previous_task.expert_idx);
     unused_mems_lock.lock();
     CHECK(previous_task.expert->gpu_data != nullptr);
     unused_mems.push_back(previous_task.expert->gpu_data);
@@ -205,8 +204,7 @@ void PrefetchMngr::preempt_one_layer(int layer_idx, torch::Tensor experts) {
 }
 void PrefetchMngr::wait_and_lock_expert(int layer_id, int expert_id) {
   LOG(DEBUG) << "waiting expert " << layer_id << "." << expert_id;
-  model_loader->get_source(layer_id, expert_id)
-      ->expert_status.lock(kReady, kUsing);
+  model_loader->get_source(layer_id, expert_id)->expert_status.lock(kReady, kUsing);
   LOG(DEBUG) << "waiting expert " << layer_id << "." << expert_id << " success";
 }
 void PrefetchMngr::try_release_expert(int layer_id, int expert_id) {

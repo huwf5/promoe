@@ -80,7 +80,7 @@ class SequentialHook(ModelHook):
         return args, kwargs
 
     def post_forward(self, module, output):
-        for hook in self.hooks:
+        for hook in reversed(self.hooks):
             output = hook.post_forward(module, output)
         return output
 
@@ -176,14 +176,7 @@ class ExpertHook(ModelHook):
   # def init_hook(self, module):
   #   return super().init_hook(module)
   def pre_forward(self, module, *args, **kwargs):
-    # self.prefetch_mngr.add_one_layer_task(module._layer_id, torch.asarray([module._expert_id], dtype=torch.int32))
     self.prefetch_mngr.wait_and_lock_expert(module._layer_id, module._expert_id)
-
-    # fixme: point all expert param to the same cuda tensor to eliminate this overhead
-    # def update_child_param(child_module, child_name, match):
-    #   for n,_ in child_module.named_parameters():
-    #     child_module._parameters[n] = model_loader.ref_one_expert_param(module._layer_id, module._expert_id, child_name + '.' + n)
-    # recursive_traverse_childrens_leaf_only(module, update_child_param)
     return args, kwargs
   # def post_forward(self, module, output):
   #   return output

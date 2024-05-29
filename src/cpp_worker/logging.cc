@@ -28,7 +28,7 @@
 
 LogMessage::LogMessage(const char* fname, int line, LogLevel severity)
     : fname_(fname), line_(line), severity_(severity) {
-    LogLevel min_log_level = MinLogLevelFromEnv();
+    static LogLevel min_log_level = MinLogLevelFromEnv();
     should_output_ = (severity_ >= min_log_level);
   }
 
@@ -62,9 +62,9 @@ void LogMessage::GenerateLogMessage(bool log_time) {
 }
 
 LogMessage::~LogMessage() {
-  static LogLevel min_log_level = MinLogLevelFromEnv();
+  // static LogLevel min_log_level = MinLogLevelFromEnv();
   static bool log_time = LogTimeFromEnv();
-  if (severity_ >= min_log_level) {
+  if (should_output_) {
     GenerateLogMessage(log_time);
   }
 }

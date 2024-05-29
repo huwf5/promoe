@@ -47,7 +47,7 @@ class AtomicLock {
   AtomicLock() : lock_(false) {}
   void lock();
   void unlock();
-  bool is_locked();
+  // bool is_locked();
 };
 
 

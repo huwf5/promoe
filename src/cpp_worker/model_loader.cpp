@@ -21,6 +21,7 @@ void ModelLoader::add_one_expert_param(torch::Tensor param, int layer_id,
   expert_handler->reference_to_model_param.mem_buffers[param_id].set_tensor(torch::empty({0}, options));
 }
 void ModelLoader::pin_memory() {
+  LOG(INFO) << "pin expert memorys on cpu...";
   for (int l = 0; l < metas->num_layer; l++) {
     for (int e = 0; e < metas->num_expert; e++) {
       for (int p = 0; p < metas->num_per_expert_param; p++) {
@@ -29,4 +30,5 @@ void ModelLoader::pin_memory() {
       }
     }
   }
+  LOG(INFO) << "pin expert memorys on cpu...done";
 }

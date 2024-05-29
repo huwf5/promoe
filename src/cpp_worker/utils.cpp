@@ -32,7 +32,7 @@ void AtomicLock::lock() {
     cur_status = false;
   };
 }
-bool AtomicLock::is_locked() { return lock_.load(); }
+// bool AtomicLock::is_locked() { return lock_.load(); }
 
 std::string tensor_to_str(torch::Tensor t) {
   std::stringstream ss;
