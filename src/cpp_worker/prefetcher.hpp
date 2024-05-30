@@ -63,6 +63,7 @@ class PrefetchMngr {
   AtomicQueueLock queue_lock;
 
   PrefetchTask previous_task;
+  PrefetchTask current_task;
   // ExpertHandler * previous_task = nullptr;
 
   void add_tasks_for_one_expert(int layer_idx, int exper_idx, Queue* queue,
