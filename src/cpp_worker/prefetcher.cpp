@@ -77,19 +77,23 @@ void PrefetchMngr::do_one_task(PrefetchTask *task) {
       previous_task.mem_buf_idx != metas->num_per_expert_param-1) {
     lock_queue();
     // if (prefetched_experts[previous_task.layer_idx].find(previous_task.expert_idx) != prefetched_experts[previous_task.layer_idx].end()) {
-      LOG(ERROR) << "removing partially fetched expert " << previous_task.layer_idx << "," << previous_task.expert_idx;
+      LOG(ERROR) << "removing partially fetched expert " << previous_task.toString();
       prefetched_experts[previous_task.layer_idx].erase(previous_task.expert_idx);
     // }
     unlock_queue();
-    unused_mems_lock.lock();
-    CHECK(previous_task.expert->gpu_data != nullptr);
-    unused_mems.push_back(previous_task.expert->gpu_data);
-    previous_task.expert->gpu_data = nullptr;
-    unused_mems_lock.unlock();
+    // we need to release this, since it may be a mispredicted expert in current layer.
+    //   but previous task may be from previous layer. the entire layer is released before this function
+    if (previous_task.expert->gpu_data != nullptr) {
+      unused_mems_lock.lock();
+      // CHECK(previous_task.expert->gpu_data != nullptr) << previous_task.toString();
+      unused_mems.push_back(previous_task.expert->gpu_data);
+      previous_task.expert->gpu_data = nullptr;
+      unused_mems_lock.unlock();
+    }
   }
   previous_task = *task;
   if (task->expert->expert_status.is_locked(kFetching) == false) {
-    LOG(TRACE) << "a duplicated task, skip it: expert " << task->layer_idx << "," << task->expert_idx << "," << task->mem_buf_idx;
+    LOG(ERROR) << "a duplicated task, skip it: expert " << task->toString() << ", status " << task->expert->expert_status.get();
     return;
   }
   if (task->expert->gpu_data == nullptr) {
@@ -204,13 +208,26 @@ void PrefetchMngr::wait_and_lock_expert(int layer_id, int expert_id) {
   LOG(DEBUG) << "waiting expert " << layer_id << "." << expert_id << " success";
 }
 void PrefetchMngr::try_release_expert(int layer_id, int expert_id) {
-  // TRACE_EVENT_GURAD(kCacheLib, "try_release:" + std::to_string(layer_id) + "." + std::to_string(expert_id));
+  /**
+   * kFetching: skip it
+   * kReady: a prefetched expert, but not used by model.
+   *    currently we release it's memory here and reset it to kFetching
+   * kUsing: a prefetched expert, and is touched by model. 
+   *    we should reset it to kReady
+   *    but currently we release it's memory and reset it to kFetching
+   *
+   * concurrent release may happen between
+   *    - prefetch thread, it checks previous task and clear a partial task (but this does not all this function)
+   *    - python api, it calls preempt and releases previous layer
+   */
   LOG(TRACE) << "try unlocking expert " << layer_id << "." << expert_id;
   auto expert_handler = model_loader->get_source(layer_id, expert_id);
-  if (expert_handler->expert_status.is_locked(kUsing) == false) {
-    LOG(TRACE) << "try unlocking expert " << layer_id << "." << expert_id << ": it's not locked";
+  auto cur_status = expert_handler->expert_status.get();
+  if (cur_status == kFetching) {
+    LOG(TRACE) << "try unlocking expert " << layer_id << "." << expert_id << ": it's not fetched";
     return;
   }
+  // fixme: the cache should not be maintained here. add a cache module
   {
     TRACE_EVENT_GURAD(kCacheLib, "release:"+ expert_meta_to_str(layer_id, expert_id) + ",erase");
     lock_queue();
@@ -225,9 +242,12 @@ void PrefetchMngr::try_release_expert(int layer_id, int expert_id) {
     unused_mems.push_back(expert_handler->gpu_data);
     unused_mems_lock.unlock();
     expert_handler->gpu_data = nullptr;
+  } else {
+    LOG(ERROR) << "try unlocking expert " << layer_id << "." << expert_id << ", but it has no gpu memory";
   }
-  auto unlock_success = expert_handler->expert_status.try_unlock(kUsing, kFetching);
-  LOG(TRACE) << "try unlocking expert " << layer_id << "." << expert_id << " success:" << unlock_success;
+  // auto unlock_success = expert_handler->expert_status.try_unlock(kUsing, kFetching);
+  // LOG(TRACE) << "try unlocking expert " << layer_id << "." << expert_id << " success:" << unlock_success;
+  expert_handler->expert_status.unlock(cur_status, kFetching);
 }
 void PrefetchMngr::try_release_expert_in_layer(int layer_id) {
   TRACE_EVENT_GURAD(kCacheLib, "try_release:" + std::to_string(layer_id));
@@ -259,7 +279,7 @@ void PrefetchMngr::record_then_predict_and_launch(int layer_id, torch::Tensor ex
   if (layer_id == metas->num_layer - 1) {
     auto prob = predictor->predict().reshape({metas->num_layer, metas->num_expert});
     auto sorted = prob.sort(-1, true);
-    auto predicted_expert_prob = std::get<0>(sorted).slice(1, 0, metas->num_predict_expert_per_layer);
+    // auto predicted_expert_prob = std::get<0>(sorted).slice(1, 0, metas->num_predict_expert_per_layer);
     auto predicted_expert = std::get<1>(sorted).slice(1, 0, metas->num_predict_expert_per_layer);
 
     // for (int l = 0; l < metas->num_layer; l++) {
@@ -276,7 +296,6 @@ void PrefetchMngr::record_then_predict_and_launch(int layer_id, torch::Tensor ex
       }
     });
     this->add_multi_layer_task(predicted_expert);
-
     predictor->clear_access_buffer();
   }
 }
@@ -297,4 +316,13 @@ void PrefetchMngr::add_multi_layer_task(torch::Tensor experts) {
     }
   }
   unlock_queue();
+}
+PrefetchMngr::~PrefetchMngr() {
+  thread_exit_mark = true;
+  prefetch_thread.join();
+  size_t used_mem_cnt = 0;
+  for (auto & l : prefetched_experts) {
+    used_mem_cnt += l.size();
+  }
+  LOG(ERROR) << unused_mems.size() << "+" << used_mem_cnt << "=" << unused_mems.size()+used_mem_cnt;
 }

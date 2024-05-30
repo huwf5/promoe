@@ -39,6 +39,7 @@ class AtomicMultiStatusLock {
   void unlock(ExpertStatus from, ExpertStatus to);
   bool try_unlock(ExpertStatus from, ExpertStatus to);
   bool is_locked(ExpertStatus locked_status);
+  ExpertStatus get() { return ExpertStatus(lock_.load()); }
 };
 
 class AtomicLock {
