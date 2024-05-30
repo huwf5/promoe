@@ -19,7 +19,7 @@ class PrefetchTask {
   ExpertHandler* expert = nullptr;
   std::string toString() const {
     std::stringstream ss;
-    ss << layer_idx << "." << expert_idx << "." << mem_buf_idx;
+    ss << layer_idx << "." << expert_idx << "." << mem_buf_idx << ", precise " << (is_precise?"true":"false");
     return ss.str();
   }
 };
