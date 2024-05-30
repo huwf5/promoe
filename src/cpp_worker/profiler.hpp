@@ -47,11 +47,11 @@ class TraceEventCollector {
       os << ",";
     }
     os << "{"
+       << "\"ts\":"   << e.start_ts  << ","
        << "\"name\":" << "\"" << e.event_name << "\"" << ","
        << "\"ph\":"   << "\"" << "X" << "\"" << ","
        << "\"pid\":"  << e.pid << ","
-       << "\"tid\":"  << e.tid << ","
-       << "\"ts\":"   << e.start_ts  << ",";
+       << "\"tid\":"  << e.tid << ",";
     os << "\"dur\":"  << e.stop_ts - e.start_ts << ",";
     // os << "\"cat\":"  << "\"" << cat << "\"" << ",";
     os << "\"id\":"   << id;

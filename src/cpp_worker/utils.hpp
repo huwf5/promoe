@@ -96,6 +96,12 @@ class ModuleMeta {
 };
 
 std::string tensor_to_str(torch::Tensor t);
+inline std::string expert_meta_to_str(int layer, int e) {
+  return std::to_string(layer) + "." + std::to_string(e);
+}
+inline std::string expert_meta_to_str(int layer, int e, int p) {
+  return std::to_string(layer) + "." + std::to_string(e) + "." + std::to_string(p);
+}
 
 template<typename T>
 std::string array_to_str(T* array, size_t len) {

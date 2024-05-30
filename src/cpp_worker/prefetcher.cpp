@@ -229,7 +229,7 @@ void PrefetchMngr::preempt_one_layer(int layer_idx, torch::Tensor experts) {
   preempt_one_layer_(layer_idx, experts.data_ptr<int64_t>(), experts.size(0));
 }
 void PrefetchMngr::wait_and_lock_expert(int layer_id, int expert_id) {
-  TRACE_EVENT_GURAD(kCacheLib, "wait_and_lock_expert");
+  TRACE_EVENT_GURAD(kCacheLib, "wait:"+expert_meta_to_str(layer_id, expert_id));
   LOG(DEBUG) << "waiting expert " << layer_id << "." << expert_id;
   model_loader->get_source(layer_id, expert_id)->expert_status.lock(kReady, kUsing);
   LOG(DEBUG) << "waiting expert " << layer_id << "." << expert_id << " success";
@@ -243,20 +243,16 @@ void PrefetchMngr::try_release_expert(int layer_id, int expert_id) {
     return;
   }
   {
-    {
-      TRACE_EVENT_GURAD(kCacheLib, "try_release_expert.lock_queue");
-      lock_queue();
-    }
+    TRACE_EVENT_GURAD(kCacheLib, "release:"+ expert_meta_to_str(layer_id, expert_id) + ",erase");
+    lock_queue();
     prefetched_experts[layer_id].erase(expert_id);
     unlock_queue();
   }
   // fixme: the memory may should not be released here. add a cache module
   if (expert_handler->gpu_data != nullptr) {
     LOG(TRACE) << "try unlocking expert " << layer_id << "." << expert_id << ": returning it's gpu memory " << expert_handler->gpu_data;
-    {
-      TRACE_EVENT_GURAD(kCacheLib, "try_release_expert.lock_unused_mems");
-      unused_mems_lock.lock();
-    }
+    TRACE_EVENT_GURAD(kCacheLib, "release:"+ expert_meta_to_str(layer_id, expert_id) + ",return mem");
+    unused_mems_lock.lock();
     unused_mems.push_back(expert_handler->gpu_data);
     unused_mems_lock.unlock();
     expert_handler->gpu_data = nullptr;
