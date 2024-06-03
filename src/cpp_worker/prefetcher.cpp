@@ -26,28 +26,24 @@ void PrefetchMngr::preempt_one_layer_(int layer_idx, int64_t *expert_idxs,
       wrong_experts.insert(expert_idxs[i]);
     }
   }
-  //// empty queue, insert all missing experts
-  if (per_layer_job_queues[layer_idx].empty()) {
-    LOG(TRACE) << "preempting one layer " << layer_idx << ", queue is empty";
-    for (auto eid : wrong_experts) {
-      LOG(TRACE) << "preempting one layer " << layer_idx << ", add task for " << eid;
-      add_tasks_for_one_expert(layer_idx, eid, &precise_job_queue);
-    }
-  } else {
+
+  if (per_layer_job_queues[layer_idx].empty() == false) {
     LOG(TRACE) << "preempting one layer " << layer_idx << ", queue is not empty, current task is " << current_task.layer_idx << "." << current_task.expert_idx << "." << current_task.mem_buf_idx;
     per_layer_job_queues[layer_idx].clear();
-
     if (going_experts.size() != 0 && current_task.mem_buf_idx < metas->num_per_expert_param-1) {
       add_tasks_for_one_expert(layer_idx, current_task.expert_idx, &precise_job_queue, current_task.mem_buf_idx+1);
     }
-    for (auto eid : wrong_experts) {
-      LOG(TRACE) << "preempting one layer " << layer_idx << ", add task for " << eid;
-      add_tasks_for_one_expert(layer_idx, eid, &precise_job_queue);
-    }
+  } else {
+    LOG(TRACE) << "preempting one layer " << layer_idx << ", queue is empty";
+  }
+  for (auto eid : wrong_experts) {
+    LOG(TRACE) << "preempting one layer " << layer_idx << ", add task for " << eid;
+    add_tasks_for_one_expert(layer_idx, eid, &precise_job_queue);
   }
 
   unlock_queue();
   num_expert = 0;
+  // reorder expert order to let model use expert in the same order of fetching
   for (auto e : correct_experts) { expert_idxs[num_expert++] = e; }
   for (auto e : going_experts) { expert_idxs[num_expert++] = e; }
   for (auto e : wrong_experts) { expert_idxs[num_expert++] = e; }
