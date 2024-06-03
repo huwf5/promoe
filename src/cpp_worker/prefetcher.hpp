@@ -61,6 +61,7 @@ class PrefetchMngr {
   std::thread prefetch_thread;
   std::thread predict_thread;
   sem_t predictor_send, predictor_done;
+  std::function<void()> try_wait_pretictor_done;
   volatile bool thread_exit_mark = false;
   AtomicQueueLock queue_lock;
 
