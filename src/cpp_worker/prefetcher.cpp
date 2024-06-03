@@ -20,7 +20,7 @@ void PrefetchMngr::preempt_one_layer_(int layer_idx, int64_t *expert_idxs,
   for (int i = 0; i < num_expert; i++) {
     if (current_task.expert != nullptr && current_task.layer_idx == layer_idx && current_task.expert_idx == expert_idxs[i]) {
       going_experts.insert(expert_idxs[i]);
-    } else if (prefetched_experts[layer_idx].find(expert_idxs[i]) != prefetched_experts[layer_idx].end()) {
+    } else if (cache->is_in_cache(layer_idx, expert_idxs[i])) {
       correct_experts.insert(expert_idxs[i]);
     } else {
       wrong_experts.insert(expert_idxs[i]);
@@ -62,7 +62,7 @@ void PrefetchMngr::add_one_layer_task_(int layer_idx, int64_t *expert_idxs,
   for (int i = 0; i < num_expert; i++) {
     LOG(TRACE) << "adding prefetch task " << layer_idx << "," << expert_idxs[i];
     lock_queue();
-    if (prefetched_experts[layer_idx].find(expert_idxs[i]) != prefetched_experts[layer_idx].end()) {
+    if (cache->is_in_cache(layer_idx, expert_idxs[i])) {
       LOG(TRACE) << "skip add prefetch task " << layer_idx << "," << expert_idxs[i];
       unlock_queue();
       continue;
@@ -79,17 +79,14 @@ void PrefetchMngr::do_one_task(PrefetchTask *task) {
     lock_queue();
     // if (prefetched_experts[previous_task.layer_idx].find(previous_task.expert_idx) != prefetched_experts[previous_task.layer_idx].end()) {
       LOG(ERROR) << "removing partially fetched expert " << previous_task.toString();
-      prefetched_experts[previous_task.layer_idx].erase(previous_task.expert_idx);
+      cache->erase(previous_task.layer_idx, previous_task.expert_idx);
     // }
     unlock_queue();
     // we need to release this, since it may be a mispredicted expert in current layer.
     //   but previous task may be from previous layer. the entire layer is released before this function
     if (previous_task.expert->gpu_data != nullptr) {
-      unused_mems_lock.lock();
-      // CHECK(previous_task.expert->gpu_data != nullptr) << previous_task.toString();
-      unused_mems.push_back(previous_task.expert->gpu_data);
+      cache->add_free_buffer(previous_task.expert->gpu_data);
       previous_task.expert->gpu_data = nullptr;
-      unused_mems_lock.unlock();
     }
   }
   previous_task = *task;
@@ -99,19 +96,14 @@ void PrefetchMngr::do_one_task(PrefetchTask *task) {
   }
   if (task->expert->gpu_data == nullptr) {
     LOG(TRACE) << "assigning gpu mem for expert " << task->layer_idx << "," << task->expert_idx << "," << task->mem_buf_idx;
-    unused_mems_lock.lock();
-    if (unused_mems.size() > 0) {
-      task->expert->gpu_data = unused_mems.back();
-      CHECK(task->expert->gpu_data != nullptr);
-      LOG(TRACE) << "assigning gpu mem " << task->expert->gpu_data << " for expert " << task->layer_idx << "," << task->expert_idx << "," << task->mem_buf_idx;
-      unused_mems.pop_back();
-    } else {
-      CHECK(false) << "no remaining mem buffer";
-    }
-    unused_mems_lock.unlock();
+
+    task->expert->gpu_data = cache->allocate_from_free_buffer();
+    CHECK(task->expert->gpu_data != nullptr);
+    LOG(TRACE) << "assigning gpu mem " << task->expert->gpu_data << " for expert " << task->layer_idx << "," << task->expert_idx << "," << task->mem_buf_idx;
+
     // fixme: find one loc from cache
     lock_queue();
-    prefetched_experts[task->layer_idx][task->expert_idx] = task->expert;
+    cache->register_cached(task->expert);
     unlock_queue();
   }
   CUDA_CALL(cudaMemcpyAsync(
@@ -184,17 +176,7 @@ void PrefetchMngr::prefetch_thread_func() {
   }
 }
 void PrefetchMngr::init_gpu_mem_buffer(size_t num_buffers) {
-  unused_mems.resize(num_buffers, nullptr);
-  auto &mem_example = model_loader->get_source(0, 0)->host_data.mem_buffers;
-  for (int i = 0; i < num_buffers; i++) {
-    unused_mems[i] = new ExpertMemHanlder;
-    unused_mems[i]->mem_buffers.resize(mem_example.size());
-    for (int j = 0; j < mem_example.size(); j++) {
-      unused_mems[i]->mem_buffers[j].set_tensor(
-          torch::empty_like(mem_example[j].get_tensor(),
-                            torch::TensorOptions().device(torch::kCUDA, 0)));
-    }
-  }
+  cache->init_gpu_mem_buffer(num_buffers);
 }
 void PrefetchMngr::add_one_layer_task(int layer_idx, torch::Tensor experts) {
   add_one_layer_task_(layer_idx, experts.data_ptr<int64_t>(), experts.size(0));
@@ -232,16 +214,14 @@ void PrefetchMngr::try_release_expert(int layer_id, int expert_id) {
   {
     TRACE_EVENT_GURAD(kCacheLib, "release:"+ expert_meta_to_str(layer_id, expert_id) + ",erase");
     lock_queue();
-    prefetched_experts[layer_id].erase(expert_id);
+    cache->erase(layer_id, expert_id);
     unlock_queue();
   }
   // fixme: the memory may should not be released here. add a cache module
   if (expert_handler->gpu_data != nullptr) {
     LOG(TRACE) << "try unlocking expert " << layer_id << "." << expert_id << ": returning it's gpu memory " << expert_handler->gpu_data;
     TRACE_EVENT_GURAD(kCacheLib, "release:"+ expert_meta_to_str(layer_id, expert_id) + ",return mem");
-    unused_mems_lock.lock();
-    unused_mems.push_back(expert_handler->gpu_data);
-    unused_mems_lock.unlock();
+    cache->add_free_buffer(expert_handler->gpu_data);
     expert_handler->gpu_data = nullptr;
   } else {
     LOG(ERROR) << "try unlocking expert " << layer_id << "." << expert_id << ", but it has no gpu memory";
@@ -268,8 +248,8 @@ PrefetchMngr::PrefetchMngr(std::shared_ptr<ModuleMeta> metas,
                            std::shared_ptr<ModelLoader> model_loader,
                            std::shared_ptr<Predictor> predictor)
     : metas(metas), model_loader(model_loader), predictor(predictor) {
+  this->cache = std::make_shared<CacheMngr>(metas, model_loader);
   per_layer_job_queues.resize(metas->num_layer);
-  prefetched_experts.resize(metas->num_layer);
   sem_init(&predictor_send, 0, 0);
   sem_init(&predictor_done, 0, 0);
   CUDA_CALL(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
@@ -294,7 +274,7 @@ void PrefetchMngr::add_multi_layer_task(torch::Tensor experts) {
     int64_t* expert_idxs = experts[layer_idx].data_ptr<int64_t>();
     for (int i = 0; i < per_layer_num_expert; i++) {
       LOG(TRACE) << "adding prefetch task " << layer_idx << "," << expert_idxs[i];
-      if (prefetched_experts[layer_idx].find(expert_idxs[i]) != prefetched_experts[layer_idx].end()) {
+      if (cache->is_in_cache(layer_idx, expert_idxs[i])) {
         LOG(TRACE) << "skip add prefetch task " << layer_idx << "," << expert_idxs[i];
         continue;
       }
@@ -308,11 +288,6 @@ PrefetchMngr::~PrefetchMngr() {
   sem_post(&predictor_send);
   if (prefetch_thread.joinable()) { prefetch_thread.join(); }
   if (predict_thread.joinable()) { predict_thread.join(); }
-  size_t used_mem_cnt = 0;
-  for (auto & l : prefetched_experts) {
-    used_mem_cnt += l.size();
-  }
-  LOG(ERROR) << unused_mems.size() << "+" << used_mem_cnt << "=" << unused_mems.size()+used_mem_cnt;
 }
 void PrefetchMngr::predict_thread_func() {
   while (true) {

@@ -12,6 +12,7 @@
 #include "utils.hpp"
 #include "model_loader.hpp"
 #include "predictor.hpp"
+#include "cache.hpp"
 
 class PrefetchTask {
  public:
@@ -54,22 +55,20 @@ class PrefetchMngr {
   std::shared_ptr<ModuleMeta> metas;
   std::shared_ptr<ModelLoader> model_loader;
   std::shared_ptr<Predictor> predictor;
+  std::shared_ptr<CacheMngr> cache;
   std::vector<Queue> per_layer_job_queues; // the fetching thread takes out the first task from queue, then execute it.
   Queue precise_job_queue;
-  std::vector<std::unordered_map<int, ExpertHandler*>> prefetched_experts; // the ongoing job also lives in here.
   std::thread prefetch_thread;
   std::thread predict_thread;
   sem_t predictor_send, predictor_done;
   volatile bool thread_exit_mark = false;
-  std::vector<ExpertMemHanlder*> unused_mems;
-  AtomicQueueLock unused_mems_lock;
   AtomicQueueLock queue_lock;
 
   PrefetchTask previous_task;
   PrefetchTask current_task;
   // ExpertHandler * previous_task = nullptr;
 
-  void add_tasks_for_one_expert(int layer_idx, int exper_idx, Queue* queue,
+  void add_tasks_for_one_expert(int layer_idx, int expert_idx, Queue* queue,
                                 int starting_mem_buffer = 0);
 
   void prefetch_thread_func();
