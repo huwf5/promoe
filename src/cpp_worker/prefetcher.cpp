@@ -152,7 +152,7 @@ void PrefetchMngr::add_tasks_for_one_expert(int layer_idx, int expert_idx, Queue
     LOG(TRACE) << "add prefetch task for one param " << layer_idx << "," << expert_idx << "," << j;
   }
 }
-void PrefetchMngr::thread_func() {
+void PrefetchMngr::prefetch_thread_func() {
   while (thread_exit_mark == false) {
     bool found = false;
     lock_queue();
@@ -256,8 +256,9 @@ void PrefetchMngr::try_release_expert_in_layer(int layer_id) {
     try_release_expert(layer_id, expert_id);
   }
 }
-void PrefetchMngr::launch_prefetch_thread() {
-  prefetch_thread = std::thread([this]() { this->thread_func(); });
+void PrefetchMngr::launch_thread() {
+  prefetch_thread = std::thread([this]() { this->prefetch_thread_func(); });
+  predict_thread = std::thread([this]() { this->predict_thread_func(); });
 }
 void PrefetchEngine::init_predictor(std::string model_path) {
   predictor = std::make_shared<Predictor>(this->metas);
@@ -269,6 +270,8 @@ PrefetchMngr::PrefetchMngr(std::shared_ptr<ModuleMeta> metas,
     : metas(metas), model_loader(model_loader), predictor(predictor) {
   per_layer_job_queues.resize(metas->num_layer);
   prefetched_experts.resize(metas->num_layer);
+  sem_init(&predictor_send, 0, 0);
+  sem_init(&predictor_done, 0, 0);
   CUDA_CALL(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
 }
 void PrefetchMngr::record_then_predict_and_launch(int layer_id, torch::Tensor experts) {
@@ -278,26 +281,8 @@ void PrefetchMngr::record_then_predict_and_launch(int layer_id, torch::Tensor ex
   });
   predictor->add_one_layer(layer_id, experts);
   if (layer_id == metas->num_layer - 1) {
-    auto prob = predictor->predict().reshape({metas->num_layer, metas->num_expert});
-    auto sorted = prob.sort(-1, true);
-    // auto predicted_expert_prob = std::get<0>(sorted).slice(1, 0, metas->num_predict_expert_per_layer);
-    auto predicted_expert = std::get<1>(sorted).slice(1, 0, metas->num_predict_expert_per_layer);
-
-    // for (int l = 0; l < metas->num_layer; l++) {
-    //   // auto cur_layer_predicted_expert = predicted_expert[l].slice(0, 0, metas->num_predict_expert_per_layer);
-    //   auto cur_layer_predicted_expert = predicted_expert[l];
-    //   LOG(DEBUG) << "predicted expert" << l << ":" << tensor_to_str(cur_layer_predicted_expert);
-    //   // LOG(DEBUG) << "predicted prob  " << l << ":" << tensor_to_str(predicted_expert_prob[l]);
-    //   this->add_one_layer_task(l, cur_layer_predicted_expert);
-    // }
-
-    LOG_BLOCK(DEBUG, logger, {
-      for (int l = 0; l < metas->num_layer; l++) {
-        logger << "predicted expert" << l << ":" << tensor_to_str(predicted_expert[l]);
-      }
-    });
-    this->add_multi_layer_task(predicted_expert);
-    predictor->clear_access_buffer();
+    sem_post(&predictor_send);
+    sem_wait(&predictor_done);
   }
 }
 void PrefetchMngr::add_multi_layer_task(torch::Tensor experts) {
@@ -320,10 +305,32 @@ void PrefetchMngr::add_multi_layer_task(torch::Tensor experts) {
 }
 PrefetchMngr::~PrefetchMngr() {
   thread_exit_mark = true;
-  prefetch_thread.join();
+  sem_post(&predictor_send);
+  if (prefetch_thread.joinable()) { prefetch_thread.join(); }
+  if (predict_thread.joinable()) { predict_thread.join(); }
   size_t used_mem_cnt = 0;
   for (auto & l : prefetched_experts) {
     used_mem_cnt += l.size();
   }
   LOG(ERROR) << unused_mems.size() << "+" << used_mem_cnt << "=" << unused_mems.size()+used_mem_cnt;
+}
+void PrefetchMngr::predict_thread_func() {
+  while (true) {
+    sem_wait(&predictor_send);
+    if (thread_exit_mark) { break; }
+    TRACE_EVENT_GURAD(kPredict, "predict thread");
+    auto prob = predictor->predict().reshape({metas->num_layer, metas->num_expert});
+    auto sorted = prob.sort(-1, true);
+    // auto predicted_expert_prob = std::get<0>(sorted).slice(1, 0, metas->num_predict_expert_per_layer);
+    auto predicted_expert = std::get<1>(sorted).slice(1, 0, metas->num_predict_expert_per_layer);
+
+    LOG_BLOCK(DEBUG, logger, {
+      for (int l = 0; l < metas->num_layer; l++) {
+        logger << "predicted expert" << l << ":" << tensor_to_str(predicted_expert[l]);
+      }
+    });
+    this->add_multi_layer_task(predicted_expert);
+    predictor->clear_access_buffer();
+    sem_post(&predictor_done);
+  }
 }

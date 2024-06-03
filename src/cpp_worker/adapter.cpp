@@ -36,7 +36,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
   py::class_<PrefetchMngr, std::shared_ptr<PrefetchMngr>>(m, "PrefetchMngr")
     .def(py::init<std::shared_ptr<ModuleMeta>, std::shared_ptr<ModelLoader>, std::shared_ptr<Predictor>>())
-    .def("launch_prefetch_thread", &PrefetchMngr::launch_prefetch_thread)
+    .def("launch_thread", &PrefetchMngr::launch_thread)
     .def("init_gpu_mem_buffer", &PrefetchMngr::init_gpu_mem_buffer)
     .def("wait_and_lock_expert", &PrefetchMngr::wait_and_lock_expert)
     .def("try_release_expert", &PrefetchMngr::try_release_expert)

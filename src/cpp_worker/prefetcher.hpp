@@ -7,6 +7,7 @@
 #include <vector>
 #include <queue>
 #include <cuda_runtime.h>
+#include <semaphore.h>
 
 #include "utils.hpp"
 #include "model_loader.hpp"
@@ -57,6 +58,8 @@ class PrefetchMngr {
   Queue precise_job_queue;
   std::vector<std::unordered_map<int, ExpertHandler*>> prefetched_experts; // the ongoing job also lives in here.
   std::thread prefetch_thread;
+  std::thread predict_thread;
+  sem_t predictor_send, predictor_done;
   volatile bool thread_exit_mark = false;
   std::vector<ExpertMemHanlder*> unused_mems;
   AtomicQueueLock unused_mems_lock;
@@ -69,7 +72,8 @@ class PrefetchMngr {
   void add_tasks_for_one_expert(int layer_idx, int exper_idx, Queue* queue,
                                 int starting_mem_buffer = 0);
 
-  void thread_func();
+  void prefetch_thread_func();
+  void predict_thread_func();
   void do_one_task(PrefetchTask *task);
 
   inline void lock_queue() {
@@ -101,7 +105,7 @@ public:
   void try_release_expert(int layer_id, int expert_id);
   void try_release_expert_in_layer(int layer_id);
 
-  void launch_prefetch_thread();
+  void launch_thread();
 };
 
 class PrefetchEngine {
