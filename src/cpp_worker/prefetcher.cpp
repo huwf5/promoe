@@ -15,6 +15,8 @@ void PrefetchMngr::preempt_one_layer_(int layer_idx, int64_t *expert_idxs,
     LOG(TRACE) << "preempting one layer " << layer_idx << ", releasing previous layer " << prev_layer_idx << " first";
     try_release_expert_in_layer(prev_layer_idx);
   }
+  // incase of predictor thread adding task for same iteration even after the queue is preempted
+  if (layer_idx == 0) { try_wait_pretictor_done(); }
   std::unordered_set<uint64_t> correct_experts, wrong_experts, going_experts;
   lock_queue();
   for (int i = 0; i < num_expert; i++) {
@@ -233,6 +235,7 @@ void PrefetchMngr::try_release_expert_in_layer(int layer_id) {
   }
 }
 void PrefetchMngr::launch_thread() {
+  try_wait_pretictor_done = [this]() { sem_wait(&predictor_done); };
   prefetch_thread = std::thread([this]() { this->prefetch_thread_func(); });
   predict_thread = std::thread([this]() { this->predict_thread_func(); });
 }
@@ -246,8 +249,9 @@ PrefetchMngr::PrefetchMngr(std::shared_ptr<ModuleMeta> metas,
     : metas(metas), model_loader(model_loader), predictor(predictor) {
   this->cache = std::make_shared<CacheMngr>(metas, model_loader);
   per_layer_job_queues.resize(metas->num_layer);
+  try_wait_pretictor_done = [](){};
   sem_init(&predictor_send, 0, 0);
-  sem_init(&predictor_done, 0, 0);
+  sem_init(&predictor_done, 0, 1);
   CUDA_CALL(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
 }
 void PrefetchMngr::record_then_predict_and_launch(int layer_id, torch::Tensor experts) {
@@ -258,7 +262,7 @@ void PrefetchMngr::record_then_predict_and_launch(int layer_id, torch::Tensor ex
   predictor->add_one_layer(layer_id, experts);
   if (layer_id == metas->num_layer - 1) {
     sem_post(&predictor_send);
-    sem_wait(&predictor_done);
+    // sem_wait(&predictor_done);
   }
 }
 void PrefetchMngr::add_multi_layer_task(torch::Tensor experts) {
