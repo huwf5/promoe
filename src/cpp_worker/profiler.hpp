@@ -9,7 +9,9 @@ enum ThreadType {
   kPythonMain = 0,
   kCacheLib,
   kPrefetch,
+  kPredict,
   kGPU,
+  kThreadTypeNum,
 };
 enum EventType {
   kCustomEvent = 0,
@@ -71,6 +73,18 @@ class TraceEventCollector {
     std::stringstream ss;
     dump_json_to_stream(ss);
     return ss.str();
+  }
+};
+
+class Timer {
+ public:
+  uint64_t start;
+  static uint64_t cur_ts_us() { return std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::high_resolution_clock::now().time_since_epoch()).count(); }
+  Timer() {
+    start = cur_ts_us();
+  }
+  uint64_t dur_us() {
+    return cur_ts_us() - start;
   }
 };
 

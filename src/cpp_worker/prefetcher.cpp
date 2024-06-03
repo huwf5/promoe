@@ -1,3 +1,4 @@
+#include <omp.h>
 #include "prefetcher.hpp"
 #include "profiler.hpp"
 #include "logging.hpp"
@@ -300,7 +301,7 @@ void PrefetchMngr::record_then_predict_and_launch(int layer_id, torch::Tensor ex
   }
 }
 void PrefetchMngr::add_multi_layer_task(torch::Tensor experts) {
-  TRACE_EVENT_GURAD(kCacheLib, "add_multi_layer_task");
+  TRACE_EVENT_GURAD(kPredict, "add_multi_layer_task");
   size_t per_layer_num_expert = experts.size(1);
   lock_queue();
   for (int layer_idx = 0; layer_idx < metas->num_layer; layer_idx++) {

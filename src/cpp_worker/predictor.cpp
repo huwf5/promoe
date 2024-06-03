@@ -10,7 +10,7 @@ void Predictor::add_one_layer(int layer_id, int64_t *experts, size_t num_expert)
   }
 }
 torch::Tensor Predictor::predict() {
-  TRACE_EVENT_GURAD(kCacheLib, "predict");
+  TRACE_EVENT_GURAD(kPredict, "predict");
   std::vector<torch::jit::IValue> inputs{this->expert_access_buffer.flatten().unsqueeze(0)};
   return predict_model.forward(inputs).toTensor();
 }

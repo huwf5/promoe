@@ -12,7 +12,7 @@ setup(
             'src/cpp_worker/predictor.cpp',
             'src/cpp_worker/utils.cpp',
             'src/cpp_worker/profiler.cpp',
-        ], extra_compile_args={'cxx': ['-g'], 'nvcc': ['-g']}),
+        ], extra_compile_args={'cxx': ['-g', '-fopenmp'], 'nvcc': ['-g', '-fopenmp']}),
     ],
     cmdclass={
         'build_ext': BuildExtension
