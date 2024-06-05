@@ -17,15 +17,17 @@ void PrefetchMngr::preempt_one_layer_(int layer_idx, int64_t *expert_idxs,
   }
   // incase of predictor thread adding task for same iteration even after the queue is preempted
   if (layer_idx == 0) { try_wait_pretictor_done(); }
-  std::unordered_set<uint64_t> correct_experts, wrong_experts, going_experts;
+  std::unordered_set<uint64_t> done_experts; // correctly predicted and already done
+  std::unordered_set<uint64_t> missed_experts;  // not predicted
+  std::unordered_set<uint64_t> going_experts;   // correctly predicted and started
   lock_queue();
   for (int i = 0; i < num_expert; i++) {
     if (current_task.expert != nullptr && current_task.layer_idx == layer_idx && current_task.expert_idx == expert_idxs[i]) {
       going_experts.insert(expert_idxs[i]);
     } else if (cache->is_in_cache(layer_idx, expert_idxs[i])) {
-      correct_experts.insert(expert_idxs[i]);
+      done_experts.insert(expert_idxs[i]);
     } else {
-      wrong_experts.insert(expert_idxs[i]);
+      missed_experts.insert(expert_idxs[i]);
     }
   }
 
@@ -38,7 +40,7 @@ void PrefetchMngr::preempt_one_layer_(int layer_idx, int64_t *expert_idxs,
   } else {
     LOG(TRACE) << "preempting one layer " << layer_idx << ", queue is empty";
   }
-  for (auto eid : wrong_experts) {
+  for (auto eid : missed_experts) {
     LOG(TRACE) << "preempting one layer " << layer_idx << ", add task for " << eid;
     add_tasks_for_one_expert(layer_idx, eid, &precise_job_queue);
   }
@@ -46,15 +48,16 @@ void PrefetchMngr::preempt_one_layer_(int layer_idx, int64_t *expert_idxs,
   unlock_queue();
   num_expert = 0;
   // reorder expert order to let model use expert in the same order of fetching
-  for (auto e : correct_experts) { expert_idxs[num_expert++] = e; }
-  for (auto e : going_experts) { expert_idxs[num_expert++] = e; }
-  for (auto e : wrong_experts) { expert_idxs[num_expert++] = e; }
+  for (auto e : done_experts)   { expert_idxs[num_expert++] = e; }
+  for (auto e : going_experts)  { expert_idxs[num_expert++] = e; }
+  for (auto e : missed_experts) { expert_idxs[num_expert++] = e; }
   LOG_BLOCK(DEBUG, logger, {
     logger << "reordered expert to " << array_to_str(expert_idxs, num_expert);
   });
 }
 void PrefetchMngr::add_one_layer_task_(int layer_idx, int64_t *expert_idxs,
                                        size_t num_expert) {
+  CHECK(false) << "Deprecated";
   TRACE_EVENT_GURAD(kHook, "add_one_layer_task_");
   CHECK(per_layer_job_queues[layer_idx].empty());
   for (int i = 0; i < num_expert; i++) {
