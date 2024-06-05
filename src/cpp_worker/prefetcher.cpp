@@ -210,7 +210,7 @@ void PrefetchMngr::try_release_expert(int layer_id, int expert_id) {
   }
   // fixme: the cache should not be maintained here. add a cache module
   {
-    TRACE_EVENT_GURAD(kCacheLib, "release:"+ expert_meta_to_str(layer_id, expert_id) + ",erase");
+    TRACE_EVENT_GURAD(kHook, "release:"+ expert_meta_to_str(layer_id, expert_id) + ",erase");
     lock_queue();
     cache->erase(layer_id, expert_id);
     unlock_queue();
@@ -218,7 +218,7 @@ void PrefetchMngr::try_release_expert(int layer_id, int expert_id) {
   // fixme: the memory may should not be released here. add a cache module
   if (expert_handler->gpu_data != nullptr) {
     LOG(TRACE) << "try unlocking expert " << layer_id << "." << expert_id << ": returning it's gpu memory " << expert_handler->gpu_data;
-    TRACE_EVENT_GURAD(kCacheLib, "release:"+ expert_meta_to_str(layer_id, expert_id) + ",return mem");
+    TRACE_EVENT_GURAD(kHook, "release:"+ expert_meta_to_str(layer_id, expert_id) + ",return mem");
     cache->add_free_buffer(expert_handler->gpu_data);
     expert_handler->gpu_data = nullptr;
   } else {
