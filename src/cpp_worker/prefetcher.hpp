@@ -27,6 +27,69 @@ class PrefetchTask {
 };
 
 class Queue {
+  std::vector<PrefetchTask> queue_buffer;
+  int start, stop;
+  void extend() {
+    auto orig_size = queue_buffer.size();
+    queue_buffer.resize(queue_buffer.size() * 2);
+    if (start < stop) { return; }
+    std::copy(queue_buffer.begin(), queue_buffer.begin() + stop, queue_buffer.begin() + orig_size);
+    stop = orig_size + stop;
+    // {
+    //   std::vector<PrefetchTask> new_queue;
+    //   new_queue.resize(queue_buffer.size() * 2);
+    //   auto new_tail = new_queue.begin();
+    //   if (start < stop) {
+    //     new_tail = std::copy(queue_buffer.begin() + start, queue_buffer.begin() + stop, new_tail);
+    //   } else {
+    //     new_tail = std::copy(queue_buffer.begin() + start, queue_buffer.end(), new_tail);
+    //     new_tail = std::copy(queue_buffer.begin(), queue_buffer.begin() + stop, new_tail);
+    //   }
+    //   start = 0;
+    //   stop = new_tail - new_queue.begin();
+    //   queue_buffer.swap(new_queue);
+    // }
+  }
+  int next(int a) { return (a + 1) % queue_buffer.size(); }
+ public:
+  std::unordered_map<int, int> expert_to_remaining_task;
+  Queue() : queue_buffer(10), start(0), stop(0) {}
+  void clear() {
+    expert_to_remaining_task.clear();
+    start = stop;
+  }
+  bool empty() {
+    return start == stop;
+  }
+  PrefetchTask front() {
+    CHECK(empty() == false);
+    return queue_buffer[start];
+  }
+  void pop() {
+    CHECK(empty() == false);
+    expert_to_remaining_task[queue_buffer[start].expert_idx] -= 1;
+    start = next(start);
+  }
+  void push(PrefetchTask task) {
+    if (next(stop) == start) {
+      extend();
+    }
+    queue_buffer[stop] = task;
+    stop = next(stop);
+    if (expert_to_remaining_task.find(task.expert_idx) == expert_to_remaining_task.end()) {
+      expert_to_remaining_task[task.expert_idx] = 0;
+    }
+    expert_to_remaining_task[task.expert_idx] += 1;
+  }
+  int remaining_task(int expert_id) {
+    auto iter = expert_to_remaining_task.find(expert_id);
+    if (iter == expert_to_remaining_task.end()) { return 0; }
+    return iter->second;
+  }
+};
+
+#ifdef DEAD_CODE
+class Queue {
   std::queue<PrefetchTask> queue;
  public:
   void clear() {
@@ -47,6 +110,7 @@ class Queue {
   }
 
 };
+#endif
 
 class ExpertHandler;
 
