@@ -26,6 +26,7 @@ class MemBuffer {
 class ExpertMemHanlder {
  public:
   std::vector<MemBuffer> mem_buffers;
+  int num_ready = 0;
 };
 
 class ExpertHandler {

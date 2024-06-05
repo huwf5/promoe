@@ -24,11 +24,24 @@ class SpinLock {
     }
 };
 
+// enum ExpertStatus {
+//   // kHost = 0,
+//   kFetching = 0,
+//   kReady = 2,
+//   kUsing = 3,
+// };
+
+// fixme: is it necessary to distinguish idle, queue, fetching?
 enum ExpertStatus {
-  // kHost = 0,
-  kFetching = 0,
-  kReady = 2,
-  kUsing = 3,
+  kIdle = 0,
+  // kQueue,
+  kFetching,
+  kReady,
+  kUsing,
+
+  // fixme: a new status design
+  // prefetcher: idle, queue, fetching, ready
+  // inference: using
 };
 
 class AtomicMultiStatusLock {
@@ -37,6 +50,25 @@ class AtomicMultiStatusLock {
   AtomicMultiStatusLock() : lock_(0) {}
   void lock(ExpertStatus from, ExpertStatus to);
   void unlock(ExpertStatus from, ExpertStatus to);
+  ExpertStatus try_transfer(ExpertStatus from, ExpertStatus to) {
+    int from_ = from;
+    lock_.compare_exchange_strong(from_, to);
+    return (ExpertStatus)from_;
+  }
+  ExpertStatus transfer(ExpertStatus from, ExpertStatus to, bool abort_on_fail = true) {
+    auto ret = try_transfer(from, to);
+    if (abort_on_fail) {
+      CHECK(ret == from);
+    }
+    return ret;
+  }
+  void wait(ExpertStatus from, ExpertStatus to) {
+    int from_ = from, to_ = to;
+    while (lock_.compare_exchange_strong(from_, to_) == false) {
+      from_ = from;
+    };
+  }
+  
   bool try_unlock(ExpertStatus from, ExpertStatus to);
   bool is_locked(ExpertStatus locked_status);
   ExpertStatus get() { return ExpertStatus(lock_.load()); }

@@ -120,7 +120,13 @@ class PrefetchMngr {
   std::shared_ptr<ModelLoader> model_loader;
   std::shared_ptr<Predictor> predictor;
   std::shared_ptr<CacheMngr> cache;
+  /**
+   * protected by queue_lock
+   */
   std::vector<Queue> per_layer_job_queues; // the fetching thread takes out the first task from queue, then execute it.
+  /**
+   * protected by queue_lock
+   */
   Queue precise_job_queue;
   std::thread prefetch_thread;
   std::thread predict_thread;
@@ -129,7 +135,13 @@ class PrefetchMngr {
   volatile bool thread_exit_mark = false;
   AtomicQueueLock queue_lock;
 
+  /**
+   * protected by queue_lock
+   */
   PrefetchTask previous_task;
+  /**
+   * protected by queue_lock
+   */
   PrefetchTask current_task;
   // ExpertHandler * previous_task = nullptr;
 
