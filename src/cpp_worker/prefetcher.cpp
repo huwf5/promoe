@@ -5,7 +5,7 @@
 
 void PrefetchMngr::preempt_one_layer_(int layer_idx, int64_t *expert_idxs,
                                       size_t num_expert) {
-  TRACE_EVENT_GURAD(kCacheLib, "preempt_one_layer_");
+  TRACE_EVENT_GURAD(kHook, "preempt_one_layer_");
   LOG_BLOCK(DEBUG, logger, {
     logger << "preempting one layer " << layer_idx << " with expert " << array_to_str(expert_idxs, num_expert);
   });
@@ -55,7 +55,7 @@ void PrefetchMngr::preempt_one_layer_(int layer_idx, int64_t *expert_idxs,
 }
 void PrefetchMngr::add_one_layer_task_(int layer_idx, int64_t *expert_idxs,
                                        size_t num_expert) {
-  TRACE_EVENT_GURAD(kCacheLib, "add_one_layer_task_");
+  TRACE_EVENT_GURAD(kHook, "add_one_layer_task_");
   CHECK(per_layer_job_queues[layer_idx].empty());
   for (int i = 0; i < num_expert; i++) {
     LOG(TRACE) << "adding prefetch task " << layer_idx << "," << expert_idxs[i];
@@ -183,7 +183,7 @@ void PrefetchMngr::preempt_one_layer(int layer_idx, torch::Tensor experts) {
   preempt_one_layer_(layer_idx, experts.data_ptr<int64_t>(), experts.size(0));
 }
 void PrefetchMngr::wait_and_lock_expert(int layer_id, int expert_id) {
-  TRACE_EVENT_GURAD(kCacheLib, "wait:"+expert_meta_to_str(layer_id, expert_id));
+  TRACE_EVENT_GURAD(kHook, "wait:"+expert_meta_to_str(layer_id, expert_id));
   LOG(DEBUG) << "waiting expert " << layer_id << "." << expert_id;
   model_loader->get_source(layer_id, expert_id)->expert_status.lock(kReady, kUsing);
   LOG(DEBUG) << "waiting expert " << layer_id << "." << expert_id << " success";
@@ -229,7 +229,7 @@ void PrefetchMngr::try_release_expert(int layer_id, int expert_id) {
   expert_handler->expert_status.unlock(cur_status, kFetching);
 }
 void PrefetchMngr::try_release_expert_in_layer(int layer_id) {
-  TRACE_EVENT_GURAD(kCacheLib, "try_release:" + std::to_string(layer_id));
+  TRACE_EVENT_GURAD(kHook, "try_release:" + std::to_string(layer_id));
   for (int expert_id = 0; expert_id < metas->num_expert; expert_id++) {
     try_release_expert(layer_id, expert_id);
   }
@@ -255,7 +255,7 @@ PrefetchMngr::PrefetchMngr(std::shared_ptr<ModuleMeta> metas,
   CUDA_CALL(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
 }
 void PrefetchMngr::record_then_predict_and_launch(int layer_id, torch::Tensor experts) {
-  TRACE_EVENT_GURAD(kCacheLib, "record_then_predict_and_launch");
+  TRACE_EVENT_GURAD(kHook, "record_then_predict_and_launch");
   LOG_BLOCK(DEBUG, logger, {
     logger << "actual " << layer_id << ":" << tensor_to_str(experts);
   });

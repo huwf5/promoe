@@ -57,7 +57,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
   py::class_<TraceEventGuard, std::shared_ptr<TraceEventGuard>>(m, "TraceEventGuard")
     .def(py::init<>())
-    .def("init", &TraceEventGuard::init)
+    .def("init", &TraceEventGuard::init, "docstring", py::arg(), py::arg(), py::arg("phase")='X')
     .def("release", &TraceEventGuard::release)
   ;
 
@@ -65,7 +65,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
   py::enum_<ThreadType>(m, "ThreadType")
     .value("kPythonMain", ThreadType::kPythonMain)
-    .value("kCacheLib", ThreadType::kCacheLib)
+    .value("kHook", ThreadType::kHook)
     .value("kPrefetch", ThreadType::kPrefetch)
     .value("kGPU", ThreadType::kGPU)
     .export_values();
