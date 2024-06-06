@@ -13,67 +13,43 @@ void PrefetchMngr::preempt_one_layer_(int layer_idx, int64_t *expert_idxs,
   {
     int prev_layer_idx = (layer_idx + metas->num_layer - 1) % metas->num_layer;
     LOG(TRACE) << "preempting one layer " << layer_idx << ", releasing previous layer " << prev_layer_idx << " first";
-    try_release_expert_in_layer(prev_layer_idx);
+    // try_release_expert_in_layer(prev_layer_idx);
   }
   // incase of predictor thread adding task for same iteration even after the queue is preempted
   if (layer_idx == 0) { try_wait_pretictor_done(); }
-  std::unordered_set<uint64_t> done_experts; // correctly predicted and already done
-  std::unordered_set<uint64_t> missed_experts;  // not predicted
-  std::unordered_set<uint64_t> going_experts;   // correctly predicted and started
-  lock_queue();
-  #ifdef DEAD_CODE
+  std::vector<uint64_t> correct_done_experts; // correctly predicted and already done
+  std::vector<uint64_t> not_started_experts;  // not predicted
+  std::vector<uint64_t> correct_going_experts;   // correctly predicted and started
+  lock_task_queue();
 
   for (int i = 0; i < num_expert; i++) {
-    if (current_task.expert != nullptr && current_task.layer_idx == layer_idx && current_task.expert_idx == expert_idxs[i]) {
-      going_experts.insert(expert_idxs[i]);
-    } else if (cache->is_in_cache(layer_idx, expert_idxs[i])) {
-      done_experts.insert(expert_idxs[i]);
-    } else {
-      missed_experts.insert(expert_idxs[i]);
-    }
-  }
-
-  if (per_layer_job_queues[layer_idx].empty() == false) {
-    LOG(TRACE) << "preempting one layer " << layer_idx << ", queue is not empty, current task is " << current_task.layer_idx << "." << current_task.expert_idx << "." << current_task.mem_buf_idx;
-    per_layer_job_queues[layer_idx].clear();
-    if (going_experts.size() != 0 && current_task.mem_buf_idx < metas->num_per_expert_param-1) {
-      add_tasks_for_one_expert(layer_idx, current_task.expert_idx, &precise_job_queue, current_task.mem_buf_idx+1);
-    }
-  } else {
-    LOG(TRACE) << "preempting one layer " << layer_idx << ", queue is empty";
-  }
-  for (auto eid : missed_experts) {
-    LOG(TRACE) << "preempting one layer " << layer_idx << ", add task for " << eid;
-    add_tasks_for_one_expert(layer_idx, eid, &precise_job_queue);
-  }
-
-  #endif
-
-  for (int i = 0; i < num_expert; i++) {
-    // kIdle: miss predicted
-    // kQueue: correctly predicted, in queue, not started
-    // kFetching: correctly predicted, maybe in queue, already started fetching
+    // kIdle: in queue or not in queue. not started
+    // kFetching: correctly predicted, maybe in queue, already started fetching (may not be the current task)
     // kReady: correctly predicted, already fetched
     // kUsing: impossible
     // inside this lock, only the status of current/previous task may change:
     //   previous:
     //     - kFetching -> kIdle, a wrong task is preempted
     //   current:
-    //     - kQueue -> kFetching, a task just starts
+    //     - kIdle -> kFetching, a task just starts
     //     - kFetching -> kReady, a task finishes
+    //   other expert may also change, since it may be evicted!!!!!!
     auto e = model_loader->get_source(layer_idx, expert_idxs[i]);
     if (e == current_task.expert) {
-      // cur_status must be kFetching, kReady
+      // cur_status must be kIdle, kFetching, kReady
+      // fixme: how to avoid this task to be evicted?
+      //   by adding a redundant precise task
       auto cur_status = e->expert_status.get();
-      CHECK(cur_status == kFetching || cur_status == kReady || cur_status == kIdle); // fixme
-      going_experts.insert(expert_idxs[i]);
+      CHECK(cur_status == kFetching || cur_status == kReady || cur_status == kIdle);
+      correct_going_experts.push_back(expert_idxs[i]);
     } else {
-      auto cur_status = e->expert_status.get();
+      auto cur_status = e->expert_status.transfer(kReady, kLaunching, false);
       switch (cur_status) {
-        case kReady:    { done_experts.insert(expert_idxs[i]); break; }
-        // case kQueue:    { queue_experts.insert(expert_idxs[i]); break; }
-        case kIdle:     { missed_experts.insert(expert_idxs[i]); break; }
-        // case kFetching:
+        // fixme: reorder done experts by order in cache evict policy to improve performance
+        case kReady:    { correct_done_experts.push_back(expert_idxs[i]); break; }
+        // case kQueue:    { queue_experts.push_back(expert_idxs[i]); break; }
+        case kIdle:     { not_started_experts.push_back(expert_idxs[i]); break; }
+        case kFetching: { not_started_experts.insert(not_started_experts.begin(), expert_idxs[i]); break; } // previously partially fetched then preempted expert
         // case kUsing:
         default: { CHECK(false); }
       }
@@ -83,22 +59,23 @@ void PrefetchMngr::preempt_one_layer_(int layer_idx, int64_t *expert_idxs,
   if (per_layer_job_queues[layer_idx].empty() == false) {
     LOG(TRACE) << "preempting one layer " << layer_idx << ", queue is not empty, current task is " << current_task.toString();
     per_layer_job_queues[layer_idx].clear();
-    if (going_experts.size() != 0 && current_task.mem_buf_idx < metas->num_per_expert_param-1) {
-      add_tasks_for_one_expert(layer_idx, current_task.expert_idx, &precise_job_queue, current_task.mem_buf_idx+1);
-    }
   } else {
     LOG(TRACE) << "preempting one layer " << layer_idx << ", queue is empty";
   }
-  for (auto eid : missed_experts) {
+  for (auto eid : correct_going_experts) {
     LOG(TRACE) << "preempting one layer " << layer_idx << ", add task for " << eid;
-    add_tasks_for_one_expert(layer_idx, eid, &precise_job_queue);
+    add_tasks_for_one_expert(layer_idx, eid, &precise_job_queue, std::min(current_task.mem_buf_idx + 1, metas->num_per_expert_param-1), true);
   }
-  unlock_queue();
+  for (auto eid : not_started_experts) {
+    LOG(TRACE) << "preempting one layer " << layer_idx << ", add task for " << eid;
+    add_tasks_for_one_expert(layer_idx, eid, &precise_job_queue, 0, true);
+  }
+  unlock_task_queue();
   num_expert = 0;
   // reorder expert order to let model use expert in the same order of fetching
-  for (auto e : done_experts)   { expert_idxs[num_expert++] = e; }
-  for (auto e : going_experts)  { expert_idxs[num_expert++] = e; }
-  for (auto e : missed_experts) { expert_idxs[num_expert++] = e; }
+  for (auto e : correct_done_experts)   { expert_idxs[num_expert++] = e; }
+  for (auto e : correct_going_experts)  { expert_idxs[num_expert++] = e; }
+  for (auto e : not_started_experts) { expert_idxs[num_expert++] = e; }
   LOG_BLOCK(DEBUG, logger, {
     logger << "reordered expert to " << array_to_str(expert_idxs, num_expert);
   });
@@ -106,65 +83,49 @@ void PrefetchMngr::preempt_one_layer_(int layer_idx, int64_t *expert_idxs,
 void PrefetchMngr::add_one_layer_task_(int layer_idx, int64_t *expert_idxs,
                                        size_t num_expert) {
   CHECK(false) << "Deprecated";
-  TRACE_EVENT_GURAD(kHook, "add_one_layer_task_");
-  CHECK(per_layer_job_queues[layer_idx].empty());
-  for (int i = 0; i < num_expert; i++) {
-    LOG(TRACE) << "adding prefetch task " << layer_idx << "," << expert_idxs[i];
-    lock_queue();
-    if (cache->is_in_cache(layer_idx, expert_idxs[i])) {
-      LOG(TRACE) << "skip add prefetch task " << layer_idx << "," << expert_idxs[i];
-      unlock_queue();
-      continue;
-    }
-    add_tasks_for_one_expert(layer_idx, expert_idxs[i], &per_layer_job_queues[layer_idx]);
-    unlock_queue();
-  }
 }
 void PrefetchMngr::do_one_task(PrefetchTask *task) {
   TRACE_EVENT_GURAD(kPrefetch, "do:" + task->toString());
-  LOG(DEBUG) << "do one prefetch task " << task->layer_idx << "," << task->expert_idx << "," << task->mem_buf_idx << ", precise " << task->is_precise;
-  // if (previous_task.expert != nullptr && previous_task.expert != task->expert &&
-  //     previous_task.mem_buf_idx != metas->num_per_expert_param-1) {
-  //   // fixme: this cheking may cause bug
-  //   LOG(ERROR) << "removing partially fetched expert " << previous_task.toString();
-  //   cache->evict(previous_task.expert);
-  //   previous_task.expert->expert_status.transfer(kFetching, kIdle);
-  // }
+  LOG(DEBUG) << "do one prefetch task " << task->toString();
+
+  // nullptr and 0: first time task
+  // nullptr and >0 : a partial task gets evicted
+  // not nullptr and 0: duplicated
+  // not nullptr and not 0: normal
 
   if (task->expert->gpu_data == nullptr) {
-    // a first time task
-    CHECK(task->mem_buf_idx == 0);
-    LOG(TRACE) << "assigning gpu mem for expert " << task->layer_idx << "," << task->expert_idx << "," << task->mem_buf_idx;
-    cache->miss(task->expert);
-    CHECK(task->expert->gpu_data->num_ready == 0);
-    task->expert->expert_status.transfer(kIdle, kFetching);
-    LOG(TRACE) << "assigning gpu mem " << task->expert->gpu_data << " for expert " << task->layer_idx << "," << task->expert_idx << "," << task->mem_buf_idx;
+    if (task->mem_buf_idx != 0) {
+      LOG(ERROR) << "a partial task gets evicted " << task->toString();
+      CHECK(task->is_precise == false);
+      CHECK(task->expert->expert_status.get() == kIdle);
+      // task->expert->expert_status.transfer(kIdle, kIdle);
+      return;
+    } else {
+      // a first time task
+      LOG(TRACE) << "assigning gpu mem for expert " << task->toString();
+      cache->miss(task->expert);
+      CHECK(task->expert->gpu_data->num_ready == 0);
+      task->expert->expert_status.transfer(kIdle, kFetching);
+      // LOG(TRACE) << "assigning gpu mem " << task->expert->gpu_data << " for expert " << task->toString();
+    }
   }
 
   auto orig_status = task->expert->expert_status.get();
   if (task->expert->gpu_data->num_ready > task->mem_buf_idx) {
-    LOG(ERROR) << "a duplicated partial task, skip it: expert " << task->toString() << ", " << task->expert->gpu_data->num_ready << ">" << task->mem_buf_idx;
+    LOG(TRACE) << "a duplicated partial task, skip it: expert " << task->toString() << ", " << task->expert->gpu_data->num_ready << ">" << task->mem_buf_idx;
     if (task->expert->gpu_data->num_ready == metas->num_per_expert_param) {
-      CHECK(orig_status == kReady || orig_status == kUsing);
+      if (task->is_precise) {
+        task->expert->expert_status.transfer(kReady, kLaunching, false);
+      }
+      CHECK(orig_status == kReady || orig_status == kUsing || orig_status == kLaunching);
     } else {
       CHECK(orig_status == kFetching);
     }
     return;
   } else {
+    CHECK(task->expert->gpu_data->num_ready == task->mem_buf_idx);
     CHECK(orig_status == kFetching);
   }
-
-  #ifdef DEAD_CODE
-  if (task->expert->expert_status.is_locked(kFetching) == false) {
-    LOG(ERROR) << "a duplicated task, skip it: expert " << task->toString() << ", status " << task->expert->expert_status.get();
-    return;
-  }
-  if (task->expert->gpu_data == nullptr) {
-    LOG(TRACE) << "assigning gpu mem for expert " << task->layer_idx << "," << task->expert_idx << "," << task->mem_buf_idx;
-    cache->miss(task->expert);
-    LOG(TRACE) << "assigning gpu mem " << task->expert->gpu_data << " for expert " << task->layer_idx << "," << task->expert_idx << "," << task->mem_buf_idx;
-  }
-  #endif
 
   CUDA_CALL(cudaMemcpyAsync(
       task->expert->gpu_data->mem_buffers[task->mem_buf_idx].ptr(),
@@ -184,36 +145,36 @@ void PrefetchMngr::do_one_task(PrefetchTask *task) {
     //       metas->param_name_list[i],
     //       task->expert->gpu_data->mem_buffers[i].get_tensor());
     // }
-    LOG(DEBUG) << "all fetch job done for expert " << task->layer_idx << "," << task->expert_idx << "," << task->mem_buf_idx;
+    LOG(DEBUG) << "all fetch job done for expert " << task->toString();
 
     // CUDA_CALL(cudaStreamSynchronize(this->stream));
-    task->expert->expert_status.transfer(kFetching, kReady);
+    task->expert->expert_status.transfer(kFetching, task->is_precise ? kLaunching : kReady);
   }
 }
 void PrefetchEngine::init_prefetch_worker() {
   prefetch_worker = std::make_shared<PrefetchMngr>(metas, model_loader, predictor);
 }
-void PrefetchMngr::add_tasks_for_one_expert(int layer_idx, int expert_idx, Queue* queue,
-                                            int starting_mem_buffer) {
+void PrefetchMngr::add_tasks_for_one_expert(int layer_idx, int expert_idx, TaskQueue* queue,
+                                            int starting_mem_buffer, bool is_precise) {
   auto expert_handler = model_loader->get_source(layer_idx, expert_idx);
+  LOG(TRACE) << "add prefetch task for one param " << expert_handler->toString() << ", starting from " << starting_mem_buffer;
   for (int j = starting_mem_buffer; j < expert_handler->host_data.mem_buffers.size(); j++) {
     PrefetchTask task;
     task.layer_idx = layer_idx;
     task.expert_idx = expert_idx;
     task.mem_buf_idx = j;
     task.expert = expert_handler;
+    task.is_precise = is_precise;
     queue->push(task);
-    LOG(TRACE) << "add prefetch task for one param " << layer_idx << "," << expert_idx << "," << j;
   }
 }
 void PrefetchMngr::prefetch_thread_func() {
   while (thread_exit_mark == false) {
     bool found = false;
-    lock_queue();
+    lock_task_queue();
     if (!precise_job_queue.empty()) {
       previous_task = current_task;
       current_task = precise_job_queue.front();
-      current_task.is_precise = true;
       precise_job_queue.pop();
       found = true;
     } else {
@@ -231,10 +192,10 @@ void PrefetchMngr::prefetch_thread_func() {
     }
 
     if (found) {
-      unlock_queue();
+      unlock_task_queue();
       do_one_task(&current_task);
     } else {
-      unlock_queue();
+      unlock_task_queue();
       usleep(10);
     }
   }
@@ -245,56 +206,32 @@ void PrefetchMngr::init_gpu_mem_buffer(size_t num_buffers) {
 void PrefetchMngr::add_one_layer_task(int layer_idx, torch::Tensor experts) {
   add_one_layer_task_(layer_idx, experts.data_ptr<int64_t>(), experts.size(0));
 }
-void PrefetchMngr::preempt_one_layer(int layer_idx, torch::Tensor experts) {
+void PrefetchMngr::preempt_and_launch_one_layer(int layer_idx, torch::Tensor experts) {
   preempt_one_layer_(layer_idx, experts.data_ptr<int64_t>(), experts.size(0));
 }
-void PrefetchMngr::wait_and_lock_expert(int layer_id, int expert_id) {
-  TRACE_EVENT_GURAD(kHook, "wait:"+expert_meta_to_str(layer_id, expert_id));
-  LOG(DEBUG) << "waiting expert " << layer_id << "." << expert_id;
-  model_loader->get_source(layer_id, expert_id)->expert_status.wait(kReady, kUsing);
-  LOG(DEBUG) << "waiting expert " << layer_id << "." << expert_id << " success";
+void PrefetchMngr::wait_expert(int layer_id, int expert_id) {
+  auto expert = model_loader->get_source(layer_id, expert_id);
+  TRACE_EVENT_GURAD(kHook, "wait:" + expert->toString());
+  LOG(DEBUG) << "waiting expert " << expert->toString();
+  // model_loader->get_source(layer_id, expert_id)->expert_status.wait(kReady, kLaunching);
+  expert->expert_status.wait(kLaunching, kLaunching);
+  LOG(DEBUG) << "waiting expert " << expert->toString() << " success";
 }
+void PrefetchMngr::record_cuda_event(int layer_id, int expert_id) {
+  CHECK(false) << "Deprecated";
+  CUDA_CALL(cudaEventRecord(model_loader->get_source(layer_id, expert_id)->event, nullptr));
+}
+void PrefetchMngr::mark_expert_using(int layer_id, int expert_id) {
+  auto expert = model_loader->get_source(layer_id, expert_id);
+  CUDA_CALL(cudaEventRecord(expert->event, nullptr));
+  expert->expert_status.transfer(kLaunching, kUsing);
+
+  expert_usage_queue_lock.lock();
+  expert_usage_queue.push(expert);
+  expert_usage_queue_lock.unlock();
+}
+
 void PrefetchMngr::try_release_expert(int layer_id, int expert_id) {
-  #ifdef DEAD_CODE
-  /**
-   * kFetching: skip it
-   * kReady: a prefetched expert, but not used by model.
-   *    currently we release it's memory here and reset it to kFetching
-   * kUsing: a prefetched expert, and is touched by model. 
-   *    we should reset it to kReady
-   *    but currently we release it's memory and reset it to kFetching
-   *
-   * concurrent release may happen between
-   *    - prefetch thread, it checks previous task and clear a partial task (but this does not all this function)
-   *    - python api, it calls preempt and releases previous layer
-   */
-  LOG(TRACE) << "try unlocking expert " << layer_id << "." << expert_id;
-  auto expert_handler = model_loader->get_source(layer_id, expert_id);
-  auto cur_status = expert_handler->expert_status.get();
-  if (cur_status == kFetching) {
-    LOG(TRACE) << "try unlocking expert " << layer_id << "." << expert_id << ": it's not fetched";
-    return;
-  }
-  // fixme: the cache should not be maintained here. add a cache module
-  {
-    TRACE_EVENT_GURAD(kHook, "release:"+ expert_meta_to_str(layer_id, expert_id) + ",erase");
-    lock_queue();
-    cache->erase(layer_id, expert_id);
-    unlock_queue();
-  }
-  // fixme: the memory may should not be released here. add a cache module
-  if (expert_handler->gpu_data != nullptr) {
-    LOG(TRACE) << "try unlocking expert " << layer_id << "." << expert_id << ": returning it's gpu memory " << expert_handler->gpu_data;
-    TRACE_EVENT_GURAD(kHook, "release:"+ expert_meta_to_str(layer_id, expert_id) + ",return mem");
-    cache->add_free_buffer(expert_handler->gpu_data);
-    expert_handler->gpu_data = nullptr;
-  } else {
-    LOG(ERROR) << "try unlocking expert " << layer_id << "." << expert_id << ", but it has no gpu memory";
-  }
-  // auto unlock_success = expert_handler->expert_status.try_unlock(kUsing, kFetching);
-  // LOG(TRACE) << "try unlocking expert " << layer_id << "." << expert_id << " success:" << unlock_success;
-  expert_handler->expert_status.unlock(cur_status, kFetching);
-  #endif
   LOG(TRACE) << "try unlocking expert " << layer_id << "." << expert_id;
   auto expert_handler = model_loader->get_source(layer_id, expert_id);
   auto cur_status = expert_handler->expert_status.transfer(kUsing, kReady, false);
@@ -313,6 +250,7 @@ void PrefetchMngr::launch_thread() {
   try_wait_pretictor_done = [this]() { sem_wait(&predictor_done); };
   prefetch_thread = std::thread([this]() { this->prefetch_thread_func(); });
   predict_thread = std::thread([this]() { this->predict_thread_func(); });
+  expert_unlocker_thread = std::thread([this]() { this->expert_unlocker_thread_func(); });
 }
 void PrefetchEngine::init_predictor(std::string model_path) {
   predictor = std::make_shared<Predictor>(this->metas);
@@ -329,7 +267,7 @@ PrefetchMngr::PrefetchMngr(std::shared_ptr<ModuleMeta> metas,
   sem_init(&predictor_done, 0, 1);
   CUDA_CALL(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
 }
-void PrefetchMngr::record_then_predict_and_launch(int layer_id, torch::Tensor experts) {
+void PrefetchMngr::record_then_predict_and_prefetch(int layer_id, torch::Tensor experts) {
   TRACE_EVENT_GURAD(kHook, "record_then_predict_and_launch");
   LOG_BLOCK(DEBUG, logger, {
     logger << "actual " << layer_id << ":" << tensor_to_str(experts);
@@ -344,26 +282,31 @@ void PrefetchMngr::add_multi_layer_task(torch::Tensor experts) {
   TRACE_EVENT_GURAD(kPredict, "add_multi_layer_task");
   size_t per_layer_num_expert = experts.size(1);
   for (int layer_idx = 0; layer_idx < metas->num_layer; layer_idx++) {
-    lock_queue();
+    lock_task_queue();
     CHECK(per_layer_job_queues[layer_idx].empty());
     int64_t* expert_idxs = experts[layer_idx].data_ptr<int64_t>();
     for (int i = 0; i < per_layer_num_expert; i++) {
-      LOG(TRACE) << "adding prefetch task " << layer_idx << "," << expert_idxs[i];
-      auto cur_status = model_loader->get_source(layer_idx, expert_idxs[i])->expert_status.get();
+      auto expert = model_loader->get_source(layer_idx, expert_idxs[i]);
+      LOG(TRACE) << "adding prefetch task " << expert->toString();
+      auto cur_status = expert->expert_status.get();
       if (cur_status == kReady || cur_status == kUsing) {
-        LOG(TRACE) << "skip add prefetch task " << layer_idx << "," << expert_idxs[i];
+        LOG(TRACE) << "skip add prefetch task " << expert->toString();
         continue;
       }
       add_tasks_for_one_expert(layer_idx, expert_idxs[i], &per_layer_job_queues[layer_idx]);
     }
-    unlock_queue();
+    unlock_task_queue();
   }
 }
 PrefetchMngr::~PrefetchMngr() {
+  // for (int l = 0; l < metas->num_layer; l++) {
+  //   try_release_expert_in_layer(l);
+  // }
   thread_exit_mark = true;
   sem_post(&predictor_send);
   if (prefetch_thread.joinable()) { prefetch_thread.join(); }
   if (predict_thread.joinable()) { predict_thread.join(); }
+  if (expert_unlocker_thread.joinable()) { expert_unlocker_thread.join(); }
 }
 void PrefetchMngr::predict_thread_func() {
   while (true) {
@@ -383,5 +326,29 @@ void PrefetchMngr::predict_thread_func() {
     this->add_multi_layer_task(predicted_expert);
     predictor->clear_access_buffer();
     sem_post(&predictor_done);
+  }
+}
+void PrefetchMngr::expert_unlocker_thread_func() {
+  while (true) {
+    if (thread_exit_mark) {
+      break;
+    }
+    ExpertHandler* expert = nullptr;
+    expert_usage_queue_lock.lock();
+    if (expert_usage_queue.empty() == false) {
+      expert = expert_usage_queue.front();
+      expert_usage_queue.pop();
+      CHECK(expert != nullptr);
+    }
+    expert_usage_queue_lock.unlock();
+
+    if (expert == nullptr) {
+      usleep(10);
+      continue;
+    } else {
+      expert->expert_status.wait(kUsing, kUsing);
+      CUDA_CALL(cudaEventSynchronize(expert->event));
+      expert->expert_status.transfer(kUsing, kReady);
+    }
   }
 }

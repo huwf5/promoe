@@ -1,5 +1,6 @@
 #include <torch/extension.h>
 #include "model_loader.hpp"
+#include "logging.hpp"
 void ModelLoader::add_one_expert_param(torch::Tensor param, int layer_id,
                                        int expert_id, int param_id) {
   ExpertHandler *expert_handler = nullptr;
@@ -9,6 +10,7 @@ void ModelLoader::add_one_expert_param(torch::Tensor param, int layer_id,
     expert_handler->layer_idx = layer_id;
     expert_handler->host_data.mem_buffers.resize(metas->num_per_expert_param);
     expert_handler->reference_to_model_param.mem_buffers.resize(metas->num_per_expert_param);
+    CUDA_CALL(cudaEventCreateWithFlags(&expert_handler->event, cudaEventDisableTiming));
     source_list[metas->squeeze_expert_idx(layer_id, expert_id)] = expert_handler;
   } else {
     expert_handler = source_list[metas->squeeze_expert_idx(layer_id, expert_id)];

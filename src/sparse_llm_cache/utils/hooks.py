@@ -177,10 +177,11 @@ class ExpertHook(ModelHook):
   # def init_hook(self, module):
   #   return super().init_hook(module)
   def pre_forward(self, module, *args, **kwargs):
-    self.prefetch_mngr.wait_and_lock_expert(module._layer_id, module._expert_id)
+    self.prefetch_mngr.wait_expert(module._layer_id, module._expert_id)
     return args, kwargs
-  # def post_forward(self, module, output):
-  #   return output
+  def post_forward(self, module, output):
+    self.prefetch_mngr.mark_expert_using(module._layer_id, module._expert_id)
+    return output
   # def detach_hook(self, module):
   #   return super().detach_hook(module)
 

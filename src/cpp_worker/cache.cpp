@@ -50,16 +50,35 @@ void CacheMngr::handle_miss(ExpertHandler *expert) {
     unused_mems.pop_back();
   } else {
     auto e_to_evict = policy->select_for_evict(expert);
-    expert->gpu_data = evict(e_to_evict, true);
+    expert->gpu_data = evict(e_to_evict, expert, true);
   }
   prefetched_experts[expert->layer_idx][expert->expert_idx] = expert;
 }
-ExpertMemHanlder* CacheMngr::evict(ExpertHandler *expert, bool reserve_mem) {
-  TRACE_EVENT_GURAD(kCache, "evict:" + expert_meta_to_str(expert->layer_idx, expert->expert_idx));
-  CHECK(expert->expert_status.is_locked(kUsing) == false) << "Trying to evict an expert in use. Maybe the cache size is too small?";
+ExpertMemHanlder* CacheMngr::evict(ExpertHandler *expert, ExpertHandler *incoming_e, bool reserve_mem) {
+  TRACE_EVENT_GURAD(kCache, "evict " + expert->toString());
+  LOG(TRACE) << "cache evict " << expert->toString();
+  CHECK(expert != incoming_e);
+  // kIdle: ?
+  // kFetching: ?
+  // kReady: ?
+  // kLaunching: wait till using, then wait for event, set back to idle
+  // kUsing: wait for event, then set back to idle
+  // expert->expert_status.wait(kReady, ExpertStatus to)
+
+  auto orig_status = expert->expert_status.transfer(kReady, kIdle, false);
+  if (orig_status == kUsing || orig_status == kLaunching) {
+    TRACE_EVENT_GURAD(kCache, "waiting " + expert->toString());
+    expert->expert_status.wait(kReady, kIdle);
+  } else if (orig_status == kReady) {
+    // successfully locked the expert to evict
+  } else {
+    expert->expert_status.transfer(kFetching, kIdle);// evict a partially fetched expert
+  }
+
   policy->evict(expert);
   prefetched_experts[expert->layer_idx].erase(expert->expert_idx);
   auto ret = expert->gpu_data;
+  CHECK(ret != nullptr);
   expert->gpu_data = nullptr;
   ret->num_ready = 0;
   if (!reserve_mem) {
@@ -78,7 +97,8 @@ void CacheMngr::access(ExpertHandler *expert) {
   }
 }
 void CacheMngr::miss(ExpertHandler *expert) {
-  TRACE_EVENT_GURAD(kCache, "miss:" + expert_meta_to_str(expert->layer_idx, expert->expert_idx));
+  TRACE_EVENT_GURAD(kCache, "miss:" + expert->toString());
+  LOG(TRACE) << "cache miss " << expert->toString();
   handle_miss(expert);
   policy->access_on_miss(expert);
 }

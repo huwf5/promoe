@@ -5,6 +5,7 @@
 #include <vector>
 
 #include <torch/torch.h>
+#include <cuda_runtime.h>
 
 #include "utils.hpp"
 
@@ -38,9 +39,13 @@ class ExpertHandler {
   int layer_idx, expert_idx;
   // SpinLock lock;
   AtomicMultiStatusLock expert_status;
+  cudaEvent_t event = nullptr;
   ExpertHandler() : expert_status() {}
   void wait() {
     expert_status.lock(kReady, kUsing);
+  }
+  std::string toString() const {
+    return std::to_string(layer_idx) + "." + std::to_string(expert_idx);
   }
 };
 

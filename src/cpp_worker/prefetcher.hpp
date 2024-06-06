@@ -26,8 +26,9 @@ class PrefetchTask {
   }
 };
 
+template<typename ELEM_T>
 class Queue {
-  std::vector<PrefetchTask> queue_buffer;
+  std::vector<ELEM_T> queue_buffer;
   int start, stop;
   void extend() {
     auto orig_size = queue_buffer.size();
@@ -36,7 +37,7 @@ class Queue {
     std::copy(queue_buffer.begin(), queue_buffer.begin() + stop, queue_buffer.begin() + orig_size);
     stop = orig_size + stop;
     // {
-    //   std::vector<PrefetchTask> new_queue;
+    //   std::vector<ELEM_T> new_queue;
     //   new_queue.resize(queue_buffer.size() * 2);
     //   auto new_tail = new_queue.begin();
     //   if (start < stop) {
@@ -52,40 +53,40 @@ class Queue {
   }
   int next(int a) { return (a + 1) % queue_buffer.size(); }
  public:
-  std::unordered_map<int, int> expert_to_remaining_task;
+  // std::unordered_map<int, int> expert_to_remaining_task;
   Queue() : queue_buffer(10), start(0), stop(0) {}
   void clear() {
-    expert_to_remaining_task.clear();
+    // expert_to_remaining_task.clear();
     start = stop;
   }
   bool empty() {
     return start == stop;
   }
-  PrefetchTask front() {
+  ELEM_T front() {
     CHECK(empty() == false);
     return queue_buffer[start];
   }
   void pop() {
     CHECK(empty() == false);
-    expert_to_remaining_task[queue_buffer[start].expert_idx] -= 1;
+    // expert_to_remaining_task[queue_buffer[start].expert_idx] -= 1;
     start = next(start);
   }
-  void push(PrefetchTask task) {
+  void push(ELEM_T task) {
     if (next(stop) == start) {
       extend();
     }
     queue_buffer[stop] = task;
     stop = next(stop);
-    if (expert_to_remaining_task.find(task.expert_idx) == expert_to_remaining_task.end()) {
-      expert_to_remaining_task[task.expert_idx] = 0;
-    }
-    expert_to_remaining_task[task.expert_idx] += 1;
+    // if (expert_to_remaining_task.find(task.expert_idx) == expert_to_remaining_task.end()) {
+    //   expert_to_remaining_task[task.expert_idx] = 0;
+    // }
+    // expert_to_remaining_task[task.expert_idx] += 1;
   }
-  int remaining_task(int expert_id) {
-    auto iter = expert_to_remaining_task.find(expert_id);
-    if (iter == expert_to_remaining_task.end()) { return 0; }
-    return iter->second;
-  }
+  // int remaining_task(int expert_id) {
+  //   auto iter = expert_to_remaining_task.find(expert_id);
+  //   if (iter == expert_to_remaining_task.end()) { return 0; }
+  //   return iter->second;
+  // }
 };
 
 #ifdef DEAD_CODE
@@ -115,6 +116,7 @@ class Queue {
 class ExpertHandler;
 
 class PrefetchMngr {
+  using TaskQueue = Queue<PrefetchTask>;
   cudaStream_t stream;
   std::shared_ptr<ModuleMeta> metas;
   std::shared_ptr<ModelLoader> model_loader;
@@ -123,17 +125,22 @@ class PrefetchMngr {
   /**
    * protected by queue_lock
    */
-  std::vector<Queue> per_layer_job_queues; // the fetching thread takes out the first task from queue, then execute it.
+  std::vector<TaskQueue> per_layer_job_queues; // the fetching thread takes out the first task from queue, then execute it.
   /**
    * protected by queue_lock
    */
-  Queue precise_job_queue;
+  TaskQueue precise_job_queue;
   std::thread prefetch_thread;
   std::thread predict_thread;
+
+  Queue<ExpertHandler*> expert_usage_queue;
+  AtomicQueueLock expert_usage_queue_lock;
+
+  std::thread expert_unlocker_thread;
   sem_t predictor_send, predictor_done;
   std::function<void()> try_wait_pretictor_done;
   volatile bool thread_exit_mark = false;
-  AtomicQueueLock queue_lock;
+  AtomicQueueLock task_queue_lock;
 
   /**
    * protected by queue_lock
@@ -145,18 +152,20 @@ class PrefetchMngr {
   PrefetchTask current_task;
   // ExpertHandler * previous_task = nullptr;
 
-  void add_tasks_for_one_expert(int layer_idx, int expert_idx, Queue* queue,
-                                int starting_mem_buffer = 0);
+  void add_tasks_for_one_expert(int layer_idx, int expert_idx, TaskQueue* queue,
+                                int starting_mem_buffer = 0, bool is_precise = false);
 
   void prefetch_thread_func();
   void predict_thread_func();
+  void expert_unlocker_thread_func();
+
   void do_one_task(PrefetchTask *task);
 
-  inline void lock_queue() {
-    queue_lock.lock();
+  inline void lock_task_queue() {
+    task_queue_lock.lock();
   }
-  inline void unlock_queue() {
-    queue_lock.unlock();
+  inline void unlock_task_queue() {
+    task_queue_lock.unlock();
   }
 
   void preempt_one_layer_(int layer_idx, int64_t *expert_idxs, size_t num_expert);
@@ -173,11 +182,18 @@ public:
 
   void add_one_layer_task(int layer_idx, torch::Tensor experts);
   void add_multi_layer_task(torch::Tensor experts);
-  void preempt_one_layer(int layer_idx, torch::Tensor experts);
 
-  void record_then_predict_and_launch(int layer_id, torch::Tensor experts);
+  /**
+   * for already in cache, directly lock it
+   * for fetching, lock it after fetching is done
+   */
+  void preempt_and_launch_one_layer(int layer_idx, torch::Tensor experts);
 
-  void wait_and_lock_expert(int layer_id, int expert_id);
+  void record_then_predict_and_prefetch(int layer_id, torch::Tensor experts);
+
+  void wait_expert(int layer_id, int expert_id);
+  void mark_expert_using(int layer_id, int expert_id);
+  void record_cuda_event(int layer_id, int expert_id);
   void try_release_expert(int layer_id, int expert_id);
   void try_release_expert_in_layer(int layer_id);
 

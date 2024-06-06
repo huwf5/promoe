@@ -71,9 +71,9 @@ def replace_mlp_report_experts(model, prefetch_mngr, predictor, num_moe_layer, n
   def f(module, name):
     def new_report_experts(experts):
       # print(module._layer_id, experts)
-      prefetch_mngr.preempt_one_layer(module._layer_id, experts)
+      prefetch_mngr.preempt_and_launch_one_layer(module._layer_id, experts)
 
-      prefetch_mngr.record_then_predict_and_launch(module._layer_id, experts)
+      prefetch_mngr.record_then_predict_and_prefetch(module._layer_id, experts)
       # predictor.add_one_layer(module._layer_id, experts)
       # if module._layer_id == num_moe_layer-1:
       #   predicted_prob = predictor.predict()

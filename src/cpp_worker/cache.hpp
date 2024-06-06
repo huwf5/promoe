@@ -78,7 +78,7 @@ class CacheMngr {
 
 
   // formal methods
-  ExpertMemHanlder* evict(ExpertHandler *expert, bool reserve_mem = false);
+  ExpertMemHanlder* evict(ExpertHandler *evict_e, ExpertHandler *incoming_e=nullptr, bool reserve_mem = false);
   void access(ExpertHandler *expert);
   void miss(ExpertHandler *expert);
 };
