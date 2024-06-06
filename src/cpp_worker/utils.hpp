@@ -113,6 +113,12 @@ class ModuleMeta {
   std::vector<std::string> param_name_list;
   std::unordered_map<std::string, int> param_name_to_id;
   int num_predict_expert_per_layer;
+  int max_prefetch_layer_distance = 1;
+
+  bool can_do_layer(int cur_preempted_layer, int target_layer) {
+    // (cur_preempted_layer, cur_preempted_layer + max_prefetch_layer_distance]
+    return ((target_layer + num_layer - 1 - cur_preempted_layer) % num_layer) < max_prefetch_layer_distance;
+  }
 
   ModuleMeta(int num_layer, int num_expert) : num_layer(num_layer), num_expert(num_expert) {}
 

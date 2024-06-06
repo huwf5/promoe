@@ -16,6 +16,7 @@ ExpertMemHanlder *CacheMngr::allocate_from_free_buffer() {
   return ret;
 }
 void CacheMngr::init_gpu_mem_buffer(size_t num_buffers) {
+  cache_len = num_buffers;
   unused_mems.resize(num_buffers, nullptr);
   auto &mem_example = model_loader->get_source(0, 0)->host_data.mem_buffers;
   for (int i = 0; i < num_buffers; i++) {

@@ -11,9 +11,9 @@ enum ThreadType {
   kPythonMain = 0,
   kHook,
   kPrefetch,
+  kCache,
   kPredict,
   kGPU,
-  kCache,
   kThreadTypeNum,
 };
 enum EventType {

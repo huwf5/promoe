@@ -43,6 +43,7 @@ class CacheMngr {
   void handle_miss(ExpertHandler *expert);
   CachePolicyFactory policy_factory;
  public:
+  size_t cache_len = 0;
   std::shared_ptr<ModuleMeta> metas;
   std::shared_ptr<ModelLoader> model_loader;
   std::shared_ptr<CachePolicy> policy;
@@ -78,6 +79,10 @@ class CacheMngr {
 
 
   // formal methods
+  size_t query_per_layer_cache_len() {
+    // fixme: support for per layer cache
+    return cache_len;
+  }
   ExpertMemHanlder* evict(ExpertHandler *evict_e, ExpertHandler *incoming_e=nullptr, bool reserve_mem = false);
   void access(ExpertHandler *expert);
   void miss(ExpertHandler *expert);

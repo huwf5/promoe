@@ -137,7 +137,10 @@ class PrefetchMngr {
   AtomicQueueLock expert_usage_queue_lock;
 
   std::thread expert_unlocker_thread;
-  sem_t predictor_send, predictor_done;
+  sem_t predictor_send;
+  // sem_t predictor_done;
+  sem_t prefetch_layer_budget;
+  sem_t prefetch_layer_progress;
   std::function<void()> try_wait_pretictor_done;
   volatile bool thread_exit_mark = false;
   AtomicQueueLock task_queue_lock;
@@ -170,7 +173,7 @@ class PrefetchMngr {
 
   void preempt_one_layer_(int layer_idx, int64_t *expert_idxs, size_t num_expert);
 
-  void add_one_layer_task_(int layer_idx, int64_t *expert_idxs, size_t num_expert);
+  void add_one_layer_task(int layer_idx, int64_t *expert_idxs, size_t num_expert);
 
 public:
   ~PrefetchMngr();
