@@ -38,19 +38,40 @@ class CachePolicyFactory {
   }
 };
 
+
+struct CacheSlot {
+  std::shared_ptr<CachePolicy> policy;
+  std::vector<ExpertMemHanlder*> unused_mems;
+  size_t full_len;
+};
+
+class SlotMapper {
+ public:
+  std::vector<CacheSlot> slots;
+  virtual int to_slot_idx(int layer_id) { return 0; };
+  inline CacheSlot* to_slot(int layer_id) { return &slots[to_slot_idx(layer_id)]; }
+  inline CacheSlot* to_slot(ExpertHandler* expert) { return to_slot(expert->layer_idx); }
+  virtual ~SlotMapper() {}
+};
+
+class SlotMapperPerLayer : public SlotMapper {
+ public:
+  int to_slot_idx(int layer_id) override { return layer_id; }
+};
+
 class CacheMngr {
   void handle_hit(ExpertHandler *expert);
   void handle_miss(ExpertHandler *expert);
   CachePolicyFactory policy_factory;
+  friend class SlotMapper;
  public:
   size_t cache_len = 0;
   std::shared_ptr<ModuleMeta> metas;
   std::shared_ptr<ModelLoader> model_loader;
-  std::shared_ptr<CachePolicy> policy;
 
   std::vector<std::unordered_map<int, ExpertHandler*>> prefetched_experts; // the ongoing job also lives in here.
 
-  std::vector<ExpertMemHanlder*> unused_mems;
+  std::shared_ptr<SlotMapper> cache_slots;
   AtomicQueueLock unused_mems_lock;
 
   CacheMngr(std::shared_ptr<ModuleMeta> metas,
@@ -63,25 +84,12 @@ class CacheMngr {
   bool is_in_cache(int layer_id, int expert_id) {
     return (prefetched_experts[layer_id].find(expert_id) != prefetched_experts[layer_id].end());
   }
-  void erase(int layer_id, int expert_id) {
-    prefetched_experts[layer_id].erase(expert_id);
-  }
-  void add_free_buffer(ExpertMemHanlder * ptr) {
-    unused_mems_lock.lock();
-    unused_mems.push_back(ptr);
-    unused_mems_lock.unlock();
-  }
-  ExpertMemHanlder *allocate_from_free_buffer();
-  void register_cached(ExpertHandler* expert) {
-    prefetched_experts[expert->layer_idx][expert->expert_idx] = expert;
-  }
   void init_gpu_mem_buffer(size_t num_buffers);
 
 
   // formal methods
-  size_t query_per_layer_cache_len() {
-    // fixme: support for per layer cache
-    return cache_len;
+  size_t query_per_layer_cache_len(int layer_idx = 0) {
+    return cache_slots->to_slot(layer_idx)->full_len;
   }
   ExpertMemHanlder* evict(ExpertHandler *evict_e, ExpertHandler *incoming_e=nullptr, bool reserve_mem = false);
   void access(ExpertHandler *expert);

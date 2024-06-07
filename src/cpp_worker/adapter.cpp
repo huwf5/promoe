@@ -10,7 +10,12 @@ std::string dump_trace_event_collector_singleton() {
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   py::class_<ModuleMeta, std::shared_ptr<ModuleMeta>>(m, "ModuleMeta")
     .def(py::init<int,int>())
+    .def_readwrite("num_layer", &ModuleMeta::num_layer)
+    .def_readwrite("num_expert", &ModuleMeta::num_expert)
+    .def_readwrite("num_per_expert_param", &ModuleMeta::num_per_expert_param)
     .def_readwrite("num_predict_expert_per_layer", &ModuleMeta::num_predict_expert_per_layer)
+    .def_readwrite("max_prefetch_layer_distance", &ModuleMeta::max_prefetch_layer_distance)
+    .def_readwrite("per_layer_cache", &ModuleMeta::per_layer_cache)
     .def("init_param_list", &ModuleMeta::init_param_list)
   ;
 

@@ -114,6 +114,7 @@ class ModuleMeta {
   std::unordered_map<std::string, int> param_name_to_id;
   int num_predict_expert_per_layer;
   int max_prefetch_layer_distance = 1;
+  bool per_layer_cache = true;
 
   bool can_do_layer(int cur_preempted_layer, int target_layer) {
     // (cur_preempted_layer, cur_preempted_layer + max_prefetch_layer_distance]
