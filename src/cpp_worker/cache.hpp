@@ -18,9 +18,35 @@ class CachePolicy {
 class CachePolicyFIFO : public CachePolicy {
  public:
   std::queue<ExpertHandler*> fifo_queue;
-  CachePolicyFIFO(CacheMngr* cache) : CachePolicy(cache) {}
+  using CachePolicy::CachePolicy;
   ExpertHandler *select_for_evict(ExpertHandler *) override;
   void evict(ExpertHandler *e) override;
+  void access_on_miss(ExpertHandler *e) override;
+};
+
+class CachePolicyLRU : public CachePolicy {
+  using LL = DoubleLinkedList<ExpertHandler*>;
+  std::vector<LL::Node*> linked_list_node_free_buffer;
+  LL linked_list;
+  std::unordered_map<ExpertHandler*, LL::Node*> map;
+ public:
+  std::queue<ExpertHandler*> fifo_queue;
+  using CachePolicy::CachePolicy;
+  ~CachePolicyLRU() {
+    while (linked_list_node_free_buffer.empty() == false) {
+      delete linked_list_node_free_buffer.back();
+      linked_list_node_free_buffer.pop_back();
+    }
+  }
+  ExpertHandler *select_for_evict(ExpertHandler *) override {
+    return linked_list.front()->data;
+  }
+  void evict(ExpertHandler *e) override {
+    auto n = linked_list.remove(map[e]);
+    linked_list_node_free_buffer.push_back(n);
+    map.erase(e);
+  }
+  void access_on_hit(ExpertHandler *e) override;
   void access_on_miss(ExpertHandler *e) override;
 };
 
@@ -93,5 +119,6 @@ class CacheMngr {
   }
   ExpertMemHanlder* evict(ExpertHandler *evict_e, ExpertHandler *incoming_e=nullptr, bool reserve_mem = false);
   void access(ExpertHandler *expert);
+  void hit(ExpertHandler *expert);
   void miss(ExpertHandler *expert);
 };

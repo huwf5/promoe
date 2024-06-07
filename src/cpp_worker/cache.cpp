@@ -37,9 +37,8 @@ CacheMngr::CacheMngr(std::shared_ptr<ModuleMeta> metas,
     : metas(metas), model_loader(model_loader), policy_factory() {
   prefetched_experts.resize(metas->num_layer);
 
-  policy_factory.register_policy("fifo", [this]() -> std::shared_ptr<CachePolicy>{
-    return std::make_shared<CachePolicyFIFO>(this);
-  });
+  policy_factory.register_policy("fifo", [this]() -> std::shared_ptr<CachePolicy>{ return std::make_shared<CachePolicyFIFO>(this); });
+  policy_factory.register_policy("lru",  [this]() -> std::shared_ptr<CachePolicy>{ return std::make_shared<CachePolicyLRU>(this);  });
 
 
   if (metas->per_layer_cache) {
@@ -51,7 +50,7 @@ CacheMngr::CacheMngr(std::shared_ptr<ModuleMeta> metas,
   }
 
   for (auto & cache_slot : cache_slots->slots) {
-    cache_slot.policy = policy_factory.create_policy("fifo");
+    cache_slot.policy = policy_factory.create_policy(metas->cache_policy);
   }
 
 }
@@ -105,12 +104,16 @@ ExpertMemHanlder* CacheMngr::evict(ExpertHandler *expert, ExpertHandler *incomin
 }
 void CacheMngr::access(ExpertHandler *expert) {
   if (is_in_cache(expert)) {
-    handle_hit(expert);
-    cache_slots->to_slot(expert)->policy->access_on_hit(expert);
+    hit(expert);
   } else {
     miss(expert);
   }
 }
+void CacheMngr::hit(ExpertHandler *expert) {
+  handle_hit(expert);
+  cache_slots->to_slot(expert)->policy->access_on_hit(expert);
+}
+
 void CacheMngr::miss(ExpertHandler *expert) {
   TRACE_EVENT_GURAD(kCache, "miss:" + expert->toString());
   LOG(TRACE) << "cache miss " << expert->toString();
@@ -124,4 +127,23 @@ void CachePolicyFIFO::evict(ExpertHandler *e) {
 void CachePolicyFIFO::access_on_miss(ExpertHandler *e) { fifo_queue.push(e); }
 ExpertHandler *CachePolicyFIFO::select_for_evict(ExpertHandler *) {
   return fifo_queue.front();
+}
+void CachePolicyLRU::access_on_hit(ExpertHandler *e) {
+  CHECK(map.find(e) != map.end());
+  auto n = map[e];
+  linked_list.remove(n);
+  linked_list.push_back(n);
+}
+void CachePolicyLRU::access_on_miss(ExpertHandler *e) {
+  CHECK(map.find(e) == map.end());
+  LL::Node *n = nullptr;
+  if (linked_list_node_free_buffer.empty()) {
+    n = new LL::Node;
+  } else {
+    n = linked_list_node_free_buffer.back();
+    linked_list_node_free_buffer.pop_back();
+  }
+  map[e] = n;
+  n->data = e;
+  linked_list.push_back(n);
 }

@@ -115,6 +115,7 @@ class ModuleMeta {
   int num_predict_expert_per_layer;
   int max_prefetch_layer_distance = 1;
   bool per_layer_cache = true;
+  std::string cache_policy = "fifo";
 
   bool can_do_layer(int cur_preempted_layer, int target_layer) {
     // (cur_preempted_layer, cur_preempted_layer + max_prefetch_layer_distance]
@@ -157,3 +158,56 @@ std::string array_to_str(T* array, size_t len) {
 }
 
 // inline void CHECK(bool exp) { assert(exp); }
+
+template<typename DATA_T>
+struct DoubleLinkedList {
+  struct Node {
+    Node *prev = nullptr, *next = nullptr;
+    DATA_T data;
+  };
+  Node guard_head, guard_tail;
+  DoubleLinkedList() {
+    guard_head.next = &guard_tail;
+    guard_tail.prev = &guard_head;
+  }
+  ~DoubleLinkedList() {
+    while (empty() == false) {
+      delete pop_front();
+    }
+  }
+  void insert_after(Node* new_node, Node* after_me) {
+    new_node->next = after_me->next;
+    new_node->prev = after_me;
+    new_node->next->prev = new_node;
+    new_node->prev->next = new_node;
+  }
+  Node* remove(Node* n) {
+    n->next->prev = n->prev;
+    n->prev->next = n->next;
+    n->next = nullptr;
+    n->prev = nullptr;
+    return n;
+  }
+
+  bool empty() {
+    return (guard_head.next == &guard_tail);
+  }
+
+  Node* pop_front() {
+    return remove(front());
+  }
+  Node* pop_back() {
+    return remove(back());
+  }
+  Node* front() {
+    return guard_head.next;
+  }
+  Node* back() {
+    return guard_head.prev;
+  }
+
+  inline void append(Node* n) { return insert_after(n, guard_tail.prev); }
+  inline void push_back(Node* n) { return append(n); }
+  inline void push_front(Node* n) { return insert_after(n, &guard_head); }
+
+};

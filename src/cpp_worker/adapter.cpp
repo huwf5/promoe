@@ -16,6 +16,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     .def_readwrite("num_predict_expert_per_layer", &ModuleMeta::num_predict_expert_per_layer)
     .def_readwrite("max_prefetch_layer_distance", &ModuleMeta::max_prefetch_layer_distance)
     .def_readwrite("per_layer_cache", &ModuleMeta::per_layer_cache)
+    .def_readwrite("cache_policy", &ModuleMeta::cache_policy)
     .def("init_param_list", &ModuleMeta::init_param_list)
   ;
 
