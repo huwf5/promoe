@@ -23,6 +23,7 @@ void PrefetchMngr::preempt_one_layer_(int layer_idx, int64_t *expert_idxs,
   sem_wait(&this->prefetch_layer_progress);
   lock_task_queue();
 
+  cache->cache_lock.lock();
   for (int i = 0; i < num_expert; i++) {
     // kIdle: in queue or not in queue. not started
     // kFetching: correctly predicted, maybe in queue, already started fetching (may not be the current task)
@@ -45,17 +46,30 @@ void PrefetchMngr::preempt_one_layer_(int layer_idx, int64_t *expert_idxs,
       correct_going_experts.push_back(expert_idxs[i]);
     } else {
       auto cur_status = e->expert_status.transfer(kReady, kLaunching, false);
-      switch (cur_status) {
-        // fixme: reorder done experts by order in cache evict policy to improve performance
-        case kReady:    { correct_done_experts.push_back(expert_idxs[i]); break; }
-        // case kQueue:    { queue_experts.push_back(expert_idxs[i]); break; }
-        case kIdle:     { not_started_experts.push_back(expert_idxs[i]); break; }
-        case kFetching: { not_started_experts.insert(not_started_experts.begin(), expert_idxs[i]); break; } // previously partially fetched then preempted expert
-        // case kUsing:
-        default: { CHECK(false); }
+      if (cache->is_in_cache(e)) {
+        if (cur_status == kReady) {
+          correct_done_experts.push_back(expert_idxs[i]);
+          cache->hit(e);
+        } else if (cur_status == kFetching) {
+          not_started_experts.insert(not_started_experts.begin(), expert_idxs[i]);
+        } else {
+          CHECK(false);
+        }
+      } else {
+        not_started_experts.push_back(expert_idxs[i]);
       }
+      // switch (cur_status) {
+      //   // fixme: reorder done experts by order in cache evict policy to improve performance
+      //   case kReady:    { correct_done_experts.push_back(expert_idxs[i]); break; }
+      //   // case kQueue:    { queue_experts.push_back(expert_idxs[i]); break; }
+      //   case kIdle:     { not_started_experts.push_back(expert_idxs[i]); break; }
+      //   case kFetching: { not_started_experts.insert(not_started_experts.begin(), expert_idxs[i]); break; } // previously partially fetched then preempted expert
+      //   // case kUsing:
+      //   default: { CHECK(false); }
+      // }
     }
   }
+  cache->cache_lock.unlock();
 
   if (per_layer_job_queues[layer_idx].empty() == false) {
     LOG(TRACE) << "preempting one layer " << layer_idx << ", queue is not empty, current task is " << current_task.toString();
@@ -101,7 +115,10 @@ void PrefetchMngr::do_one_task(PrefetchTask *task) {
     } else {
       // a first time task
       LOG(TRACE) << "assigning gpu mem for expert " << task->toString();
-      cache->miss(task->expert);
+      cache->cache_lock.lock();
+      auto lambda_wait = cache->miss(task->expert);
+      cache->cache_lock.unlock();
+      lambda_wait();
       CHECK(task->expert->gpu_data->num_ready == 0);
       task->expert->expert_status.transfer(kIdle, kFetching);
       // LOG(TRACE) << "assigning gpu mem " << task->expert->gpu_data << " for expert " << task->toString();
@@ -146,6 +163,11 @@ void PrefetchMngr::do_one_task(PrefetchTask *task) {
     LOG(DEBUG) << "all fetch job done for expert " << task->toString();
 
     // CUDA_CALL(cudaStreamSynchronize(this->stream));
+    if (task->is_precise) {
+      cache->cache_lock.lock();
+      cache->hit(task->expert);
+      cache->cache_lock.unlock();
+    }
     task->expert->expert_status.transfer(kFetching, task->is_precise ? kLaunching : kReady);
   }
 }

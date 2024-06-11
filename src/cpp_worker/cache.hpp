@@ -91,6 +91,7 @@ class CacheMngr {
   CachePolicyFactory policy_factory;
   friend class SlotMapper;
  public:
+  AtomicQueueLock cache_lock;
   size_t cache_len = 0;
   std::shared_ptr<ModuleMeta> metas;
   std::shared_ptr<ModelLoader> model_loader;
@@ -120,5 +121,5 @@ class CacheMngr {
   ExpertMemHanlder* evict(ExpertHandler *evict_e, ExpertHandler *incoming_e=nullptr, bool reserve_mem = false);
   void access(ExpertHandler *expert);
   void hit(ExpertHandler *expert);
-  void miss(ExpertHandler *expert);
+  std::function<void()> miss(ExpertHandler *expert);
 };

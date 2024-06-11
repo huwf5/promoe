@@ -57,47 +57,41 @@ CacheMngr::CacheMngr(std::shared_ptr<ModuleMeta> metas,
 
 void CacheMngr::handle_hit(ExpertHandler *expert) {}
 void CacheMngr::handle_miss(ExpertHandler *expert) {
-  auto cache_slot = cache_slots->to_slot(expert);
-  if (cache_slot->unused_mems.size() > 0) {
-    expert->gpu_data = cache_slot->unused_mems.back();
-    cache_slot->unused_mems.pop_back();
-  } else {
-    auto e_to_evict = cache_slot->policy->select_for_evict(expert);
-    expert->gpu_data = evict(e_to_evict, expert, true);
-  }
-  prefetched_experts[expert->layer_idx][expert->expert_idx] = expert;
+  CHECK(false) << "Deprecated";
 }
-ExpertMemHanlder* CacheMngr::evict(ExpertHandler *expert, ExpertHandler *incoming_e, bool reserve_mem) {
-  TRACE_EVENT_GURAD(kCache, "evict " + expert->toString());
-  LOG(TRACE) << "cache evict " << expert->toString();
-  CHECK(expert != incoming_e);
+ExpertMemHanlder* CacheMngr::evict(ExpertHandler *e_to_evict, ExpertHandler *incoming_e, bool reserve_mem) {
+  CHECK(false) << "Deprecated";
+  TRACE_EVENT_GURAD(kCache, "evict " + e_to_evict->toString());
+  LOG(TRACE) << "cache evict " << e_to_evict->toString();
+  CHECK(e_to_evict != incoming_e);
   // kIdle: ?
   // kFetching: ?
   // kReady: ?
   // kLaunching: wait till using, then wait for event, set back to idle
   // kUsing: wait for event, then set back to idle
-  // expert->expert_status.wait(kReady, ExpertStatus to)
+  // e_to_evict->expert_status.wait(kReady, ExpertStatus to)
 
-  auto orig_status = expert->expert_status.transfer(kReady, kIdle, false);
+  auto orig_status = e_to_evict->expert_status.transfer(kReady, kIdle, false);
   if (orig_status == kUsing || orig_status == kLaunching) {
-    TRACE_EVENT_GURAD(kCache, "waiting " + expert->toString());
-    expert->expert_status.wait(kReady, kIdle);
+    TRACE_EVENT_GURAD(kCache, "waiting " + e_to_evict->toString());
+    e_to_evict->expert_status.wait(kReady, kIdle);
   } else if (orig_status == kReady) {
-    // successfully locked the expert to evict
+    // successfully locked the e_to_evict to evict
   } else {
-    expert->expert_status.transfer(kFetching, kIdle);// evict a partially fetched expert
+    e_to_evict->expert_status.transfer(kFetching, kIdle);// evict a partially fetched e_to_evict
   }
 
-  auto cache_slot = cache_slots->to_slot(expert);
+  auto cache_slot = cache_slots->to_slot(e_to_evict);
 
-  cache_slot->policy->evict(expert);
-  prefetched_experts[expert->layer_idx].erase(expert->expert_idx);
-  auto ret = expert->gpu_data;
+  cache_slot->policy->evict(e_to_evict);
+  prefetched_experts[e_to_evict->layer_idx].erase(e_to_evict->expert_idx);
+  auto ret = e_to_evict->gpu_data;
   CHECK(ret != nullptr);
-  expert->gpu_data = nullptr;
+  e_to_evict->gpu_data = nullptr;
   ret->num_ready = 0;
   if (!reserve_mem) {
-    cache_slot->unused_mems.push_back(expert->gpu_data);
+    CHECK(false) << "Unimplemented";
+    cache_slot->unused_mems.push_back(e_to_evict->gpu_data);
     ret = nullptr;
   }
   return ret;
@@ -114,11 +108,56 @@ void CacheMngr::hit(ExpertHandler *expert) {
   cache_slots->to_slot(expert)->policy->access_on_hit(expert);
 }
 
-void CacheMngr::miss(ExpertHandler *expert) {
-  TRACE_EVENT_GURAD(kCache, "miss:" + expert->toString());
-  LOG(TRACE) << "cache miss " << expert->toString();
-  handle_miss(expert);
-  cache_slots->to_slot(expert)->policy->access_on_miss(expert);
+std::function<void()> CacheMngr::miss(ExpertHandler *incoming_e) {
+  TRACE_EVENT_GURAD(kCache, "miss:" + incoming_e->toString());
+  LOG(TRACE) << "cache miss " << incoming_e->toString();
+  auto cache_slot = cache_slots->to_slot(incoming_e);
+  std::function<void()> lambda_to_wait_expert_occupancy = [](){};
+  if (cache_slot->unused_mems.size() > 0) {
+    incoming_e->gpu_data = cache_slot->unused_mems.back();
+    cache_slot->unused_mems.pop_back();
+    cache_slots->to_slot(incoming_e)->policy->access_on_miss(incoming_e);
+    prefetched_experts[incoming_e->layer_idx][incoming_e->expert_idx] = incoming_e;
+  } else {
+    auto e_to_evict = cache_slot->policy->select_for_evict(incoming_e);
+    // incoming_e->gpu_data = evict(e_to_evict, incoming_e, true);
+    {
+      TRACE_EVENT_GURAD(kCache, "evict " + e_to_evict->toString());
+      LOG(TRACE) << "cache evict " << e_to_evict->toString();
+      CHECK(e_to_evict != incoming_e);
+
+      cache_slot->policy->evict(e_to_evict);
+      cache_slots->to_slot(incoming_e)->policy->access_on_miss(incoming_e);
+      prefetched_experts[e_to_evict->layer_idx].erase(e_to_evict->expert_idx);
+      prefetched_experts[incoming_e->layer_idx][incoming_e->expert_idx] = incoming_e;
+      // kIdle: ?
+      // kFetching: ?
+      // kReady: ?
+      // kLaunching: wait till using, then wait for event, set back to idle
+      // kUsing: wait for event, then set back to idle
+      // e_to_evict->expert_status.wait(kReady, ExpertStatus to)
+
+
+      auto orig_status = e_to_evict->expert_status.transfer(kReady, kIdle, false);
+      if (orig_status == kUsing || orig_status == kLaunching) {
+        TRACE_EVENT_GURAD(kCache, "waiting " + e_to_evict->toString());
+        lambda_to_wait_expert_occupancy = [e_to_evict]() {
+          e_to_evict->expert_status.wait(kReady, kIdle);
+        };
+        // lambda_to_wait_expert_occupancy();
+      } else if (orig_status == kReady) {
+        // successfully locked the e_to_evict to evict
+      } else {
+        e_to_evict->expert_status.transfer(kFetching, kIdle);// evict a partially fetched e_to_evict
+      }
+
+      CHECK(e_to_evict->gpu_data != nullptr);
+      incoming_e->gpu_data = e_to_evict->gpu_data;
+      e_to_evict->gpu_data = nullptr;
+      incoming_e->gpu_data->num_ready = 0;
+    }
+  }
+  return lambda_to_wait_expert_occupancy;
 }
 void CachePolicyFIFO::evict(ExpertHandler *e) {
   CHECK(e == select_for_evict(nullptr));
