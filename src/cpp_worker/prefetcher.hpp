@@ -54,7 +54,71 @@ class Queue {
 
 class ExpertHandler;
 
+class FetchScheduleTaskBase {
+ public:
+  enum TaskType {
+    kIdle,
+    kPreempt,
+    kFetchDone,
+  };
+  TaskType task_type;
+  FetchScheduleTaskBase(TaskType task_type) : task_type(task_type) {}
+  virtual ~FetchScheduleTaskBase() {}
+};
+class IdleTask : public FetchScheduleTaskBase {
+ public:
+  IdleTask() : FetchScheduleTaskBase(kIdle) {}
+};
+class PreemptTask : public FetchScheduleTaskBase {
+ public:
+  PreemptTask() : FetchScheduleTaskBase(kPreempt) {}
+  int layer_idx;
+  int64_t* expert_idxs;
+  size_t num_expert;
+};
+class FetchDoneTask : public FetchScheduleTaskBase, public PrefetchTask {
+ public:
+  FetchDoneTask() : FetchScheduleTaskBase(kFetchDone) {}
+  void init(PrefetchTask* task) {
+    this->mem_buf_idx = task->mem_buf_idx;
+    this->expert = task->expert;
+    this->is_precise = task->is_precise;
+    this->layer_idx = expert->layer_idx;
+    this->expert_idx = expert->expert_idx;
+  }
+  void init(CopyTask* task) {
+    this->expert = task->expert;
+    this->mem_buf_idx = task->mem_buf_idx;
+    this->is_precise = task->is_precise;
+    this->expert_idx = expert->expert_idx;
+    this->layer_idx = expert->layer_idx;
+  }
+  // CopyTask* copy_task;
+};
+
+class FetchScheduleWorker : public WorkerThread<FetchScheduleTaskBase*> {
+  ModuleMeta* metas;
+  CacheMngr* cache;
+  PrefetchMngr* prefetcher;
+
+  IdleTask idle_task;
+  CopyTask copy_task; // we allow only one ongoing copy task
+  friend class FetchWorker;
+  FetchDoneTask copy_done_task;
+
+  bool send_one_job(PrefetchTask *task);
+  void do_one_task_impl(IdleTask *task);
+  void do_one_task_impl(PreemptTask *task);
+  void do_one_task_impl(FetchDoneTask *task);
+
+public:
+  void init(ModuleMeta* metas, CacheMngr *cache, PrefetchMngr *prefetcher);
+  void do_one_task_impl(FetchScheduleTaskBase *task);
+};
+
 class PrefetchMngr {
+  friend class FetchScheduleWorker;
+  friend class FetchWorker;
   using TaskQueue = Queue<PrefetchTask>;
   cudaStream_t stream;
   std::shared_ptr<ModuleMeta> metas;
@@ -69,18 +133,14 @@ class PrefetchMngr {
    * protected by queue_lock
    */
   TaskQueue precise_job_queue;
-  std::thread prefetch_thread;
+  std::shared_ptr<FetchScheduleWorker> fetch_schedule_thread;
+  std::shared_ptr<FetchWorker> fetch_thread;
   std::shared_ptr<PredictWorker> predict_thread;
   std::shared_ptr<ExpertUnlockWorker> expert_unlocker_thread;
 
   std::function<void()> try_wait_pretictor_done;
-  volatile bool thread_exit_mark = false;
   AtomicQueueLock task_queue_lock;
 
-  /**
-   * protected by queue_lock
-   */
-  PrefetchTask previous_task;
   /**
    * protected by queue_lock
    */
@@ -90,7 +150,7 @@ class PrefetchMngr {
   void add_tasks_for_one_expert(int layer_idx, int expert_idx, TaskQueue* queue,
                                 int starting_mem_buffer = 0, bool is_precise = false);
 
-  void prefetch_thread_func();
+  void pop_next_task(PrefetchTask &task, bool &found);
 
   void do_one_task(PrefetchTask *task);
 

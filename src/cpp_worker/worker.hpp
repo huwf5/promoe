@@ -12,11 +12,20 @@ class WorkerThread {
   AtomicQueueLock queue_lock;
   std::thread worker_thread;
   volatile bool exit_mark = false;
+  using progress_handler_t = int64_t;
+  progress_handler_t queued = 0;
+  std::atomic<progress_handler_t> progress{0};
  protected:
   bool should_exit() {
     return exit_mark;
   }
+  virtual void do_one_task_impl(TASK_T task) {}
+  inline void do_one_task(TASK_T task) { 
+    do_one_task_impl(task);
+    progress.fetch_add(1);
+  }
  public:
+  WorkerThread() : progress(0) {}
   virtual void exit() {
     exit_mark = true;
     if (worker_thread.joinable()) { worker_thread.join(); }
@@ -31,7 +40,7 @@ class WorkerThread {
       queue_lock.lock();
       if (queue.empty()) {
         queue_lock.unlock();
-        usleep(10);
+        // usleep(10);
       } else {
         current_task = queue.front();
         queue.pop();
@@ -40,12 +49,17 @@ class WorkerThread {
       }
     }
   }
-  virtual void add_one_task(TASK_T task) {
+  progress_handler_t add_one_task(TASK_T task) {
     queue_lock.lock();
+    auto ret = queued++;
     queue.push(task);
     queue_lock.unlock();
+    return ret;
   }
-  virtual void do_one_task(TASK_T task) {}
+  void wait_progress(progress_handler_t handle) {
+    // todo: handle overflow
+    while(progress.load() <= handle) {};
+  }
   virtual ~WorkerThread() {}
 };
 
@@ -53,10 +67,11 @@ class BaseTask {
   public:
 };
 
+class PrefetchMngr;
 /**
  * Param Fetcher
  */
-
+class PrefetchTask;
 class CopyTask : public BaseTask {
  public:
   int mem_buf_idx;
@@ -64,6 +79,7 @@ class CopyTask : public BaseTask {
   ExpertHandler *expert = nullptr;
   ExpertMemHanlder *dst = nullptr;
   std::function<void()> lambda_wait = [](){};
+  void init(PrefetchTask *task);
   std::string toString() const {
     std::stringstream ss;
     ss << expert->toString() << "." << mem_buf_idx << ", precise " << (is_precise?"true":"false");
@@ -72,12 +88,17 @@ class CopyTask : public BaseTask {
 };
 
 class FetchWorker : public WorkerThread<CopyTask*> {
-  std::shared_ptr<ModuleMeta> metas;
+  ModuleMeta* metas;
+  PrefetchMngr* prefetcher;
   cudaStream_t stream;
   friend class PrefetchMngr;
  public:
-  FetchWorker(std::shared_ptr<ModuleMeta> metas) : WorkerThread<CopyTask*>(), metas(metas) {}
-  void do_one_task(CopyTask *task) override;
+  void init(ModuleMeta* metas, PrefetchMngr* prefetcher, cudaStream_t stream) {
+    this->metas = metas;
+    this->prefetcher = prefetcher;
+    this->stream = stream;
+  }
+  void do_one_task_impl(CopyTask *task) override;
 };
 
 /**
@@ -86,13 +107,12 @@ class FetchWorker : public WorkerThread<CopyTask*> {
 class ExpertUnlockWorker : public WorkerThread<ExpertHandler*> {
   AtomicQueueLock expert_usage_queue_lock;
  public:
-   void do_one_task(ExpertHandler *task) override;
+   void do_one_task_impl(ExpertHandler *task) override;
 };
 
 /**
  * Predict Worker
  */
-class PrefetchMngr;
 class PredictWorker : public WorkerThread<BaseTask*> {
   PrefetchMngr  * prefetcher;
   Predictor  * predictor;
@@ -116,9 +136,5 @@ class PredictWorker : public WorkerThread<BaseTask*> {
   void consume_prefetch_layer_progress() {
     sem_wait(&prefetch_layer_progress);
   }
-  void do_one_task(BaseTask *_) override;
-};
-
-class PreemptTask {
-  public:
+  void do_one_task_impl(BaseTask *_) override;
 };

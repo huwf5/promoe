@@ -108,11 +108,11 @@ void CacheMngr::hit(ExpertHandler *expert) {
   cache_slots->to_slot(expert)->policy->access_on_hit(expert);
 }
 
-std::function<void()> CacheMngr::miss(ExpertHandler *incoming_e) {
+CacheMngr::CacheLineOccupancyWaiter CacheMngr::miss(ExpertHandler *incoming_e) {
   TRACE_EVENT_GURAD(kCache, "miss:" + incoming_e->toString());
   LOG(TRACE) << "cache miss " << incoming_e->toString();
   auto cache_slot = cache_slots->to_slot(incoming_e);
-  std::function<void()> lambda_to_wait_expert_occupancy = [](){};
+  CacheLineOccupancyWaiter lambda_to_wait_expert_occupancy = [](){};
   if (cache_slot->unused_mems.size() > 0) {
     incoming_e->gpu_data = cache_slot->unused_mems.back();
     cache_slot->unused_mems.pop_back();
@@ -140,8 +140,8 @@ std::function<void()> CacheMngr::miss(ExpertHandler *incoming_e) {
 
       auto orig_status = e_to_evict->expert_status.transfer(kReady, kIdle, false);
       if (orig_status == kUsing || orig_status == kLaunching) {
-        TRACE_EVENT_GURAD(kCache, "waiting " + e_to_evict->toString());
         lambda_to_wait_expert_occupancy = [e_to_evict]() {
+          TRACE_EVENT_GURAD(kFetcher, "waiting " + e_to_evict->toString());
           e_to_evict->expert_status.wait(kReady, kIdle);
         };
         // lambda_to_wait_expert_occupancy();
