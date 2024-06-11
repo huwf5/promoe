@@ -53,15 +53,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     .def("record_then_predict_and_prefetch", &PrefetchMngr::record_then_predict_and_prefetch)
   ;
 
-  py::class_<PrefetchEngine, std::shared_ptr<PrefetchEngine>>(m, "PrefetchEngine")
-    .def(py::init<>())
-    .def_readwrite("prefetch_worker", &PrefetchEngine::prefetch_worker)
-    .def_readwrite("metas", &PrefetchEngine::metas)
-    .def_readwrite("model_loader", &PrefetchEngine::model_loader)
-    .def_readwrite("predictor", &PrefetchEngine::predictor)
-    .def("init_prefetch_worker", &PrefetchEngine::init_prefetch_worker)
-  ;
-
   py::class_<TraceEventGuard, std::shared_ptr<TraceEventGuard>>(m, "TraceEventGuard")
     .def(py::init<>())
     .def("init", &TraceEventGuard::init, "docstring", py::arg(), py::arg(), py::arg("phase")='X')

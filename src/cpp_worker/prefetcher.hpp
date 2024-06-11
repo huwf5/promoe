@@ -9,6 +9,7 @@
 #include <cuda_runtime.h>
 #include <semaphore.h>
 
+#include "worker.hpp"
 #include "utils.hpp"
 #include "model_loader.hpp"
 #include "predictor.hpp"
@@ -69,16 +70,9 @@ class PrefetchMngr {
    */
   TaskQueue precise_job_queue;
   std::thread prefetch_thread;
-  std::thread predict_thread;
+  std::shared_ptr<PredictWorker> predict_thread;
+  std::shared_ptr<ExpertUnlockWorker> expert_unlocker_thread;
 
-  Queue<ExpertHandler*> expert_usage_queue;
-  AtomicQueueLock expert_usage_queue_lock;
-
-  std::thread expert_unlocker_thread;
-  sem_t predictor_send;
-  // sem_t predictor_done;
-  sem_t prefetch_layer_budget;
-  sem_t prefetch_layer_progress;
   std::function<void()> try_wait_pretictor_done;
   volatile bool thread_exit_mark = false;
   AtomicQueueLock task_queue_lock;
@@ -97,8 +91,6 @@ class PrefetchMngr {
                                 int starting_mem_buffer = 0, bool is_precise = false);
 
   void prefetch_thread_func();
-  void predict_thread_func();
-  void expert_unlocker_thread_func();
 
   void do_one_task(PrefetchTask *task);
 
@@ -111,7 +103,6 @@ class PrefetchMngr {
 
   void preempt_one_layer_(int layer_idx, int64_t *expert_idxs, size_t num_expert);
 
-  void add_one_layer_task(int layer_idx, int64_t *expert_idxs, size_t num_expert);
 
 public:
   ~PrefetchMngr();
@@ -122,7 +113,8 @@ public:
   void init_gpu_mem_buffer(size_t num_buffers);
 
   void add_one_layer_task(int layer_idx, torch::Tensor experts);
-  void add_multi_layer_task(torch::Tensor experts);
+  // void add_multi_layer_task(torch::Tensor experts);
+  void add_one_layer_task(int layer_idx, int64_t *expert_idxs, size_t num_expert);
 
   /**
    * for already in cache, directly lock it
@@ -139,26 +131,4 @@ public:
   void try_release_expert_in_layer(int layer_id);
 
   void launch_thread();
-};
-
-class PrefetchEngine {
- public:
-  std::shared_ptr<PrefetchMngr> prefetch_worker;
-  std::shared_ptr<ModuleMeta> metas;
-  std::shared_ptr<ModelLoader> model_loader;
-  std::shared_ptr<Predictor> predictor;
-  PrefetchEngine() {}
-  void init_predictor(std::string model_path);
-  void init_meta(int num_layer, int num_expert) {
-    metas = std::make_shared<ModuleMeta>(num_layer, num_expert);
-  }
-  void init_model_loader() {
-    model_loader = std::make_shared<ModelLoader>(metas);
-  }
-  void init_prefetch_worker();
-
-  std::shared_ptr<ModelLoader> get_model_loader() {
-    return model_loader;
-  }
-
 };

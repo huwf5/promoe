@@ -13,6 +13,7 @@ setup(
             'src/cpp_worker/utils.cpp',
             'src/cpp_worker/profiler.cpp',
             'src/cpp_worker/cache.cpp',
+            'src/cpp_worker/worker.cpp',
         ], extra_compile_args={'cxx': ['-g', '-fopenmp'], 'nvcc': ['-g', '-fopenmp']}),
     ],
     cmdclass={

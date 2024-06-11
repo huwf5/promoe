@@ -20,7 +20,7 @@ void PrefetchMngr::preempt_one_layer_(int layer_idx, int64_t *expert_idxs,
   std::vector<uint64_t> correct_done_experts; // correctly predicted and already done
   std::vector<uint64_t> not_started_experts;  // not predicted
   std::vector<uint64_t> correct_going_experts;   // correctly predicted and started
-  sem_wait(&this->prefetch_layer_progress);
+  predict_thread->consume_prefetch_layer_progress();
   lock_task_queue();
 
   cache->cache_lock.lock();
@@ -86,7 +86,7 @@ void PrefetchMngr::preempt_one_layer_(int layer_idx, int64_t *expert_idxs,
     add_tasks_for_one_expert(layer_idx, eid, &precise_job_queue, 0, true);
   }
   unlock_task_queue();
-  sem_post(&prefetch_layer_budget);
+  predict_thread->add_prefetch_layer_budget();
   num_expert = 0;
   // reorder expert order to let model use expert in the same order of fetching
   for (auto e : correct_done_experts)   { expert_idxs[num_expert++] = e; }
@@ -171,9 +171,6 @@ void PrefetchMngr::do_one_task(PrefetchTask *task) {
     task->expert->expert_status.transfer(kFetching, task->is_precise ? kLaunching : kReady);
   }
 }
-void PrefetchEngine::init_prefetch_worker() {
-  prefetch_worker = std::make_shared<PrefetchMngr>(metas, model_loader, predictor);
-}
 void PrefetchMngr::add_tasks_for_one_expert(int layer_idx, int expert_idx, TaskQueue* queue,
                                             int starting_mem_buffer, bool is_precise) {
   auto expert_handler = model_loader->get_source(layer_idx, expert_idx);
@@ -243,9 +240,7 @@ void PrefetchMngr::mark_expert_using(int layer_id, int expert_id) {
   CUDA_CALL(cudaEventRecord(expert->event, nullptr));
   expert->expert_status.transfer(kLaunching, kUsing);
 
-  expert_usage_queue_lock.lock();
-  expert_usage_queue.push(expert);
-  expert_usage_queue_lock.unlock();
+  expert_unlocker_thread->add_one_task(expert);
 }
 
 void PrefetchMngr::try_release_expert(int layer_id, int expert_id) {
@@ -265,26 +260,21 @@ void PrefetchMngr::try_release_expert_in_layer(int layer_id) {
 }
 void PrefetchMngr::launch_thread() {
   // try_wait_pretictor_done = [this]() { sem_wait(&predictor_done); };
-  sem_post(&predictor_send);
+  predict_thread->add_one_task(nullptr);
   prefetch_thread = std::thread([this]() { this->prefetch_thread_func(); });
-  predict_thread = std::thread([this]() { this->predict_thread_func(); });
-  expert_unlocker_thread = std::thread([this]() { this->expert_unlocker_thread_func(); });
-}
-void PrefetchEngine::init_predictor(std::string model_path) {
-  predictor = std::make_shared<Predictor>(this->metas);
-  predictor->load_model(model_path);
+  predict_thread->launch();
+  expert_unlocker_thread->launch();
 }
 PrefetchMngr::PrefetchMngr(std::shared_ptr<ModuleMeta> metas,
                            std::shared_ptr<ModelLoader> model_loader,
                            std::shared_ptr<Predictor> predictor)
     : metas(metas), model_loader(model_loader), predictor(predictor) {
   this->cache = std::make_shared<CacheMngr>(metas, model_loader);
+  predict_thread = std::make_shared<PredictWorker>();
+  predict_thread->init(this, predictor.get(), cache.get(), metas.get());
+  expert_unlocker_thread = std::make_shared<ExpertUnlockWorker>();
   per_layer_job_queues.resize(metas->num_layer);
   try_wait_pretictor_done = [](){};
-  sem_init(&predictor_send, 0, 0);
-  // sem_init(&predictor_done, 0, 1);
-  sem_init(&prefetch_layer_budget, 0, metas->max_prefetch_layer_distance);
-  sem_init(&prefetch_layer_progress, 0, 0);
   CUDA_CALL(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
 }
 void PrefetchMngr::record_then_predict_and_prefetch(int layer_id, torch::Tensor experts) {
@@ -294,7 +284,7 @@ void PrefetchMngr::record_then_predict_and_prefetch(int layer_id, torch::Tensor 
   });
   predictor->add_one_layer(layer_id, experts);
   if (layer_id == metas->num_layer - 1) {
-    sem_post(&predictor_send);
+    predict_thread->add_one_task(nullptr);
     // sem_wait(&predictor_done);
   }
 }
@@ -319,6 +309,7 @@ void PrefetchMngr::add_one_layer_task(int layer_idx, int64_t *expert_idxs,
   }
   unlock_task_queue();
 }
+#ifdef DEAD_CODE
 void PrefetchMngr::add_multi_layer_task(torch::Tensor experts) {
   CHECK(false) << "Deprecated";
   TRACE_EVENT_GURAD(kPredict, "add_multi_layer_task");
@@ -332,17 +323,19 @@ void PrefetchMngr::add_multi_layer_task(torch::Tensor experts) {
     sem_post(&prefetch_layer_progress);
   }
 }
+#endif
 PrefetchMngr::~PrefetchMngr() {
   // for (int l = 0; l < metas->num_layer; l++) {
   //   try_release_expert_in_layer(l);
   // }
   thread_exit_mark = true;
-  sem_post(&predictor_send);
-  sem_post(&prefetch_layer_budget);
+  predict_thread->add_one_task(nullptr);
+  predict_thread->add_prefetch_layer_budget();
   if (prefetch_thread.joinable()) { prefetch_thread.join(); }
-  if (predict_thread.joinable()) { predict_thread.join(); }
-  if (expert_unlocker_thread.joinable()) { expert_unlocker_thread.join(); }
+  predict_thread->exit();
+  expert_unlocker_thread->exit();
 }
+#ifdef DEAD_CODE
 void PrefetchMngr::predict_thread_func() {
   while (true) {
     sem_wait(&predictor_send);
@@ -401,3 +394,4 @@ void PrefetchMngr::expert_unlocker_thread_func() {
     }
   }
 }
+#endif
