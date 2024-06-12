@@ -50,67 +50,61 @@ class FetchDoneTask : public FetchScheduleTaskBase, public CopyTask {
 };
 
 class FetchScheduleWorker : public WorkerThread<FetchScheduleTaskBase*> {
-  ModuleMeta* metas;
-  CacheMngr* cache;
-  PrefetchMngr* prefetcher;
+  using TaskQueue = Queue<CopyTask>;
+
+  ModuleMeta*  metas;
+  ModelLoader* model_loader;
+  CacheMngr*   cache;
+
+  FetchWorker*         fetch_thread;
+  PredictWorker*       predict_thread;
 
   IdleTask idle_task;
-  CopyTask copy_task; // we allow only one ongoing copy task
+  CopyTask current_task; // we allow only one ongoing copy task
   friend class FetchWorker;
   FetchDoneTask copy_done_task;
+
+  /** protected by queue_lock */
+  AtomicQueueLock task_queue_lock;
+  std::vector<TaskQueue> per_layer_job_queues; // the fetching thread takes out the first task from queue, then execute it.
+  /** no lock requried */
+  TaskQueue precise_job_queue;
+
+  inline void lock_task_queue() { task_queue_lock.lock(); }
+  inline void unlock_task_queue() { task_queue_lock.unlock(); }
 
   bool send_one_job(CopyTask *task);
   void do_one_task_impl(IdleTask *task);
   void do_one_task_impl(PreemptTask *task);
   void do_one_task_impl(FetchDoneTask *task);
 
-public:
-  void init(ModuleMeta* metas, CacheMngr *cache, PrefetchMngr *prefetcher);
+  void pop_next_task(CopyTask &task, bool &found);
+
+  void add_tasks_for_one_expert(int layer_idx, int expert_idx, TaskQueue* queue, int starting_mem_buffer = 0, bool is_precise = false);
+  void preempt_one_layer_(int layer_idx, int64_t *expert_idxs, size_t num_expert);
+
+ public:
+  void add_one_layer_task(int layer_idx, int64_t *expert_idxs, size_t num_expert);
+  void add_one_layer_task(int layer_idx, torch::Tensor experts);
+  void init(ModuleMeta *metas, ModelLoader *model_loader, CacheMngr *cache, FetchWorker *fetch_thread, PredictWorker *predict_thread);
+
+protected:
   void do_one_task_impl(FetchScheduleTaskBase *task);
 };
 
 class PrefetchMngr {
   friend class FetchScheduleWorker;
   friend class FetchWorker;
-  using TaskQueue = Queue<CopyTask>;
-  cudaStream_t stream;
+
   std::shared_ptr<ModuleMeta> metas;
   std::shared_ptr<ModelLoader> model_loader;
   std::shared_ptr<Predictor> predictor;
   std::shared_ptr<CacheMngr> cache;
-  /**
-   * protected by queue_lock
-   */
-  std::vector<TaskQueue> per_layer_job_queues; // the fetching thread takes out the first task from queue, then execute it.
-  /**
-   * protected by queue_lock
-   */
-  TaskQueue precise_job_queue;
+
   std::shared_ptr<FetchScheduleWorker> fetch_schedule_thread;
   std::shared_ptr<FetchWorker>         fetch_thread;
   std::shared_ptr<PredictWorker>       predict_thread;
   std::shared_ptr<ExpertUnlockWorker>  expert_unlocker_thread;
-
-  AtomicQueueLock task_queue_lock;
-
-  /**
-   * protected by queue_lock
-   */
-  CopyTask current_task;
-
-  void add_tasks_for_one_expert(int layer_idx, int expert_idx, TaskQueue* queue,
-                                int starting_mem_buffer = 0, bool is_precise = false);
-
-  void pop_next_task(CopyTask &task, bool &found);
-
-  inline void lock_task_queue() {
-    task_queue_lock.lock();
-  }
-  inline void unlock_task_queue() {
-    task_queue_lock.unlock();
-  }
-
-  void preempt_one_layer_(int layer_idx, int64_t *expert_idxs, size_t num_expert);
 
 
 public:
@@ -121,9 +115,6 @@ public:
                std::shared_ptr<Predictor> predictor);
   void init_gpu_mem_buffer(size_t num_buffers);
 
-  void add_one_layer_task(int layer_idx, torch::Tensor experts);
-  // void add_multi_layer_task(torch::Tensor experts);
-  void add_one_layer_task(int layer_idx, int64_t *expert_idxs, size_t num_expert);
 
   /**
    * for already in cache, directly lock it

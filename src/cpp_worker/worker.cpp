@@ -27,7 +27,7 @@ void PredictWorker::do_one_task_impl() {
           if (should_exit()) { return; }
         }
       }
-      prefetcher->add_one_layer_task(layer_idx, predicted_expert[layer_idx].data_ptr<int64_t>(), per_layer_num_expert);
+      fetch_schedule_thread->add_one_layer_task(layer_idx, predicted_expert[layer_idx].data_ptr<int64_t>(), per_layer_num_expert);
       sem_post(&prefetch_layer_progress);
     }
   }
@@ -57,6 +57,6 @@ void FetchWorker::do_one_task_impl(CopyTask *task) {
   expert_param.set_(gpu_tensor, 0, gpu_tensor.sizes(), gpu_tensor.strides());
 
   CUDA_CALL(cudaStreamSynchronize(this->stream));
-  prefetcher->fetch_schedule_thread->copy_done_task.init(task);
-  prefetcher->fetch_schedule_thread->add_one_task(&prefetcher->fetch_schedule_thread->copy_done_task);
+  fetch_schedule_thread->copy_done_task.init(task);
+  fetch_schedule_thread->add_one_task(&fetch_schedule_thread->copy_done_task);
 }

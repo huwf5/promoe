@@ -37,6 +37,7 @@ class WorkerThread {
       thread_func();
     });
   }
+ private:
   void thread_func() {
     while (should_exit() == false) {
       queue_lock.lock();
@@ -51,6 +52,7 @@ class WorkerThread {
       }
     }
   }
+ public:
   progress_handler_t add_one_task(TASK_T task) {
     queue_lock.lock();
     auto ret = queued++;
@@ -67,15 +69,15 @@ class WorkerThread {
 
 template<>
 class WorkerThread<void> : public WorkerThread<DummyStruct> {
-    using progress_handler_t = WorkerThread<DummyStruct>::progress_handler_t;
-  protected:
-    virtual void do_one_task_impl() = 0;
-    void do_one_task_impl(DummyStruct task) override {
-      do_one_task_impl();
-    }
-    progress_handler_t add_one_task() {
-      return WorkerThread<DummyStruct>::add_one_task(DummyStruct());
-    }
+  using progress_handler_t = WorkerThread<DummyStruct>::progress_handler_t;
+ protected:
+  virtual void do_one_task_impl() = 0;
+  void do_one_task_impl(DummyStruct task) override {
+    do_one_task_impl();
+  }
+  progress_handler_t add_one_task() {
+    return WorkerThread<DummyStruct>::add_one_task(DummyStruct());
+  }
 };
 
 class BaseTask {
@@ -94,22 +96,29 @@ class CopyTask : public BaseTask {
   std::function<void()> lambda_wait = [](){};
   std::string toString() const {
     std::stringstream ss;
-    ss << expert->toString() << "." << mem_buf_idx << ", precise " << (is_precise?"true":"false");
+    if (expert) {
+      ss << expert->toString() << "." << mem_buf_idx << ", precise " << (is_precise?"true":"false");
+    } else {
+      ss << "null";
+    }
     return ss.str();
   }
 };
 
+class FetchScheduleWorker;
+
 class FetchWorker : public WorkerThread<CopyTask*> {
   ModuleMeta* metas;
-  PrefetchMngr* prefetcher;
+  FetchScheduleWorker* fetch_schedule_thread;
   cudaStream_t stream;
   friend class PrefetchMngr;
  public:
-  void init(ModuleMeta* metas, PrefetchMngr* prefetcher, cudaStream_t stream) {
+  void init(ModuleMeta* metas, FetchScheduleWorker* fetch_schedule_thread, cudaStream_t stream) {
     this->metas = metas;
-    this->prefetcher = prefetcher;
+    this->fetch_schedule_thread = fetch_schedule_thread;
     this->stream = stream;
   }
+ protected:
   void do_one_task_impl(CopyTask *task) override;
 };
 
@@ -118,15 +127,15 @@ class FetchWorker : public WorkerThread<CopyTask*> {
  */
 class ExpertUnlockWorker : public WorkerThread<ExpertHandler*> {
   AtomicQueueLock expert_usage_queue_lock;
- public:
-   void do_one_task_impl(ExpertHandler *task) override;
+ protected:
+  void do_one_task_impl(ExpertHandler *task) override;
 };
 
 /**
  * Predict Worker
  */
 class PredictWorker : public WorkerThread<void> {
-  PrefetchMngr  * prefetcher;
+  FetchScheduleWorker* fetch_schedule_thread;
   Predictor  * predictor;
   CacheMngr  * cache;
   ModuleMeta * metas;
@@ -134,8 +143,8 @@ class PredictWorker : public WorkerThread<void> {
   friend class PrefetchMngr;
  public:
   PredictWorker() : WorkerThread<void>() {}
-  void init(PrefetchMngr* prefetcher, Predictor* predictor, CacheMngr* cache, ModuleMeta* metas) {
-    this->prefetcher = prefetcher;
+  void init(FetchScheduleWorker* fetch_schedule_thread, Predictor* predictor, CacheMngr* cache, ModuleMeta* metas) {
+    this->fetch_schedule_thread = fetch_schedule_thread;
     this->predictor = predictor;
     this->cache = cache;
     this->metas = metas;
@@ -148,5 +157,6 @@ class PredictWorker : public WorkerThread<void> {
   void consume_prefetch_layer_progress() {
     sem_wait(&prefetch_layer_progress);
   }
+ protected:
   void do_one_task_impl() override;
 };

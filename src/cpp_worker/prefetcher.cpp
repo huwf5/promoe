@@ -3,8 +3,7 @@
 #include "profiler.hpp"
 #include "logging.hpp"
 
-void PrefetchMngr::preempt_one_layer_(int layer_idx, int64_t *expert_idxs,
-                                      size_t num_expert) {
+void FetchScheduleWorker::preempt_one_layer_(int layer_idx, int64_t *expert_idxs, size_t num_expert) {
   TRACE_EVENT_GURAD(kHook, "preempt_one_layer_");
   LOG_BLOCK(DEBUG, logger, {
     logger << "preempting one layer " << layer_idx << " with expert " << array_to_str(expert_idxs, num_expert);
@@ -79,8 +78,7 @@ void PrefetchMngr::preempt_one_layer_(int layer_idx, int64_t *expert_idxs,
     logger << "reordered expert to " << array_to_str(expert_idxs, num_expert);
   });
 }
-void PrefetchMngr::add_tasks_for_one_expert(int layer_idx, int expert_idx, TaskQueue* queue,
-                                            int starting_mem_buffer, bool is_precise) {
+void FetchScheduleWorker::add_tasks_for_one_expert(int layer_idx, int expert_idx, TaskQueue* queue, int starting_mem_buffer, bool is_precise) {
   auto expert_handler = model_loader->get_source(layer_idx, expert_idx);
   LOG(TRACE) << "add prefetch task for one param " << expert_handler->toString() << ", starting from " << starting_mem_buffer;
   for (int j = starting_mem_buffer; j < expert_handler->host_data.mem_buffers.size(); j++) {
@@ -92,7 +90,7 @@ void PrefetchMngr::add_tasks_for_one_expert(int layer_idx, int expert_idx, TaskQ
   }
 }
 
-void PrefetchMngr::pop_next_task(CopyTask &task, bool &found) {
+void FetchScheduleWorker::pop_next_task(CopyTask &task, bool &found) {
   found = false;
   if (!precise_job_queue.empty()) {
     task = precise_job_queue.front();
@@ -152,14 +150,14 @@ PrefetchMngr::PrefetchMngr(std::shared_ptr<ModuleMeta> metas,
     : metas(metas), model_loader(model_loader), predictor(predictor) {
   this->cache = std::make_shared<CacheMngr>(metas, model_loader);
   predict_thread = std::make_shared<PredictWorker>();
-  predict_thread->init(this, predictor.get(), cache.get(), metas.get());
   expert_unlocker_thread = std::make_shared<ExpertUnlockWorker>();
   fetch_thread = std::make_shared<FetchWorker>();
-  per_layer_job_queues.resize(metas->num_layer);
+  cudaStream_t stream;
   CUDA_CALL(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
-  fetch_thread->init(metas.get(), this, stream);
   fetch_schedule_thread = std::make_shared<FetchScheduleWorker>();
-  fetch_schedule_thread->init(metas.get(), this->cache.get(), this);
+  predict_thread->init(fetch_schedule_thread.get(), predictor.get(), cache.get(), metas.get());
+  fetch_thread->init(metas.get(), fetch_schedule_thread.get(), stream);
+  fetch_schedule_thread->init(metas.get(), model_loader.get(), this->cache.get(), fetch_thread.get(), predict_thread.get());
 }
 void PrefetchMngr::record_then_predict_and_prefetch(int layer_id, torch::Tensor experts) {
   TRACE_EVENT_GURAD(kHook, "record_then_predict_and_launch");
@@ -171,12 +169,11 @@ void PrefetchMngr::record_then_predict_and_prefetch(int layer_id, torch::Tensor 
     predict_thread->add_one_task();
   }
 }
-void PrefetchMngr::add_one_layer_task(int layer_idx, torch::Tensor experts) {
+void FetchScheduleWorker::add_one_layer_task(int layer_idx, torch::Tensor experts) {
   add_one_layer_task(layer_idx, experts.data_ptr<int64_t>(), experts.size(0));
 }
 
-void PrefetchMngr::add_one_layer_task(int layer_idx, int64_t *expert_idxs,
-                                       size_t num_expert) {
+void FetchScheduleWorker::add_one_layer_task(int layer_idx, int64_t *expert_idxs, size_t num_expert) {
   TRACE_EVENT_GURAD(kPredict, "add task for layer " + std::to_string(layer_idx));
   lock_task_queue();
   CHECK(per_layer_job_queues[layer_idx].empty());
@@ -217,17 +214,23 @@ void FetchScheduleWorker::do_one_task_impl(FetchScheduleTaskBase *task) {
   }
 }
 void FetchScheduleWorker::do_one_task_impl(PreemptTask *task) {
-  prefetcher->preempt_one_layer_(task->layer_idx, task->expert_idxs, task->num_expert);
+  this->preempt_one_layer_(task->layer_idx, task->expert_idxs, task->num_expert);
 }
-void FetchScheduleWorker::init(ModuleMeta* metas, CacheMngr *cache, PrefetchMngr *prefetcher) {
+
+void FetchScheduleWorker::init(ModuleMeta *metas, ModelLoader *model_loader,
+                               CacheMngr *cache, FetchWorker *fetch_thread,
+                               PredictWorker *predict_thread) {
   this->metas = metas;
-  this->prefetcher = prefetcher;
+  this->model_loader = model_loader;
   this->cache = cache;
+  this->fetch_thread = fetch_thread;
+  this->predict_thread = predict_thread;
+  per_layer_job_queues.resize(metas->num_layer);
   this->add_one_task(&this->idle_task);
 }
 void FetchScheduleWorker::do_one_task_impl(FetchDoneTask *task) {
   LOG(DEBUG) << "scheduler: received one fetch job done " << task->toString();
-  CHECK(task->expert == prefetcher->current_task.expert);
+  CHECK(task->expert == current_task.expert);
   task->expert->num_ready = task->mem_buf_idx + 1;
   if (task->mem_buf_idx == metas->num_per_expert_param - 1) {
     LOG(DEBUG) << "scheduler: all fetch job done for expert " << task->toString();
@@ -244,9 +247,9 @@ void FetchScheduleWorker::do_one_task_impl(FetchDoneTask *task) {
 void FetchScheduleWorker::do_one_task_impl(IdleTask *idle_task) {
   CHECK(idle_task == &this->idle_task);
   bool found = false, sent = false;
-  prefetcher->pop_next_task(prefetcher->current_task, found);
+  pop_next_task(current_task, found);
   if (found) {
-    sent = send_one_job(&prefetcher->current_task);
+    sent = send_one_job(&current_task);
   }
   if (!found || !sent) {
     // re add this idle task
@@ -302,9 +305,9 @@ bool FetchScheduleWorker::send_one_job(CopyTask *task) {
   }
 
   {
-    copy_task = *task;
-    copy_task.lambda_wait = lambda_wait;
-    prefetcher->fetch_thread->add_one_task(&copy_task);
+    current_task = *task;
+    current_task.lambda_wait = lambda_wait;
+    fetch_thread->add_one_task(&current_task);
   }
   return true;
 }
