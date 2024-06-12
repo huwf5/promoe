@@ -22,10 +22,10 @@ void CacheMngr::init_gpu_mem_buffer(size_t num_buffers) {
   }
 }
 CacheMngr::~CacheMngr() {
-  size_t used_mem_cnt = 0;
-  for (auto &l : prefetched_experts) {
-    used_mem_cnt += l.size();
-  }
+  size_t used_mem_cnt = prefetched_experts.size();
+  // for (auto &l : prefetched_experts) {
+  //   used_mem_cnt += l.size();
+  // }
   size_t unused_mem_cnt = 0;
   for (auto &l : cache_slots->slots) {
     unused_mem_cnt += l.unused_mems.size();
@@ -35,7 +35,7 @@ CacheMngr::~CacheMngr() {
 CacheMngr::CacheMngr(std::shared_ptr<ModuleMeta> metas,
                      std::shared_ptr<ModelLoader> model_loader)
     : metas(metas), model_loader(model_loader), policy_factory() {
-  prefetched_experts.resize(metas->num_layer);
+  // prefetched_experts.resize(metas->num_layer);
 
   policy_factory.register_policy("fifo", [this]() -> std::shared_ptr<CachePolicy>{ return std::make_shared<CachePolicyFIFO>(this); });
   policy_factory.register_policy("lru",  [this]() -> std::shared_ptr<CachePolicy>{ return std::make_shared<CachePolicyLRU>(this);  });
@@ -84,14 +84,13 @@ ExpertMemHanlder* CacheMngr::evict(ExpertHandler *e_to_evict, ExpertHandler *inc
   auto cache_slot = cache_slots->to_slot(e_to_evict);
 
   cache_slot->policy->evict(e_to_evict);
-  prefetched_experts[e_to_evict->layer_idx].erase(e_to_evict->expert_idx);
-  auto ret = e_to_evict->gpu_data;
+  auto ret = prefetched_experts[e_to_evict];
+  prefetched_experts.erase(e_to_evict);
   CHECK(ret != nullptr);
   e_to_evict->gpu_data = nullptr;
-  ret->num_ready = 0;
   if (!reserve_mem) {
     CHECK(false) << "Unimplemented";
-    cache_slot->unused_mems.push_back(e_to_evict->gpu_data);
+    cache_slot->unused_mems.push_back(ret);
     ret = nullptr;
   }
   return ret;
@@ -114,10 +113,11 @@ CacheMngr::CacheLineOccupancyWaiter CacheMngr::miss(ExpertHandler *incoming_e) {
   auto cache_slot = cache_slots->to_slot(incoming_e);
   CacheLineOccupancyWaiter lambda_to_wait_expert_occupancy = [](){};
   if (cache_slot->unused_mems.size() > 0) {
-    incoming_e->gpu_data = cache_slot->unused_mems.back();
+    auto gpu_data = cache_slot->unused_mems.back();
+    incoming_e->gpu_data = gpu_data;
     cache_slot->unused_mems.pop_back();
     cache_slots->to_slot(incoming_e)->policy->access_on_miss(incoming_e);
-    prefetched_experts[incoming_e->layer_idx][incoming_e->expert_idx] = incoming_e;
+    prefetched_experts[incoming_e] = gpu_data;
   } else {
     auto e_to_evict = cache_slot->policy->select_for_evict(incoming_e);
     // incoming_e->gpu_data = evict(e_to_evict, incoming_e, true);
@@ -128,8 +128,9 @@ CacheMngr::CacheLineOccupancyWaiter CacheMngr::miss(ExpertHandler *incoming_e) {
 
       cache_slot->policy->evict(e_to_evict);
       cache_slots->to_slot(incoming_e)->policy->access_on_miss(incoming_e);
-      prefetched_experts[e_to_evict->layer_idx].erase(e_to_evict->expert_idx);
-      prefetched_experts[incoming_e->layer_idx][incoming_e->expert_idx] = incoming_e;
+      auto gpu_data = prefetched_experts[e_to_evict];
+      prefetched_experts.erase(e_to_evict);
+      prefetched_experts[incoming_e] = gpu_data;
       // kIdle: ?
       // kFetching: ?
       // kReady: ?
@@ -151,10 +152,10 @@ CacheMngr::CacheLineOccupancyWaiter CacheMngr::miss(ExpertHandler *incoming_e) {
         e_to_evict->expert_status.transfer(kFetching, kIdle);// evict a partially fetched e_to_evict
       }
 
-      CHECK(e_to_evict->gpu_data != nullptr);
-      incoming_e->gpu_data = e_to_evict->gpu_data;
+      CHECK(e_to_evict->gpu_data == gpu_data);
       e_to_evict->gpu_data = nullptr;
-      incoming_e->gpu_data->num_ready = 0;
+      incoming_e->gpu_data = gpu_data;
+      incoming_e->num_ready = 0;
     }
   }
   return lambda_to_wait_expert_occupancy;

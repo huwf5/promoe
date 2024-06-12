@@ -97,7 +97,7 @@ class CacheMngr {
   std::shared_ptr<ModuleMeta> metas;
   std::shared_ptr<ModelLoader> model_loader;
 
-  std::vector<std::unordered_map<int, ExpertHandler*>> prefetched_experts; // the ongoing job also lives in here.
+  std::unordered_map<ExpertHandler*, ExpertMemHanlder*> prefetched_experts; // the ongoing job also lives in here.
 
   std::shared_ptr<SlotMapper> cache_slots;
   AtomicQueueLock unused_mems_lock;
@@ -106,11 +106,13 @@ class CacheMngr {
             std::shared_ptr<ModelLoader> model_loader);
   ~CacheMngr();
 
-  bool is_in_cache(ExpertHandler* expert) { return is_in_cache(expert->layer_idx, expert->expert_idx); }
+  bool is_in_cache(ExpertHandler* expert) {
+    return prefetched_experts.find(expert) != prefetched_experts.end();
+  }
 
   // legacy methods
   bool is_in_cache(int layer_id, int expert_id) {
-    return (prefetched_experts[layer_id].find(expert_id) != prefetched_experts[layer_id].end());
+    return is_in_cache(model_loader->get_source(layer_id, expert_id));
   }
   void init_gpu_mem_buffer(size_t num_buffers);
 

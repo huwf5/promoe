@@ -212,10 +212,56 @@ struct DoubleLinkedList {
 
 };
 
+struct DummyStruct{};
+
+template<typename T>
+struct DummyContainer {
+  std::vector<T> data;
+  // Forward vector constructor
+  template<typename... Args>
+  DummyContainer(Args&&... args) : data(std::forward<Args>(args)...) {}
+  // Forward vector methods
+  typename std::vector<T>::iterator begin() { return data.begin(); }
+  typename std::vector<T>::iterator end() { return data.end(); }
+  typename std::vector<T>::size_type size() const { return data.size(); }
+  void resize(typename std::vector<T>::size_type count) { data.resize(count); }
+  void clear() { data.clear(); }
+  bool empty() const { return data.empty(); }
+  void swap(DummyContainer& other) { data.swap(other.data); }
+  T& operator[](typename std::vector<T>::size_type pos) { return data[pos]; }
+  T& at(typename std::vector<T>::size_type pos) { return data.at(pos); }
+  T& front() { return data.front(); }
+  T& back() { return data.back(); }
+  void push_back(const T& value) { data.push_back(value); }
+  void pop_back() { data.pop_back(); }
+};
+
+
+template<>
+struct DummyContainer<DummyStruct> {
+  using T=DummyStruct;
+  static T _place_holder;
+  size_t cur_len = 0;
+  DummyContainer() {}
+  DummyContainer(size_t count) : cur_len(count) {}
+  T* begin()        { return nullptr; }
+  T* end()          { return nullptr; }
+  size_t size() const     { return cur_len; }
+  void resize(size_t count) { cur_len = count; }
+  void clear() { cur_len = 0; }
+  bool empty() const { return cur_len == 0; }
+  void swap(DummyContainer& other) { std::swap(cur_len, other.cur_len); }
+  T& operator[](size_t pos) { return _place_holder; }
+  T& at(size_t pos) { return _place_holder; }
+  T& front() { return _place_holder; }
+  T& back() { return _place_holder; }
+  void push_back(const T& value) { cur_len++; }
+  void pop_back() { cur_len--; }
+};
 
 template<typename ELEM_T>
 class Queue {
-  std::vector<ELEM_T> queue_buffer;
+  DummyContainer<ELEM_T> queue_buffer;
   int start, stop;
   void extend() {
     auto orig_size = queue_buffer.size();
@@ -223,27 +269,11 @@ class Queue {
     if (start < stop) { return; }
     std::copy(queue_buffer.begin(), queue_buffer.begin() + stop, queue_buffer.begin() + orig_size);
     stop = orig_size + stop;
-    // {
-    //   std::vector<ELEM_T> new_queue;
-    //   new_queue.resize(queue_buffer.size() * 2);
-    //   auto new_tail = new_queue.begin();
-    //   if (start < stop) {
-    //     new_tail = std::copy(queue_buffer.begin() + start, queue_buffer.begin() + stop, new_tail);
-    //   } else {
-    //     new_tail = std::copy(queue_buffer.begin() + start, queue_buffer.end(), new_tail);
-    //     new_tail = std::copy(queue_buffer.begin(), queue_buffer.begin() + stop, new_tail);
-    //   }
-    //   start = 0;
-    //   stop = new_tail - new_queue.begin();
-    //   queue_buffer.swap(new_queue);
-    // }
   }
   int next(int a) { return (a + 1) % queue_buffer.size(); }
  public:
-  // std::unordered_map<int, int> expert_to_remaining_task;
   Queue() : queue_buffer(10), start(0), stop(0) {}
   void clear() {
-    // expert_to_remaining_task.clear();
     start = stop;
   }
   bool empty() {
@@ -255,7 +285,6 @@ class Queue {
   }
   void pop() {
     CHECK(empty() == false);
-    // expert_to_remaining_task[queue_buffer[start].expert_idx] -= 1;
     start = next(start);
   }
   void push(ELEM_T task) {
@@ -264,14 +293,5 @@ class Queue {
     }
     queue_buffer[stop] = task;
     stop = next(stop);
-    // if (expert_to_remaining_task.find(task.expert_idx) == expert_to_remaining_task.end()) {
-    //   expert_to_remaining_task[task.expert_idx] = 0;
-    // }
-    // expert_to_remaining_task[task.expert_idx] += 1;
   }
-  // int remaining_task(int expert_id) {
-  //   auto iter = expert_to_remaining_task.find(expert_id);
-  //   if (iter == expert_to_remaining_task.end()) { return 0; }
-  //   return iter->second;
-  // }
 };

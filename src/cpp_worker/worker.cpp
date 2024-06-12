@@ -3,7 +3,7 @@
 #include "profiler.hpp"
 #include "prefetcher.hpp"
 
-void PredictWorker::do_one_task_impl(BaseTask *_) {
+void PredictWorker::do_one_task_impl() {
   // TRACE_EVENT_GURAD(kPredict, "predict thread");
   auto prob = predictor->predict().reshape({metas->num_layer, metas->num_expert});
   auto sorted = prob.sort(-1, true);
@@ -46,13 +46,13 @@ void FetchWorker::do_one_task_impl(CopyTask *task) {
     task->lambda_wait();
   }
   CUDA_CALL(cudaMemcpyAsync(
-      task->dst->mem_buffers[task->mem_buf_idx].ptr(),
+      task->expert->gpu_data->mem_buffers[task->mem_buf_idx].ptr(),
       task->expert->host_data.mem_buffers[task->mem_buf_idx].ptr(),
       task->expert->host_data.mem_buffers[task->mem_buf_idx].len(),
       cudaMemcpyHostToDevice, this->stream));
 
   // point model parameter to destination
-  auto gpu_tensor = task->dst->mem_buffers[task->mem_buf_idx].get_tensor();
+  auto gpu_tensor = task->expert->gpu_data->mem_buffers[task->mem_buf_idx].get_tensor();
   auto expert_param = task->expert->reference_to_model_param.mem_buffers[task->mem_buf_idx].get_tensor();
   expert_param.set_(gpu_tensor, 0, gpu_tensor.sizes(), gpu_tensor.strides());
 
@@ -64,5 +64,4 @@ void CopyTask::init(PrefetchTask *task) {
   this->expert      = task->expert;
   this->mem_buf_idx = task->mem_buf_idx;
   this->is_precise  = task->is_precise;
-  this->dst = expert->gpu_data;
 }

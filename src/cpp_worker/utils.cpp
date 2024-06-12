@@ -42,3 +42,5 @@ std::string tensor_to_str(torch::Tensor t) {
   }
   return ss.str();
 }
+
+DummyStruct DummyContainer<DummyStruct>::_place_holder = DummyStruct();

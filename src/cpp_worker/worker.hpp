@@ -8,11 +8,13 @@
 template<typename TASK_T>
 class WorkerThread {
   Queue<TASK_T> queue;
-  TASK_T current_task;
+  // TASK_T current_task;
   AtomicQueueLock queue_lock;
   std::thread worker_thread;
   volatile bool exit_mark = false;
+ protected:
   using progress_handler_t = int64_t;
+ private:
   progress_handler_t queued = 0;
   std::atomic<progress_handler_t> progress{0};
  protected:
@@ -42,7 +44,7 @@ class WorkerThread {
         queue_lock.unlock();
         // usleep(10);
       } else {
-        current_task = queue.front();
+        auto current_task = queue.front();
         queue.pop();
         queue_lock.unlock();
         do_one_task(current_task);
@@ -63,6 +65,19 @@ class WorkerThread {
   virtual ~WorkerThread() {}
 };
 
+template<>
+class WorkerThread<void> : public WorkerThread<DummyStruct> {
+    using progress_handler_t = WorkerThread<DummyStruct>::progress_handler_t;
+  protected:
+    virtual void do_one_task_impl() = 0;
+    void do_one_task_impl(DummyStruct task) override {
+      do_one_task_impl();
+    }
+    progress_handler_t add_one_task() {
+      return WorkerThread<DummyStruct>::add_one_task(DummyStruct());
+    }
+};
+
 class BaseTask {
   public:
 };
@@ -77,7 +92,6 @@ class CopyTask : public BaseTask {
   int mem_buf_idx;
   bool is_precise = false;
   ExpertHandler *expert = nullptr;
-  ExpertMemHanlder *dst = nullptr;
   std::function<void()> lambda_wait = [](){};
   void init(PrefetchTask *task);
   std::string toString() const {
@@ -113,7 +127,7 @@ class ExpertUnlockWorker : public WorkerThread<ExpertHandler*> {
 /**
  * Predict Worker
  */
-class PredictWorker : public WorkerThread<BaseTask*> {
+class PredictWorker : public WorkerThread<void> {
   PrefetchMngr  * prefetcher;
   Predictor  * predictor;
   CacheMngr  * cache;
@@ -121,7 +135,7 @@ class PredictWorker : public WorkerThread<BaseTask*> {
   sem_t prefetch_layer_budget, prefetch_layer_progress;
   friend class PrefetchMngr;
  public:
-  PredictWorker() : WorkerThread<BaseTask*>() {}
+  PredictWorker() : WorkerThread<void>() {}
   void init(PrefetchMngr* prefetcher, Predictor* predictor, CacheMngr* cache, ModuleMeta* metas) {
     this->prefetcher = prefetcher;
     this->predictor = predictor;
@@ -136,5 +150,5 @@ class PredictWorker : public WorkerThread<BaseTask*> {
   void consume_prefetch_layer_progress() {
     sem_wait(&prefetch_layer_progress);
   }
-  void do_one_task_impl(BaseTask *_) override;
+  void do_one_task_impl() override;
 };

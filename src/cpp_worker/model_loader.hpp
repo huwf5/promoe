@@ -27,7 +27,6 @@ class MemBuffer {
 class ExpertMemHanlder {
  public:
   std::vector<MemBuffer> mem_buffers;
-  int num_ready = 0;
 };
 
 class ExpertHandler {
@@ -36,6 +35,7 @@ class ExpertHandler {
   ExpertMemHanlder host_data;
   ExpertMemHanlder reference_to_model_param;
   ExpertMemHanlder* gpu_data = nullptr;
+  int num_ready = 0;
   int layer_idx, expert_idx;
   // SpinLock lock;
   AtomicMultiStatusLock expert_status;

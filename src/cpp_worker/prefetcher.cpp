@@ -183,7 +183,7 @@ void PrefetchMngr::try_release_expert_in_layer(int layer_id) {
 }
 void PrefetchMngr::launch_thread() {
   // try_wait_pretictor_done = [this]() { sem_wait(&predictor_done); };
-  predict_thread->add_one_task(nullptr);
+  predict_thread->add_one_task();
   // prefetch_thread = std::thread([this]() { this->prefetch_thread_func(); });
   fetch_schedule_thread->launch();
   predict_thread->launch();
@@ -213,7 +213,7 @@ void PrefetchMngr::record_then_predict_and_prefetch(int layer_id, torch::Tensor 
   });
   predictor->add_one_layer(layer_id, experts);
   if (layer_id == metas->num_layer - 1) {
-    predict_thread->add_one_task(nullptr);
+    predict_thread->add_one_task();
     // sem_wait(&predictor_done);
   }
 }
@@ -243,7 +243,7 @@ PrefetchMngr::~PrefetchMngr() {
   //   try_release_expert_in_layer(l);
   // }
   // thread_exit_mark = true;
-  predict_thread->add_one_task(nullptr);
+  predict_thread->add_one_task();
   predict_thread->add_prefetch_layer_budget();
   // if (prefetch_thread.joinable()) { prefetch_thread.join(); }
   fetch_thread->exit();
@@ -279,7 +279,7 @@ void FetchScheduleWorker::init(ModuleMeta* metas, CacheMngr *cache, PrefetchMngr
 void FetchScheduleWorker::do_one_task_impl(FetchDoneTask *task) {
   LOG(DEBUG) << "scheduler: received one fetch job done " << task->toString();
   CHECK(task->expert == prefetcher->current_task.expert);
-  task->expert->gpu_data->num_ready = task->mem_buf_idx + 1;
+  task->expert->num_ready = task->mem_buf_idx + 1;
   if (task->mem_buf_idx == metas->num_per_expert_param - 1) {
     // for (int i = 0; i < metas->num_per_expert_param; i++) {
     //   task->expert->expert_module->register_parameter(
@@ -321,6 +321,7 @@ bool FetchScheduleWorker::send_one_job(PrefetchTask *task) {
   CacheMngr::CacheLineOccupancyWaiter lambda_wait = [](){};
   if (task->expert->gpu_data == nullptr) {
     if (task->mem_buf_idx != 0) {
+      CHECK(task->expert->num_ready == 0);
       LOG(ERROR) << "scheduler: a partial task gets evicted " << task->toString();
       CHECK(task->is_precise == false);
       CHECK(task->expert->expert_status.get() == kIdle);
@@ -333,16 +334,16 @@ bool FetchScheduleWorker::send_one_job(PrefetchTask *task) {
       lambda_wait = cache->miss(task->expert);
       cache->cache_lock.unlock();
       // lambda_wait();
-      CHECK(task->expert->gpu_data->num_ready == 0);
+      CHECK(task->expert->num_ready == 0);
       task->expert->expert_status.transfer(kIdle, kFetching);
       // LOG(TRACE) << "assigning gpu mem " << task->expert->gpu_data << " for expert " << task->toString();
     }
   }
 
   auto orig_status = task->expert->expert_status.get();
-  if (task->expert->gpu_data->num_ready > task->mem_buf_idx) {
-    LOG(TRACE) << "scheduler: a duplicated partial task, skip it: expert " << task->toString() << ", " << task->expert->gpu_data->num_ready << ">" << task->mem_buf_idx;
-    if (task->expert->gpu_data->num_ready == metas->num_per_expert_param) {
+  if (task->expert->num_ready > task->mem_buf_idx) {
+    LOG(TRACE) << "scheduler: a duplicated partial task, skip it: expert " << task->toString() << ", " << task->expert->num_ready << ">" << task->mem_buf_idx;
+    if (task->expert->num_ready == metas->num_per_expert_param) {
       if (task->is_precise) {
         task->expert->expert_status.transfer(kReady, kLaunching, false);
         cache->hit(task->expert);
@@ -353,7 +354,7 @@ bool FetchScheduleWorker::send_one_job(PrefetchTask *task) {
     }
     return false;
   } else {
-    CHECK(task->expert->gpu_data->num_ready == task->mem_buf_idx);
+    CHECK(task->expert->num_ready == task->mem_buf_idx);
     CHECK(orig_status == kFetching);
   }
 
