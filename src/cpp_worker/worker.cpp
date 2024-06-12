@@ -60,8 +60,3 @@ void FetchWorker::do_one_task_impl(CopyTask *task) {
   prefetcher->fetch_schedule_thread->copy_done_task.init(task);
   prefetcher->fetch_schedule_thread->add_one_task(&prefetcher->fetch_schedule_thread->copy_done_task);
 }
-void CopyTask::init(PrefetchTask *task) {
-  this->expert      = task->expert;
-  this->mem_buf_idx = task->mem_buf_idx;
-  this->is_precise  = task->is_precise;
-}

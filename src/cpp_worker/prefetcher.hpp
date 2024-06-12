@@ -15,43 +15,6 @@
 #include "predictor.hpp"
 #include "cache.hpp"
 
-class PrefetchTask {
- public:
-  int layer_idx, expert_idx, mem_buf_idx;
-  bool is_precise = false;
-  ExpertHandler* expert = nullptr;
-  std::string toString() const {
-    std::stringstream ss;
-    ss << layer_idx << "." << expert_idx << "." << mem_buf_idx << ", precise " << (is_precise?"true":"false");
-    return ss.str();
-  }
-};
-
-
-#ifdef DEAD_CODE
-class Queue {
-  std::queue<PrefetchTask> queue;
- public:
-  void clear() {
-    auto empty_queue = std::queue<PrefetchTask>();
-    queue.swap(empty_queue);
-  }
-  void push(PrefetchTask task) {
-    queue.push(task);
-  }
-  bool empty() {
-    return queue.empty();
-  }
-  PrefetchTask front() {
-    return queue.front();
-  }
-  void pop() {
-    queue.pop();
-  }
-
-};
-#endif
-
 class ExpertHandler;
 
 class FetchScheduleTaskBase {
@@ -76,24 +39,14 @@ class PreemptTask : public FetchScheduleTaskBase {
   int64_t* expert_idxs;
   size_t num_expert;
 };
-class FetchDoneTask : public FetchScheduleTaskBase, public PrefetchTask {
+class FetchDoneTask : public FetchScheduleTaskBase, public CopyTask {
  public:
   FetchDoneTask() : FetchScheduleTaskBase(kFetchDone) {}
-  void init(PrefetchTask* task) {
-    this->mem_buf_idx = task->mem_buf_idx;
-    this->expert = task->expert;
-    this->is_precise = task->is_precise;
-    this->layer_idx = expert->layer_idx;
-    this->expert_idx = expert->expert_idx;
-  }
   void init(CopyTask* task) {
-    this->expert = task->expert;
     this->mem_buf_idx = task->mem_buf_idx;
+    this->expert = task->expert;
     this->is_precise = task->is_precise;
-    this->expert_idx = expert->expert_idx;
-    this->layer_idx = expert->layer_idx;
   }
-  // CopyTask* copy_task;
 };
 
 class FetchScheduleWorker : public WorkerThread<FetchScheduleTaskBase*> {
@@ -106,7 +59,7 @@ class FetchScheduleWorker : public WorkerThread<FetchScheduleTaskBase*> {
   friend class FetchWorker;
   FetchDoneTask copy_done_task;
 
-  bool send_one_job(PrefetchTask *task);
+  bool send_one_job(CopyTask *task);
   void do_one_task_impl(IdleTask *task);
   void do_one_task_impl(PreemptTask *task);
   void do_one_task_impl(FetchDoneTask *task);
@@ -119,7 +72,7 @@ public:
 class PrefetchMngr {
   friend class FetchScheduleWorker;
   friend class FetchWorker;
-  using TaskQueue = Queue<PrefetchTask>;
+  using TaskQueue = Queue<CopyTask>;
   cudaStream_t stream;
   std::shared_ptr<ModuleMeta> metas;
   std::shared_ptr<ModelLoader> model_loader;
@@ -134,25 +87,21 @@ class PrefetchMngr {
    */
   TaskQueue precise_job_queue;
   std::shared_ptr<FetchScheduleWorker> fetch_schedule_thread;
-  std::shared_ptr<FetchWorker> fetch_thread;
-  std::shared_ptr<PredictWorker> predict_thread;
-  std::shared_ptr<ExpertUnlockWorker> expert_unlocker_thread;
+  std::shared_ptr<FetchWorker>         fetch_thread;
+  std::shared_ptr<PredictWorker>       predict_thread;
+  std::shared_ptr<ExpertUnlockWorker>  expert_unlocker_thread;
 
-  std::function<void()> try_wait_pretictor_done;
   AtomicQueueLock task_queue_lock;
 
   /**
    * protected by queue_lock
    */
-  PrefetchTask current_task;
-  // ExpertHandler * previous_task = nullptr;
+  CopyTask current_task;
 
   void add_tasks_for_one_expert(int layer_idx, int expert_idx, TaskQueue* queue,
                                 int starting_mem_buffer = 0, bool is_precise = false);
 
-  void pop_next_task(PrefetchTask &task, bool &found);
-
-  void do_one_task(PrefetchTask *task);
+  void pop_next_task(CopyTask &task, bool &found);
 
   inline void lock_task_queue() {
     task_queue_lock.lock();
@@ -186,9 +135,6 @@ public:
 
   void wait_expert(int layer_id, int expert_id);
   void mark_expert_using(int layer_id, int expert_id);
-  void record_cuda_event(int layer_id, int expert_id);
-  void try_release_expert(int layer_id, int expert_id);
-  void try_release_expert_in_layer(int layer_id);
 
   void launch_thread();
 };

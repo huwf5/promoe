@@ -86,14 +86,12 @@ class PrefetchMngr;
 /**
  * Param Fetcher
  */
-class PrefetchTask;
 class CopyTask : public BaseTask {
  public:
   int mem_buf_idx;
   bool is_precise = false;
   ExpertHandler *expert = nullptr;
   std::function<void()> lambda_wait = [](){};
-  void init(PrefetchTask *task);
   std::string toString() const {
     std::stringstream ss;
     ss << expert->toString() << "." << mem_buf_idx << ", precise " << (is_precise?"true":"false");
