@@ -92,7 +92,6 @@ class CacheMngr {
   friend class SlotMapper;
  public:
   using CacheLineOccupancyWaiter = std::function<void()>;
-  AtomicQueueLock cache_lock;
   size_t cache_len = 0;
   std::shared_ptr<ModuleMeta> metas;
   std::shared_ptr<ModelLoader> model_loader;
@@ -100,7 +99,6 @@ class CacheMngr {
   std::unordered_map<ExpertHandler*, ExpertMemHanlder*> prefetched_experts; // the ongoing job also lives in here.
 
   std::shared_ptr<SlotMapper> cache_slots;
-  AtomicQueueLock unused_mems_lock;
 
   CacheMngr(std::shared_ptr<ModuleMeta> metas,
             std::shared_ptr<ModelLoader> model_loader);

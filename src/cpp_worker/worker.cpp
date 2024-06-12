@@ -57,6 +57,5 @@ void FetchWorker::do_one_task_impl(CopyTask *task) {
   expert_param.set_(gpu_tensor, 0, gpu_tensor.sizes(), gpu_tensor.strides());
 
   CUDA_CALL(cudaStreamSynchronize(this->stream));
-  fetch_schedule_thread->copy_done_task.init(task);
   fetch_schedule_thread->add_one_task(&fetch_schedule_thread->copy_done_task);
 }

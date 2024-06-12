@@ -12,33 +12,23 @@ void FetchScheduleWorker::preempt_one_layer_(int layer_idx, int64_t *expert_idxs
   std::vector<uint64_t> not_started_experts;  // not predicted
   std::vector<uint64_t> correct_going_experts;   // correctly predicted and started
   predict_thread->consume_prefetch_layer_progress();
-  lock_task_queue();
 
-  cache->cache_lock.lock();
   for (int i = 0; i < num_expert; i++) {
     // kIdle: in queue or not in queue. not started
     // kFetching: correctly predicted, maybe in queue, already started fetching (may not be the current task)
     // kReady: correctly predicted, already fetched
     // kUsing: impossible
-    // inside this lock, only the status of current/previous task may change:
-    //   previous:
-    //     - kFetching -> kIdle, a wrong task is preempted
-    //   current:
-    //     - kIdle -> kFetching, a task just starts
-    //     - kFetching -> kReady, a task finishes
-    //   other expert may also change, since it may be evicted!!!!!!
     auto e = model_loader->get_source(layer_idx, expert_idxs[i]);
+    auto cur_status = e->expert_status.get();
     if (e == current_task.expert) {
-      // cur_status must be kIdle, kFetching, kReady
-      // how to avoid this task to be evicted?
-      //   by adding a redundant precise task
-      auto cur_status = e->expert_status.get();
-      CHECK(cur_status == kFetching || cur_status == kReady || cur_status == kIdle);
+      // cur_status must be kFetching
+      CHECK(cur_status == kFetching);
+      // Q: how to access this one in cache? A: by adding a redundant precise task
       correct_going_experts.push_back(expert_idxs[i]);
     } else {
-      auto cur_status = e->expert_status.transfer(kReady, kLaunching, false);
       if (cache->is_in_cache(e)) {
         if (cur_status == kReady) {
+          e->expert_status.transfer(kReady, kLaunching);
           correct_done_experts.push_back(expert_idxs[i]);
           cache->hit(e);
         } else if (cur_status == kFetching) {
@@ -51,8 +41,8 @@ void FetchScheduleWorker::preempt_one_layer_(int layer_idx, int64_t *expert_idxs
       }
     }
   }
-  cache->cache_lock.unlock();
 
+  lock_task_queue();
   if (per_layer_job_queues[layer_idx].empty() == false) {
     LOG(TRACE) << "preempting one layer " << layer_idx << ", queue is not empty, current task is " << current_task.toString();
     per_layer_job_queues[layer_idx].clear();
@@ -228,20 +218,18 @@ void FetchScheduleWorker::init(ModuleMeta *metas, ModelLoader *model_loader,
   per_layer_job_queues.resize(metas->num_layer);
   this->add_one_task(&this->idle_task);
 }
-void FetchScheduleWorker::do_one_task_impl(FetchDoneTask *task) {
-  LOG(DEBUG) << "scheduler: received one fetch job done " << task->toString();
-  CHECK(task->expert == current_task.expert);
-  task->expert->num_ready = task->mem_buf_idx + 1;
-  if (task->mem_buf_idx == metas->num_per_expert_param - 1) {
-    LOG(DEBUG) << "scheduler: all fetch job done for expert " << task->toString();
+void FetchScheduleWorker::do_one_task_impl(FetchDoneTask *_) {
+  LOG(DEBUG) << "scheduler: received one fetch job done " << current_task.toString();
+  current_task.expert->num_ready = current_task.mem_buf_idx + 1;
+  if (current_task.mem_buf_idx == metas->num_per_expert_param - 1) {
+    LOG(DEBUG) << "scheduler: all fetch job done for expert " << current_task.toString();
 
-    if (task->is_precise) {
-      cache->cache_lock.lock();
-      cache->hit(task->expert);
-      cache->cache_lock.unlock();
+    if (current_task.is_precise) {
+      cache->hit(current_task.expert);
     }
-    task->expert->expert_status.transfer(kFetching, task->is_precise ? kLaunching : kReady);
+    current_task.expert->expert_status.transfer(kFetching, current_task.is_precise ? kLaunching : kReady);
   }
+  current_task.expert = nullptr;
   this->add_one_task(&this->idle_task);
 }
 void FetchScheduleWorker::do_one_task_impl(IdleTask *idle_task) {
@@ -276,9 +264,7 @@ bool FetchScheduleWorker::send_one_job(CopyTask *task) {
     } else {
       // a first time task
       LOG(TRACE) << "scheduler: assigning gpu mem for expert " << task->toString();
-      cache->cache_lock.lock();
       lambda_wait = cache->miss(task->expert);
-      cache->cache_lock.unlock();
       // lambda_wait();
       CHECK(task->expert->num_ready == 0);
       task->expert->expert_status.transfer(kIdle, kFetching);

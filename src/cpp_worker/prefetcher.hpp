@@ -39,14 +39,9 @@ class PreemptTask : public FetchScheduleTaskBase {
   int64_t* expert_idxs;
   size_t num_expert;
 };
-class FetchDoneTask : public FetchScheduleTaskBase, public CopyTask {
+class FetchDoneTask : public FetchScheduleTaskBase {
  public:
   FetchDoneTask() : FetchScheduleTaskBase(kFetchDone) {}
-  void init(CopyTask* task) {
-    this->mem_buf_idx = task->mem_buf_idx;
-    this->expert = task->expert;
-    this->is_precise = task->is_precise;
-  }
 };
 
 class FetchScheduleWorker : public WorkerThread<FetchScheduleTaskBase*> {
