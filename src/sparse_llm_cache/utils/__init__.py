@@ -76,13 +76,14 @@ def inject_model(
     model : torch.nn.Module,
     num_moe_layer : int,
     num_expert_per_layer : int,
-    cache_len : int,
+    cache_rate : float,
     num_predict_expert_per_layer : int,
     expert_meta_parser,
     expert_name_filter,
     moe_layer_name_filter,
-    max_prefetch_layer_distance = None,
-    enable_per_layer_cache : bool = True,
+    cache_len : int = None,
+    max_prefetch_layer_distance = -1,
+    per_layer_cache : bool = True,
     cache_policy : str = 'lru',
     cache_device : str|int = 'cuda',
     pin_memory : bool  = True,
@@ -98,7 +99,9 @@ def inject_model(
       The number of mixture-of-experts (MoE) layers in the model.
     num_expert_per_layer (int):
       The number of experts per MoE layer.
+    cache_rate (float): The cache rate.
     cache_len (int): The length of the cache.
+      Default is None. This overrides cache_rate.
     num_predict_expert_per_layer (int): The number of experts to predict per MoE layer.
       Set to 0 can avoid prefetch. Fetch is only triggered on demand
       Set to >0 enables prefetch.
@@ -111,7 +114,7 @@ def inject_model(
     max_prefetch_layer_distance (int, optional):
       The maximum prefetch layer distance, avoiding prefetcher goes to fast.
       Defaults to None, meaning infinite.
-    enable_per_layer_cache (bool, optional):
+    per_layer_cache (bool, optional):
       Whether to enable per-layer cache. Defaults to True.
     cache_policy (str, optional):
       The cache policy. Defaults to 'lru'.
@@ -126,10 +129,10 @@ def inject_model(
   meta = cpp_worker.ModuleMeta(num_moe_layer, num_expert_per_layer)
   meta.init_param_list([k for k,_ in model.model.layers[1].mlp.experts[0].named_parameters()])
   meta.num_predict_expert_per_layer = num_predict_expert_per_layer
-  if max_prefetch_layer_distance is None:
+  if max_prefetch_layer_distance is None or max_prefetch_layer_distance == -1:
     max_prefetch_layer_distance = num_moe_layer - 1
   meta.max_prefetch_layer_distance = max_prefetch_layer_distance
-  meta.per_layer_cache = enable_per_layer_cache
+  meta.per_layer_cache = per_layer_cache
   meta.cache_policy = cache_policy
   model_loader = cpp_worker.ModelLoader(meta)
   predictor = cpp_worker.Predictor(meta)
@@ -145,6 +148,8 @@ def inject_model(
   replace_mlp_report_experts(model, prefetch_mngr, predictor, num_moe_layer, num_expert_per_layer, num_predict_expert_per_layer, moe_layer_name_filter)
 
   predictor.load_model("/nvme/songxiaoniu/moe/moe-predict-models/models--deepseek-ai--deepseek-moe-16b-chat.pt")
+  if not cache_len:
+    cache_len = round(cache_rate * num_moe_layer * num_expert_per_layer)
   prefetch_mngr.init_gpu_mem_buffer(cache_len)
 
   add_hook_to_experts(model, prefetch_mngr, expert_name_filter)
