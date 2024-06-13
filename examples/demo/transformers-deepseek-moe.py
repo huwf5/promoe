@@ -39,7 +39,7 @@ cache_configs = {
   "num_predict_expert_per_layer" : 6,
   "cache_len"                    : 27 * 12,
   "max_prefetch_layer_distance"  : None,
-  "enable_per_layer_cache"       : True,
+  "per_layer_cache"              : True,
   "cache_policy"                 : 'lru',
 }
 # ------------------ full cache ---------------------
@@ -47,7 +47,7 @@ cache_configs = {
 #   "num_predict_expert_per_layer" : 0,
 #   "cache_len"                    : 27 * 64,
 #   "max_prefetch_layer_distance"  : None,
-#   "enable_per_layer_cache"       : True,
+#   "per_layer_cache"              : True,
 #   "cache_policy"                 : 'lru',
 # }
 # # ------------------ disable prefetch ---------------
@@ -55,7 +55,7 @@ cache_configs = {
 #   "num_predict_expert_per_layer" : 0,
 #   "cache_len"                    : 27 * 12,
 #   "max_prefetch_layer_distance"  : None,
-#   "enable_per_layer_cache"       : True,
+#   "per_layer_cache"              : True,
 #   "cache_policy"                 : 'lru',
 # }
 # # ------------------ corner test 1 ------------------
@@ -63,7 +63,7 @@ cache_configs = {
 #   "num_predict_expert_per_layer" : 6,
 #   "cache_len"                    : 1,
 #   "max_prefetch_layer_distance"  : 1,
-#   "enable_per_layer_cache"       : False,
+#   "per_layer_cache"              : False,
 #   "cache_policy"                 : 'lru',
 # }
 # # ------------------ corner test 2 ------------------
@@ -71,7 +71,7 @@ cache_configs = {
 #   "num_predict_expert_per_layer" : 6,
 #   "cache_len"                    : 1,
 #   "max_prefetch_layer_distance"  : 1,
-#   "enable_per_layer_cache"       : False,
+#   "per_layer_cache"              : False,
 #   "cache_policy"                 : 'fifo',
 # }
 # # ------------------ corner test 3 ------------------
@@ -79,7 +79,7 @@ cache_configs = {
 #   "num_predict_expert_per_layer" : 0,
 #   "cache_len"                    : 1,
 #   "max_prefetch_layer_distance"  : 1,
-#   "enable_per_layer_cache"       : False,
+#   "per_layer_cache"              : False,
 #   "cache_policy"                 : 'fifo',
 # }
 
