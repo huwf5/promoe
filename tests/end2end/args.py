@@ -1,0 +1,15 @@
+# %%
+import argparse
+
+def parse_args():
+  parser = argparse.ArgumentParser()
+  parser.add_argument("--num_predict_expert_per_layer", type=int)
+  parser.add_argument("--cache_rate", type=float)
+  parser.add_argument("--cache_len", type=int, default=None)
+  parser.add_argument("--max_prefetch_layer_distance", type=int, default=-1)
+  parser.add_argument("--enable_per_layer_cache",  action="store_true",  dest="per_layer_cache", default=True)
+  parser.add_argument("--disable_per_layer_cache", action="store_false", dest="per_layer_cache", default=True)
+  parser.add_argument("--cache_policy", type=str, choices=["lru", "fifo"], default="lru")
+  # parser.add_argument("--xxx", action="store_true")
+  args = parser.parse_args()
+  return vars(args)
