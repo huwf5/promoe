@@ -101,6 +101,12 @@ class PrefetchMngr {
   std::shared_ptr<PredictWorker>       predict_thread;
   std::shared_ptr<ExpertUnlockWorker>  expert_unlocker_thread;
 
+  /**
+   * for already in cache, directly lock it
+   * for fetching, lock it after fetching is done
+   */
+  void preempt_and_launch_one_layer(int layer_idx, torch::Tensor experts);
+  void record_then_predict_and_prefetch(int layer_id, torch::Tensor experts);
 
 public:
   ~PrefetchMngr();
@@ -110,14 +116,10 @@ public:
                std::shared_ptr<Predictor> predictor);
   void init_gpu_mem_buffer(size_t num_buffers);
 
-
-  /**
-   * for already in cache, directly lock it
-   * for fetching, lock it after fetching is done
-   */
-  void preempt_and_launch_one_layer(int layer_idx, torch::Tensor experts);
-
-  void record_then_predict_and_prefetch(int layer_id, torch::Tensor experts);
+  void report_one_layer(int layer_id, torch::Tensor experts) {
+    preempt_and_launch_one_layer(layer_id, experts);
+    record_then_predict_and_prefetch(layer_id, experts);
+  }
 
   void wait_expert(int layer_id, int expert_id);
   void mark_expert_using(int layer_id, int expert_id);

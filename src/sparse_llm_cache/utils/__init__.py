@@ -70,19 +70,7 @@ def move_non_moe_to_gpu(model, device='cuda', filter=RegexFilter(r'.*layers\.(\d
 def replace_mlp_report_experts(model, prefetch_mngr, predictor, num_moe_layer, num_expert, num_predict_expert, filter=RegexFilter(r'.*layers\.([1-9]\d*)\.mlp$')):
   def f(module, name):
     def new_report_experts(experts):
-      # print(module._layer_id, experts)
-      prefetch_mngr.preempt_and_launch_one_layer(module._layer_id, experts)
-
-      prefetch_mngr.record_then_predict_and_prefetch(module._layer_id, experts)
-      # predictor.add_one_layer(module._layer_id, experts)
-      # if module._layer_id == num_moe_layer-1:
-      #   predicted_prob = predictor.predict()
-      #   # print(predicted_prob.shape)
-      #   predicted_prob = predicted_prob.reshape(num_moe_layer, num_expert)
-      #   _, _predict_idx = predicted_prob.sort(dim=-1, descending=True)
-      #   for i in range(num_moe_layer):
-      #     prefetch_mngr.add_one_layer_task(i, _predict_idx[i][:num_predict_expert])
-      #   predictor.clear_access_buffer()
+      prefetch_mngr.report_one_layer(module._layer_id, experts)
 
       return experts
     module.report_experts = new_report_experts
@@ -170,7 +158,7 @@ def inject_model(
 
   print("injecting model...")
   register_expert_params(model, model_loader, expert_name_filter)
-  model.to(cache_device)
+  # model.to(cache_device)
 
   replace_mlp_report_experts(model, prefetch_mngr, predictor, num_moe_layer, num_expert_per_layer, num_predict_expert_per_layer, moe_layer_name_filter)
 
