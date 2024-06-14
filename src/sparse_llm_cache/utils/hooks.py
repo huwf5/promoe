@@ -185,7 +185,7 @@ class ExpertHook(ModelHook):
   # def detach_hook(self, module):
   #   return super().detach_hook(module)
 
-class TimingHook(ModelHook):
+class TraceEventHook(ModelHook):
   def __init__(self):
     self.trace_guard_stack = []
   # def init_hook(self, module):
@@ -196,6 +196,21 @@ class TimingHook(ModelHook):
     return args, kwargs
   def post_forward(self, module, output):
     self.trace_guard_stack.pop().release()
+    return output
+  # def detach_hook(self, module):
+  #   return super().detach_hook(module)
+
+class TimingHook(ModelHook):
+  def __init__(self, prefetch_mngr):
+    self.timing_guard = prefetch_mngr.build_timer()
+#   def init_hook(self, module):
+#     print(f"add timing hook to {module._prefix}")
+#     return super().init_hook(module)
+  def pre_forward(self, module, *args, **kwargs):
+    self.timing_guard.init(cpp_worker.kModelForward)
+    return args, kwargs
+  def post_forward(self, module, output):
+    self.timing_guard.release()
     return output
   # def detach_hook(self, module):
   #   return super().detach_hook(module)

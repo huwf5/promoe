@@ -102,7 +102,8 @@ def inject_model(
     expert_name_filter = None,
     moe_layer_name_filter = None,
     pin_memory : bool  = True,
-    enable_timing : bool = False,
+    enable_module_trace_event : bool = False,
+    enable_model_timer : bool = False,
   ):
   """
   Injects a model with cache-related functionality.
@@ -139,8 +140,10 @@ def inject_model(
       The cache device. Defaults to 'cuda'.
     pin_memory (bool, optional):
       Whether to pin model parameters on CPU. Defaults to True.
-    enable_timing (bool, optional):
-      Whether to enable timing. Defaults to False.
+    enable_module_trace_event (bool, optional):
+      Whether to record event of each pytorch module. Defaults to False.
+    enable_model_timer (bool, optional):
+      Whether to enable timing of entire model. Defaults to False.
   """
   print("initializing cache lib...")
   model_id = model.config._name_or_path
@@ -187,9 +190,12 @@ def inject_model(
 
   add_hook_to_experts(model, prefetch_mngr, expert_name_filter)
 
-  if enable_timing:
-    timing_hook = hooks.TimingHook()
-    add_hook_to_some_modules(model, timing_hook, append=True)
+  if enable_module_trace_event:
+    trace_event_hook = hooks.TraceEventHook()
+    add_hook_to_some_modules(model, trace_event_hook, append=True)
+  if enable_model_timer:
+    timing_hook = hooks.TimingHook(prefetch_mngr)
+    add_hook_to_some_modules(model, timing_hook, filter=RegexFilter('^$'), append=True)
   print("injecting model...done")
   if pin_memory:
     print("pin model parameters on cpu...")

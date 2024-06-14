@@ -48,7 +48,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     .def("wait_expert", &PrefetchMngr::wait_expert)
     .def("mark_expert_using", &PrefetchMngr::mark_expert_using)
     .def("report_one_layer", &PrefetchMngr::report_one_layer)
+    .def("build_timer", &PrefetchMngr::build_timer)
     .def_readwrite("cache_stats", &PrefetchMngr::cache_stats)
+    .def_readwrite("profiler", &PrefetchMngr::profiler)
   ;
 
   py::class_<TraceEventGuard, std::shared_ptr<TraceEventGuard>>(m, "TraceEventGuard")
@@ -64,6 +66,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     .def("dump_average_per_layer", &CacheStatistics::dump_average_per_layer)
   ;
 
+  py::class_<TimerGuard>(m, "TimerGuard")
+    .def("init", &TimerGuard::init)
+    .def("release", &TimerGuard::release)
+  ;
+
   m.def("dump_trace_event_collector_singleton", &dump_trace_event_collector_singleton);
 
   py::enum_<ThreadType>(m, "ThreadType")
@@ -71,5 +78,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     .value("kHook", ThreadType::kHook)
     .value("kPrefetch", ThreadType::kPrefetch)
     .value("kGPU", ThreadType::kGPU)
+    .export_values();
+
+  py::enum_<TimeProfiler::TimeType>(m, "TimeType")
+    .value("kModelForward", TimeProfiler::TimeType::kModelForward)
     .export_values();
 };

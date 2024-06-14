@@ -45,6 +45,8 @@ void FetchScheduleWorker::preempt_one_layer_(int layer_idx, int64_t *expert_idxs
   cache_stats->forward();
   cache_stats->hit(correct_done_experts.size());
   cache_stats->miss(num_expert - correct_done_experts.size());
+  if (layer_idx == 0) { profiler->push(TimeProfiler::kCntActivatedExpert, 0); }
+  profiler->add(TimeProfiler::kCntActivatedExpert, num_expert);
 
   lock_task_queue();
   if (per_layer_job_queues[layer_idx].empty() == false) {
@@ -151,14 +153,45 @@ PrefetchMngr::PrefetchMngr(std::shared_ptr<ModuleMeta> metas,
   fetch_schedule_thread = std::make_shared<FetchScheduleWorker>();
   cache_stats = std::make_shared<CacheStatistics>();
   cache_stats->add_reporter([this](CacheStatistics* stats){
-    auto t = stats->dump_average(this->metas->num_expert_per_token);
-    std::cout << "decode_stage_hit_cnt:" << t[0].item<float>() << std::endl;
-    std::cout << "decode_stage_miss_cnt:" << t[1].item<float>() << std::endl;
-    std::cout << "decode_stage_hit_rate:" << t[0].item<float>() / (t[0].item<float>() + t[1].item<float>()) << std::endl;
+    auto tensor = stats->to_tensor();
+    // remove iteration of prefill
+    tensor = tensor.index({tensor.sum(1) <= this->metas->num_expert_per_token});
+    // skip first 10 iteration
+    tensor = tensor.index({torch::indexing::Slice(this->metas->num_layer * 10)});
+    tensor = tensor.mean(0);
+    std::cout << "decode_stage_hit_cnt:"  << tensor[0].item<float>() << std::endl;
+    std::cout << "decode_stage_miss_cnt:" << tensor[1].item<float>() << std::endl;
+    std::cout << "decode_stage_hit_rate:" << tensor[0].item<float>() / (tensor[0].item<float>() + tensor[1].item<float>()) << std::endl;
+  });
+  cache_stats->add_reporter([this](CacheStatistics* stats){
+    auto tensor = stats->to_tensor();
+    // remove iteration of decode
+    tensor = tensor.index({tensor.sum(1) > this->metas->num_expert_per_token});
+    // skip first 10 iteration
+    tensor = tensor.index({torch::indexing::Slice(this->metas->num_layer * 2)});
+    tensor = tensor.mean(0);
+    std::cout << "prefill_stage_hit_cnt:"  << tensor[0].item<float>() << std::endl;
+    std::cout << "prefill_stage_miss_cnt:" << tensor[1].item<float>() << std::endl;
+    std::cout << "prefill_stage_hit_rate:" << tensor[0].item<float>() / (tensor[0].item<float>() + tensor[1].item<float>()) << std::endl;
+  });
+  profiler = std::make_shared<TimeProfiler>();
+  profiler->add_reporter([this](TimeProfiler *p){
+    auto num_used_expert_tensor = p->to_tensor(TimeProfiler::kCntActivatedExpert);
+    auto forward_time_tensor    = p->to_tensor(TimeProfiler::kModelForward);
+    {
+      auto idx = num_used_expert_tensor <= (this->metas->num_expert_per_token * this->metas->num_layer);
+      auto time = forward_time_tensor.index({idx}).index({torch::indexing::Slice(10)});
+      std::cout << "decode_stage_forward_time:" << time.mean(torch::kFloat32).item() << std::endl;
+    }
+    {
+      auto idx = num_used_expert_tensor > (this->metas->num_expert_per_token * this->metas->num_layer);
+      auto time = forward_time_tensor.index({idx}).index({torch::indexing::Slice(2)});
+      std::cout << "prefill_stage_forward_time:" << time.mean(torch::kFloat32).item() << std::endl;
+    }
   });
   predict_thread->init(fetch_schedule_thread.get(), predictor.get(), cache.get(), metas.get());
   fetch_thread->init(metas.get(), fetch_schedule_thread.get(), stream);
-  fetch_schedule_thread->init(metas.get(), model_loader.get(), this->cache.get(), fetch_thread.get(), predict_thread.get(), cache_stats.get());
+  fetch_schedule_thread->init(metas.get(), model_loader.get(), this->cache.get(), fetch_thread.get(), predict_thread.get(), cache_stats.get(), profiler.get());
 }
 void PrefetchMngr::record_then_predict_and_prefetch(int layer_id, torch::Tensor experts) {
   TRACE_EVENT_GURAD(kHook, "record_then_predict_and_launch");
@@ -224,13 +257,14 @@ void FetchScheduleWorker::do_one_task_impl(PreemptTask *task) {
 
 void FetchScheduleWorker::init(ModuleMeta *metas, ModelLoader *model_loader,
                                CacheMngr *cache, FetchWorker *fetch_thread,
-                               PredictWorker *predict_thread, CacheStatistics *cache_stats) {
+                               PredictWorker *predict_thread, CacheStatistics *cache_stats, TimeProfiler* profiler) {
   this->metas = metas;
   this->model_loader = model_loader;
   this->cache = cache;
   this->fetch_thread = fetch_thread;
   this->predict_thread = predict_thread;
   this->cache_stats = cache_stats;
+  this->profiler = profiler;
   per_layer_job_queues.resize(metas->num_layer);
   this->add_one_task(&this->idle_task);
 }

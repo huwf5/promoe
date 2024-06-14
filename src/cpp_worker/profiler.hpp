@@ -237,3 +237,63 @@ class CacheStatistics {
     return tensor;
   }
 };
+
+class TimeProfiler {
+  std::vector<std::vector<uint64_t>> buffer;
+  std::vector<std::function<void(TimeProfiler*)>> reporters;
+ public:
+  enum TimeType {
+    kModelForward = 0,
+    kCntActivatedExpert,
+    kNumTimeType,
+  };
+  TimeProfiler() {
+    buffer.resize(kNumTimeType);
+    for (auto & b : buffer) {
+      b.reserve(10000);
+    }
+  }
+  ~TimeProfiler() {
+    for (auto & r : reporters) {
+      r(this);
+    }
+  }
+  void add_reporter(std::function<void(TimeProfiler*)> reporter) {
+    reporters.push_back(reporter);
+  }
+  void push(TimeType type, uint64_t dur) {
+    buffer[type].push_back(dur);
+  }
+  void add(TimeType type, uint64_t dur) {
+    buffer[type].back() += dur;
+  }
+  torch::Tensor to_tensor(TimeType type) {
+    return torch::from_blob(buffer[type].data(), {static_cast<long>(buffer[type].size())}, torch::kLong).clone();
+  }
+};
+
+class TimerGuard {
+ protected:
+  bool initialized = false;
+  uint64_t start, stop;
+  TimeProfiler::TimeType type;
+  TimeProfiler* profiler;
+ public:
+  TimerGuard(TimeProfiler* profiler) : profiler(profiler) {}
+  TimerGuard(TimeProfiler* profiler, TimeProfiler::TimeType t) : profiler(profiler) {
+    this->init(t);
+  }
+  inline void init(TimeProfiler::TimeType t) {
+    this->initialized = true;
+    this->type = t;
+    this->start = Timer::cur_ts_us();
+  }
+  void release() {
+    this->stop = Timer::cur_ts_us();
+    this->profiler->push(type, stop-start);
+    this->initialized = false;
+  }
+  ~TimerGuard() {
+    if (initialized) release();
+  }
+};
