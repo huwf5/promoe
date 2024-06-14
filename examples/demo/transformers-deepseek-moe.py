@@ -27,65 +27,17 @@ model = AutoModelForCausalLM.from_pretrained(
 )
 print("loading model...done")
 
-import re
-
 import sparse_llm_cache
-# from sparse_llm_cache.utils import inject_model, ModelMetas
 
-meta_configs  = sparse_llm_cache.utils.ModelMetas.build_deepseek_moe()
-
-# ------------------ normal config ------------------
 cache_configs = {
   "num_predict_expert_per_layer" : 6,
-  "cache_len"                    : 27 * 12,
-  "max_prefetch_layer_distance"  : None,
+  "cache_rate"                   : 0.2,
   "per_layer_cache"              : True,
   "cache_policy"                 : 'lru',
 }
-# ------------------ full cache ---------------------
-# cache_configs = {
-#   "num_predict_expert_per_layer" : 0,
-#   "cache_len"                    : 27 * 64,
-#   "max_prefetch_layer_distance"  : None,
-#   "per_layer_cache"              : True,
-#   "cache_policy"                 : 'lru',
-# }
-# # ------------------ disable prefetch ---------------
-# cache_configs = {
-#   "num_predict_expert_per_layer" : 0,
-#   "cache_len"                    : 27 * 12,
-#   "max_prefetch_layer_distance"  : None,
-#   "per_layer_cache"              : True,
-#   "cache_policy"                 : 'lru',
-# }
-# # ------------------ corner test 1 ------------------
-# cache_configs = {
-#   "num_predict_expert_per_layer" : 6,
-#   "cache_len"                    : 1,
-#   "max_prefetch_layer_distance"  : 1,
-#   "per_layer_cache"              : False,
-#   "cache_policy"                 : 'lru',
-# }
-# # ------------------ corner test 2 ------------------
-# cache_configs = {
-#   "num_predict_expert_per_layer" : 6,
-#   "cache_len"                    : 1,
-#   "max_prefetch_layer_distance"  : 1,
-#   "per_layer_cache"              : False,
-#   "cache_policy"                 : 'fifo',
-# }
-# # ------------------ corner test 3 ------------------
-# cache_configs = {
-#   "num_predict_expert_per_layer" : 0,
-#   "cache_len"                    : 1,
-#   "max_prefetch_layer_distance"  : 1,
-#   "per_layer_cache"              : False,
-#   "cache_policy"                 : 'fifo',
-# }
 
 sparse_llm_cache.utils.inject_model(
   model,
-  **meta_configs,
   **cache_configs,
   pin_memory = True,
   # enable_timing = True,

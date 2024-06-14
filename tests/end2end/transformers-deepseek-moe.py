@@ -7,16 +7,15 @@ os.environ['CUDA_VISIBLE_DEVICES'] = '6'
 os.environ['HUGGINGFACE_OFFLINE'] = "1"
 
 from transformers.utils import logging
-from args import parse_args
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 import sparse_llm_cache
+
+from args import parse_args
 cache_configs = parse_args()
-meta_configs  = sparse_llm_cache.utils.ModelMetas.build_deepseek_moe()
 
 print("loading model...")
-
 logging.disable_progress_bar()
 model_id = "deepseek-ai/deepseek-moe-16b-chat"
 tokenizer = AutoTokenizer.from_pretrained(model_id)
@@ -33,7 +32,6 @@ print("loading model...done")
 
 sparse_llm_cache.utils.inject_model(
   model,
-  **meta_configs,
   **cache_configs,
   pin_memory = True,
   # enable_timing = True,

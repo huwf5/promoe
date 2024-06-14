@@ -72,20 +72,34 @@ def add_hook_to_some_modules(model, hook, filter=RegexFilter(r'.*'), append=Fals
   recursive_traverse_childrens(model, f, filter)
 
 
+def repo_folder_name(repo_id: str, repo_type: str = 'model') -> str:
+  """
+  Copied from huggingface_hub
+  Return a serialized version of a hf.co repo name and type, safe for disk storage
+  as a single non-nested folder.
+
+  Example: models--julien-c--EsperBERTo-small
+  """
+  # remove all `/` occurrences to correctly convert repo to directory name
+  parts = [f"{repo_type}s", *repo_id.split("/")]
+  return '--'.join(parts)
+
 def inject_model(
     model : torch.nn.Module,
-    num_moe_layer : int,
-    num_expert_per_layer : int,
+    # cache configs
     cache_rate : float,
     num_predict_expert_per_layer : int,
-    expert_meta_parser,
-    expert_name_filter,
-    moe_layer_name_filter,
     cache_len : int = None,
     max_prefetch_layer_distance = -1,
     per_layer_cache : bool = True,
     cache_policy : str = 'lru',
     cache_device : str|int = 'cuda',
+    # metadatas of model
+    num_moe_layer : int = None,
+    num_expert_per_layer : int = None,
+    expert_meta_parser = None,
+    expert_name_filter = None,
+    moe_layer_name_filter = None,
     pin_memory : bool  = True,
     enable_timing : bool = False,
   ):
@@ -126,16 +140,33 @@ def inject_model(
       Whether to enable timing. Defaults to False.
   """
   print("initializing cache lib...")
+  model_id = model.config._name_or_path
+
+  if num_moe_layer is None:
+    auto_infered_model_metas = auto_infer_model_metas(model_id, return_dict=False)
+    num_moe_layer         = auto_infered_model_metas.num_moe_layer
+    num_expert_per_layer  = auto_infered_model_metas.num_expert_per_layer
+    expert_meta_parser    = auto_infered_model_metas.expert_meta_parser
+    expert_name_filter    = auto_infered_model_metas.expert_name_filter
+    moe_layer_name_filter = auto_infered_model_metas.moe_layer_name_filter
+
+  if max_prefetch_layer_distance is None or max_prefetch_layer_distance == -1:
+    max_prefetch_layer_distance = num_moe_layer - 1
+  if cache_len is None:
+    if per_layer_cache:
+      cache_len = round(cache_rate * num_expert_per_layer) * num_moe_layer
+    else:
+      cache_len = round(cache_rate * num_moe_layer * num_expert_per_layer)
+
   meta = cpp_worker.ModuleMeta(num_moe_layer, num_expert_per_layer)
   meta.init_param_list([k for k,_ in model.model.layers[1].mlp.experts[0].named_parameters()])
   meta.num_predict_expert_per_layer = num_predict_expert_per_layer
-  if max_prefetch_layer_distance is None or max_prefetch_layer_distance == -1:
-    max_prefetch_layer_distance = num_moe_layer - 1
   meta.max_prefetch_layer_distance = max_prefetch_layer_distance
   meta.per_layer_cache = per_layer_cache
   meta.cache_policy = cache_policy
-  model_loader = cpp_worker.ModelLoader(meta)
-  predictor = cpp_worker.Predictor(meta)
+
+  model_loader  = cpp_worker.ModelLoader(meta)
+  predictor     = cpp_worker.Predictor(meta)
   prefetch_mngr = cpp_worker.PrefetchMngr(meta, model_loader, predictor)
   print("initializing cache lib...done")
 
@@ -143,13 +174,10 @@ def inject_model(
 
   print("injecting model...")
   register_expert_params(model, model_loader, expert_name_filter)
-  # model.to(cache_device)
-
   replace_mlp_report_experts(model, prefetch_mngr, predictor, num_moe_layer, num_expert_per_layer, num_predict_expert_per_layer, moe_layer_name_filter)
 
-  predictor.load_model("/nvme/songxiaoniu/moe/moe-predict-models/models--deepseek-ai--deepseek-moe-16b-chat.pt")
-  if not cache_len:
-    cache_len = round(cache_rate * num_moe_layer * num_expert_per_layer)
+  # fixme: a general model path
+  predictor.load_model(f"/nvme/songxiaoniu/moe/moe-predict-models/{repo_folder_name(repo_id = model_id)}.pt")
   prefetch_mngr.init_gpu_mem_buffer(cache_len)
 
   add_hook_to_experts(model, prefetch_mngr, expert_name_filter)
