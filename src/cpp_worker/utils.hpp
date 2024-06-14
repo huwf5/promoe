@@ -113,6 +113,7 @@ class ModuleMeta {
   std::vector<std::string> param_name_list;
   std::unordered_map<std::string, int> param_name_to_id;
   int num_predict_expert_per_layer;
+  int num_expert_per_token;
   int max_prefetch_layer_distance = 1;
   bool per_layer_cache = true;
   std::string cache_policy = "fifo";

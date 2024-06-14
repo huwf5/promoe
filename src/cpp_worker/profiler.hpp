@@ -6,6 +6,7 @@
 #include <chrono>
 #include <unordered_map>
 #include <functional>
+#include <torch/torch.h>
 
 enum ThreadType {
   kPythonMain = 0,
@@ -184,3 +185,55 @@ class TraceEventGuard {
       { CODE_BLOCK } \
     } \
   }
+
+class CacheStatistics {
+  struct HitMissCnt {
+    int hit = 0, miss = 0;
+    int cnt() { return hit + miss; }
+    float hit_rate() { return (float)hit / (cnt() == 0 ? 1 : 0); }
+  };
+  std::vector<HitMissCnt> per_iter_per_layer_cnts;
+  std::vector<std::function<void(CacheStatistics*)>> reporters;
+ public:
+  CacheStatistics() {
+    per_iter_per_layer_cnts.reserve(10000);
+  }
+  ~CacheStatistics() {
+    for (auto & r : reporters) {
+      r(this);
+    }
+  }
+  void add_reporter(std::function<void(CacheStatistics*)> reporter) {
+    reporters.push_back(reporter);
+  }
+  void forward() {
+    per_iter_per_layer_cnts.push_back(HitMissCnt());
+  }
+  void hit()         { per_iter_per_layer_cnts.back().hit++; }
+  void hit(int cnt)  { per_iter_per_layer_cnts.back().hit+=cnt; }
+  void miss()        { per_iter_per_layer_cnts.back().miss++; }
+  void miss(int cnt) { per_iter_per_layer_cnts.back().miss+=cnt; }
+  torch::Tensor to_tensor() {
+    torch::Tensor ret = torch::zeros({static_cast<long>(per_iter_per_layer_cnts.size()), 2});
+    for (int i = 0; i < per_iter_per_layer_cnts.size(); i++) {
+      ret[i][0] = per_iter_per_layer_cnts[i].hit;
+      ret[i][1] = per_iter_per_layer_cnts[i].miss;
+    }
+    return ret;
+  }
+  torch::Tensor dump_average(int prefill_cnt_threshold) {
+    auto tensor = to_tensor();
+    // remove iteration of prefill
+    tensor = tensor.index({tensor.sum(1) <= prefill_cnt_threshold});
+    tensor = tensor.mean(0);
+    return tensor;
+  }
+  torch::Tensor dump_average_per_layer(int num_layer, int prefill_cnt_threshold) {
+    CHECK(per_iter_per_layer_cnts.size() % num_layer == 0);
+    auto tensor = to_tensor();
+    tensor = tensor.index({tensor.sum(1) <= prefill_cnt_threshold});
+    tensor = tensor.reshape({-1, num_layer, 2});
+    tensor = tensor.mean(0);
+    return tensor;
+  }
+};

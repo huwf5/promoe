@@ -97,6 +97,7 @@ def inject_model(
     # metadatas of model
     num_moe_layer : int = None,
     num_expert_per_layer : int = None,
+    num_expert_per_token : int = None,
     expert_meta_parser = None,
     expert_name_filter = None,
     moe_layer_name_filter = None,
@@ -113,6 +114,8 @@ def inject_model(
       The number of mixture-of-experts (MoE) layers in the model.
     num_expert_per_layer (int):
       The number of experts per MoE layer.
+    num_expert_per_token (int):
+      The number of experts activated per token.
     cache_rate (float): The cache rate.
     cache_len (int): The length of the cache.
       Default is None. This overrides cache_rate.
@@ -146,6 +149,7 @@ def inject_model(
     auto_infered_model_metas = auto_infer_model_metas(model_id, return_dict=False)
     num_moe_layer         = auto_infered_model_metas.num_moe_layer
     num_expert_per_layer  = auto_infered_model_metas.num_expert_per_layer
+    num_expert_per_token  = auto_infered_model_metas.num_expert_per_token
     expert_meta_parser    = auto_infered_model_metas.expert_meta_parser
     expert_name_filter    = auto_infered_model_metas.expert_name_filter
     moe_layer_name_filter = auto_infered_model_metas.moe_layer_name_filter
@@ -162,6 +166,7 @@ def inject_model(
   meta.init_param_list([k for k,_ in model.model.layers[1].mlp.experts[0].named_parameters()])
   meta.num_predict_expert_per_layer = num_predict_expert_per_layer
   meta.max_prefetch_layer_distance = max_prefetch_layer_distance
+  meta.num_expert_per_token = num_expert_per_token
   meta.per_layer_cache = per_layer_cache
   meta.cache_policy = cache_policy
 
@@ -192,6 +197,7 @@ def inject_model(
     print("pin model parameters on cpu...done")
   prefetch_mngr.launch_thread()
   torch.set_num_threads(16)
+  return prefetch_mngr
 
 '''
 Legacy

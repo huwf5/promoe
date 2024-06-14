@@ -7,6 +7,7 @@ from .filter import RegexFilter
 class ModelMetas:
   num_moe_layer: int
   num_expert_per_layer: int
+  num_expert_per_token: int
   expert_meta_parser: callable
   expert_name_filter: callable
   moe_layer_name_filter: callable
@@ -29,6 +30,7 @@ class ModelMetas:
     ret = ModelMetas(
       num_moe_layer         = 27,
       num_expert_per_layer  = 64,
+      num_expert_per_token  = 6,
       expert_meta_parser    = parse_expert_meta_from_name,
       expert_name_filter    = RegexFilter(r'.*layers\.(\d+)\.mlp\.experts\.(\d+)$'),
       moe_layer_name_filter = RegexFilter(r'.*layers\.([1-9]\d*)\.mlp$')
@@ -53,6 +55,7 @@ class ModelMetas:
     ret = ModelMetas(
       num_moe_layer         = 24,
       num_expert_per_layer  = 60,
+      num_expert_per_token  = 4,
       expert_meta_parser    = parse_expert_meta_from_name,
       expert_name_filter    = RegexFilter(r'.*layers\.(\d+)\.mlp\.experts\.(\d+)$'),
       moe_layer_name_filter = RegexFilter(r'.*layers\.([1-9]\d*)\.mlp$')

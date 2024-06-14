@@ -14,6 +14,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     .def_readwrite("num_expert", &ModuleMeta::num_expert)
     .def_readwrite("num_per_expert_param", &ModuleMeta::num_per_expert_param)
     .def_readwrite("num_predict_expert_per_layer", &ModuleMeta::num_predict_expert_per_layer)
+    .def_readwrite("num_expert_per_token", &ModuleMeta::num_expert_per_token)
     .def_readwrite("max_prefetch_layer_distance", &ModuleMeta::max_prefetch_layer_distance)
     .def_readwrite("per_layer_cache", &ModuleMeta::per_layer_cache)
     .def_readwrite("cache_policy", &ModuleMeta::cache_policy)
@@ -47,12 +48,20 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     .def("wait_expert", &PrefetchMngr::wait_expert)
     .def("mark_expert_using", &PrefetchMngr::mark_expert_using)
     .def("report_one_layer", &PrefetchMngr::report_one_layer)
+    .def_readwrite("cache_stats", &PrefetchMngr::cache_stats)
   ;
 
   py::class_<TraceEventGuard, std::shared_ptr<TraceEventGuard>>(m, "TraceEventGuard")
     .def(py::init<>())
     .def("init", &TraceEventGuard::init, "docstring", py::arg(), py::arg(), py::arg("phase")='X')
     .def("release", &TraceEventGuard::release)
+  ;
+
+  py::class_<CacheStatistics, std::shared_ptr<CacheStatistics>>(m, "CacheStatistics")
+    .def(py::init<>())
+    .def("to_tensor", &CacheStatistics::to_tensor)
+    .def("dump_average", &CacheStatistics::dump_average)
+    .def("dump_average_per_layer", &CacheStatistics::dump_average_per_layer)
   ;
 
   m.def("dump_trace_event_collector_singleton", &dump_trace_event_collector_singleton);

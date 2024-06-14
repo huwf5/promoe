@@ -14,6 +14,7 @@
 #include "model_loader.hpp"
 #include "predictor.hpp"
 #include "cache.hpp"
+#include "profiler.hpp"
 
 class ExpertHandler;
 
@@ -47,9 +48,10 @@ class FetchDoneTask : public FetchScheduleTaskBase {
 class FetchScheduleWorker : public WorkerThread<FetchScheduleTaskBase*> {
   using TaskQueue = Queue<CopyTask>;
 
-  ModuleMeta*  metas;
-  ModelLoader* model_loader;
-  CacheMngr*   cache;
+  ModuleMeta*      metas;
+  ModelLoader*     model_loader;
+  CacheMngr*       cache;
+  CacheStatistics* cache_stats;
 
   FetchWorker*         fetch_thread;
   PredictWorker*       predict_thread;
@@ -81,7 +83,7 @@ class FetchScheduleWorker : public WorkerThread<FetchScheduleTaskBase*> {
  public:
   void add_one_layer_task(int layer_idx, int64_t *expert_idxs, size_t num_expert);
   void add_one_layer_task(int layer_idx, torch::Tensor experts);
-  void init(ModuleMeta *metas, ModelLoader *model_loader, CacheMngr *cache, FetchWorker *fetch_thread, PredictWorker *predict_thread);
+  void init(ModuleMeta *metas, ModelLoader *model_loader, CacheMngr *cache, FetchWorker *fetch_thread, PredictWorker *predict_thread, CacheStatistics *cache_stats);
 
 protected:
   void do_one_task_impl(FetchScheduleTaskBase *task);
@@ -109,11 +111,12 @@ class PrefetchMngr {
   void record_then_predict_and_prefetch(int layer_id, torch::Tensor experts);
 
 public:
-  ~PrefetchMngr();
+  std::shared_ptr<CacheStatistics> cache_stats;
 
   PrefetchMngr(std::shared_ptr<ModuleMeta> metas,
                std::shared_ptr<ModelLoader> model_loader,
                std::shared_ptr<Predictor> predictor);
+  ~PrefetchMngr();
   void init_gpu_mem_buffer(size_t num_buffers);
 
   void report_one_layer(int layer_id, torch::Tensor experts) {

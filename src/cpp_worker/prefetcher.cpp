@@ -42,6 +42,10 @@ void FetchScheduleWorker::preempt_one_layer_(int layer_idx, int64_t *expert_idxs
     }
   }
 
+  cache_stats->forward();
+  cache_stats->hit(correct_done_experts.size());
+  cache_stats->miss(num_expert - correct_done_experts.size());
+
   lock_task_queue();
   if (per_layer_job_queues[layer_idx].empty() == false) {
     LOG(TRACE) << "preempting one layer " << layer_idx << ", queue is not empty, current task is " << current_task.toString();
@@ -145,16 +149,27 @@ PrefetchMngr::PrefetchMngr(std::shared_ptr<ModuleMeta> metas,
   cudaStream_t stream;
   CUDA_CALL(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
   fetch_schedule_thread = std::make_shared<FetchScheduleWorker>();
+  cache_stats = std::make_shared<CacheStatistics>();
+  cache_stats->add_reporter([this](CacheStatistics* stats){
+    auto t = stats->dump_average(this->metas->num_expert_per_token);
+    std::cout << "decode_stage_hit_cnt:" << t[0].item<float>() << std::endl;
+    std::cout << "decode_stage_miss_cnt:" << t[1].item<float>() << std::endl;
+    std::cout << "decode_stage_hit_rate:" << t[0].item<float>() / (t[0].item<float>() + t[1].item<float>()) << std::endl;
+  });
   predict_thread->init(fetch_schedule_thread.get(), predictor.get(), cache.get(), metas.get());
   fetch_thread->init(metas.get(), fetch_schedule_thread.get(), stream);
-  fetch_schedule_thread->init(metas.get(), model_loader.get(), this->cache.get(), fetch_thread.get(), predict_thread.get());
+  fetch_schedule_thread->init(metas.get(), model_loader.get(), this->cache.get(), fetch_thread.get(), predict_thread.get(), cache_stats.get());
 }
 void PrefetchMngr::record_then_predict_and_prefetch(int layer_id, torch::Tensor experts) {
   TRACE_EVENT_GURAD(kHook, "record_then_predict_and_launch");
   LOG_BLOCK(DEBUG, logger, {
     logger << "actual " << layer_id << ":" << tensor_to_str(experts);
   });
-  predictor->add_one_layer(layer_id, experts);
+  if (experts.numel() <= metas->num_expert_per_token) {
+    predictor->add_one_layer(layer_id, experts);
+  } else {
+    LOG(DEBUG) << "identified prefill iteration, skip adding it to prefill " << experts.numel();
+  }
   if (layer_id == metas->num_layer - 1) {
     predict_thread->add_one_task();
   }
@@ -209,12 +224,13 @@ void FetchScheduleWorker::do_one_task_impl(PreemptTask *task) {
 
 void FetchScheduleWorker::init(ModuleMeta *metas, ModelLoader *model_loader,
                                CacheMngr *cache, FetchWorker *fetch_thread,
-                               PredictWorker *predict_thread) {
+                               PredictWorker *predict_thread, CacheStatistics *cache_stats) {
   this->metas = metas;
   this->model_loader = model_loader;
   this->cache = cache;
   this->fetch_thread = fetch_thread;
   this->predict_thread = predict_thread;
+  this->cache_stats = cache_stats;
   per_layer_job_queues.resize(metas->num_layer);
   this->add_one_task(&this->idle_task);
 }
