@@ -8,68 +8,73 @@ void FetchScheduleWorker::preempt_one_layer_(int layer_idx, int64_t *expert_idxs
   LOG_BLOCK(DEBUG, logger, {
     logger << "preempting one layer " << layer_idx << " with expert " << array_to_str(expert_idxs, num_expert);
   });
-  std::vector<uint64_t> correct_done_experts; // correctly predicted and already done
-  std::vector<uint64_t> not_started_experts;  // not predicted
-  std::vector<uint64_t> correct_going_experts;   // correctly predicted and started
+  std::vector<ExpertHandler*> correct_done_experts; // correctly predicted and already done
+  std::vector<ExpertHandler*> not_started_experts;  // not predicted
+  std::vector<ExpertHandler*> correct_going_experts;   // correctly predicted and started
   predict_thread->consume_prefetch_layer_progress();
 
+  // examine expert status, classify them, and bypass experts that is already fetched.
   for (int i = 0; i < num_expert; i++) {
-    // kIdle: in queue or not in queue. not started
-    // kFetching: correctly predicted, maybe in queue, already started fetching (may not be the current task)
-    // kReady: correctly predicted, already fetched
-    // kUsing: impossible
     auto e = model_loader->get_source(layer_idx, expert_idxs[i]);
     auto cur_status = e->expert_status.get();
     if (e == current_task.expert) {
-      // cur_status must be kFetching
-      CHECK(cur_status == kFetching);
+      CHECK(cur_status == kFetching) << "current task's status must be fetching, but is " << cur_status << " for " << e->toString();
       // Q: how to access this one in cache? A: by adding a redundant precise task
-      correct_going_experts.push_back(expert_idxs[i]);
+      correct_going_experts.push_back(e);
+      current_task.is_precise = true;
     } else {
       if (cache->is_in_cache(e)) {
         if (cur_status == kReady) {
+          // bypass an already fetched expert
           e->expert_status.transfer(kReady, kLaunching);
-          correct_done_experts.push_back(expert_idxs[i]);
+          correct_done_experts.push_back(e);
           cache->hit(e);
         } else if (cur_status == kFetching) {
-          not_started_experts.insert(not_started_experts.begin(), expert_idxs[i]);
+          not_started_experts.insert(not_started_experts.begin(), e);
         } else {
           CHECK(false) << "impossible status " << cur_status << " for preempt expert " << e->toString();
         }
       } else {
-        not_started_experts.push_back(expert_idxs[i]);
+        not_started_experts.push_back(e);
       }
     }
   }
 
   cache_stats->forward();
-  cache_stats->hit(correct_done_experts.size());
-  cache_stats->miss(num_expert - correct_done_experts.size());
+  // cache_stats->hit(correct_done_experts.size());
+  // cache_stats->miss(num_expert - correct_done_experts.size());
   if (layer_idx == 0) { profiler->push(TimeProfiler::kCntActivatedExpert, 0); }
   profiler->add(TimeProfiler::kCntActivatedExpert, num_expert);
 
-  lock_task_queue();
+  // lock_task_queue();
   if (per_layer_job_queues[layer_idx].empty() == false) {
     LOG(TRACE) << "preempting one layer " << layer_idx << ", queue is not empty, current task is " << current_task.toString();
     per_layer_job_queues[layer_idx].clear();
   } else {
     LOG(TRACE) << "preempting one layer " << layer_idx << ", queue is empty";
   }
-  for (auto eid : correct_going_experts) {
-    LOG(TRACE) << "preempting one layer " << layer_idx << ", add task for " << eid;
-    add_tasks_for_one_expert(layer_idx, eid, &precise_job_queue, std::min(current_task.mem_buf_idx + 1, metas->num_per_expert_param-1), true);
+  if (correct_going_experts.size() > 0) {
+    auto e = correct_going_experts[0];
+    CHECK(correct_going_experts.size() == 1) << "correct_going_experts.size() must be 1, but is " << correct_going_experts.size();
+    LOG(TRACE) << "preempting one layer " << layer_idx << ", add task for " << e->expert_idx;
+    if (current_task.mem_buf_idx == metas->num_per_expert_param - 1) {
+      // no need to add a redundant task
+    } else {
+      add_tasks_for_one_expert(layer_idx, e->expert_idx, &precise_job_queue, current_task.mem_buf_idx + 1, true);
+    }
   }
-  for (auto eid : not_started_experts) {
-    LOG(TRACE) << "preempting one layer " << layer_idx << ", add task for " << eid;
-    add_tasks_for_one_expert(layer_idx, eid, &precise_job_queue, 0, true);
+  for (auto e : not_started_experts) {
+    LOG(TRACE) << "preempting one layer " << layer_idx << ", add task for " << e->expert_idx;
+    CHECK(e->num_ready != metas->num_per_expert_param) << "num_ready must not be " << metas->num_per_expert_param << " for " << e->toString();
+    add_tasks_for_one_expert(layer_idx, e->expert_idx, &precise_job_queue, e->num_ready, true);
   }
-  unlock_task_queue();
+  // unlock_task_queue();
   predict_thread->add_prefetch_layer_budget();
   num_expert = 0;
   // reorder expert order to let model use expert in the same order of fetching
-  for (auto e : correct_done_experts)   { expert_idxs[num_expert++] = e; }
-  for (auto e : correct_going_experts)  { expert_idxs[num_expert++] = e; }
-  for (auto e : not_started_experts) { expert_idxs[num_expert++] = e; }
+  for (auto e : correct_done_experts)   { expert_idxs[num_expert++] = e->expert_idx; }
+  for (auto e : correct_going_experts)  { expert_idxs[num_expert++] = e->expert_idx; }
+  for (auto e : not_started_experts)    { expert_idxs[num_expert++] = e->expert_idx; }
   LOG_BLOCK(DEBUG, logger, {
     logger << "reordered expert to " << array_to_str(expert_idxs, num_expert);
   });
@@ -122,7 +127,14 @@ void PrefetchMngr::wait_expert(int layer_id, int expert_id) {
   TRACE_EVENT_GURAD(kHook, "wait:" + expert->toString());
   LOG(DEBUG) << "waiting expert " << expert->toString();
   // model_loader->get_source(layer_id, expert_id)->expert_status.wait(kReady, kLaunching);
-  expert->expert_status.wait(kLaunching, kLaunching);
+  auto current_status = expert->expert_status.get();;
+  if (current_status == kLaunching) {
+    cache_stats->hit();
+  } else {
+    cache_stats->miss();
+    // todo: add timing of waiting expert ready
+    expert->expert_status.wait(kLaunching, kLaunching);
+  }
   LOG(DEBUG) << "waiting expert " << expert->toString() << " success";
 }
 void PrefetchMngr::mark_expert_using(int layer_id, int expert_id) {
@@ -249,6 +261,13 @@ void FetchScheduleWorker::do_one_task_impl(FetchScheduleTaskBase *task) {
       do_one_task_impl(dynamic_cast<IdleTask*>(task));
       break;
     }
+    case FetchScheduleTaskBase::kPrefetchLayer: {
+      do_one_task_impl(dynamic_cast<PrefetchLayerTask*>(task));
+      break;
+    }
+    default: {
+      CHECK(false) << "unknown task type " << task->task_type;
+    }
   }
 }
 void FetchScheduleWorker::do_one_task_impl(PreemptTask *task) {
@@ -294,6 +313,28 @@ void FetchScheduleWorker::do_one_task_impl(IdleTask *idle_task) {
     this->add_one_task(&this->idle_task);
   }
 }
+
+void FetchScheduleWorker::do_one_task_impl(PrefetchLayerTask *task) {
+  TRACE_EVENT_GURAD(kPredict, "add task for layer " + std::to_string(task->layer_idx));
+  CHECK(per_layer_job_queues[task->layer_idx].empty());
+  CHECK(current_task.expert == nullptr || current_task.expert->layer_idx != task->layer_idx);
+  for (int i = 0; i < task->num_expert; i++) {
+    auto expert = model_loader->get_source(task->layer_idx, task->expert_idxs[i]);
+    LOG(TRACE) << "adding prefetch task " << expert->toString();
+    auto cur_status = expert->expert_status.get();
+    if (expert->num_ready == metas->num_per_expert_param) {
+      CHECK(cur_status == kReady) << "expert " << expert->toString() << " must be ready, but is " << cur_status;
+      LOG(TRACE) << "skip add prefetch task " << expert->toString();
+      continue;
+    }
+    // if (cur_status == kReady || cur_status == kUsing) {
+    //   LOG(TRACE) << "skip add prefetch task " << expert->toString();
+    //   continue;
+    // }
+    add_tasks_for_one_expert(task->layer_idx, task->expert_idxs[i], &per_layer_job_queues[task->layer_idx], expert->num_ready, false);
+  }
+}
+
 bool FetchScheduleWorker::send_one_job(CopyTask *task) {
   TRACE_EVENT_GURAD(kPrefetch, "send:" + task->toString());
   LOG(DEBUG) << "scheduler: send one prefetch task " << task->toString();
@@ -323,7 +364,9 @@ bool FetchScheduleWorker::send_one_job(CopyTask *task) {
   }
 
   auto orig_status = task->expert->expert_status.get();
+  CHECK(task->expert->num_ready == task->mem_buf_idx) << "redundant task not allowed: " << task->toString();
   if (task->expert->num_ready > task->mem_buf_idx) {
+    CHECK(false);
     LOG(TRACE) << "scheduler: a duplicated partial task, skip it: expert " << task->toString() << ", " << task->expert->num_ready << ">" << task->mem_buf_idx;
     if (task->expert->num_ready == metas->num_per_expert_param) {
       if (task->is_precise) {

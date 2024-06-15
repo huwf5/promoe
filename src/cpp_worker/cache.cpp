@@ -154,8 +154,9 @@ CacheMngr::CacheLineOccupancyWaiter CacheMngr::miss(ExpertHandler *incoming_e) {
 
       CHECK(e_to_evict->gpu_data == gpu_data);
       e_to_evict->gpu_data = nullptr;
+      e_to_evict->num_ready = 0;
       incoming_e->gpu_data = gpu_data;
-      incoming_e->num_ready = 0;
+      // incoming_e->num_ready = 0;
     }
   }
   return lambda_to_wait_expert_occupancy;

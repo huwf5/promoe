@@ -45,7 +45,7 @@ class ExpertHandler {
     expert_status.lock(kReady, kUsing);
   }
   std::string toString() const {
-    return std::to_string(layer_idx) + "." + std::to_string(expert_idx);
+    return std::to_string(layer_idx) + "." + std::to_string(expert_idx) + "(" + std::to_string(num_ready) + ")";
   }
 };
 

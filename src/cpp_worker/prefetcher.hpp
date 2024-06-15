@@ -24,6 +24,7 @@ class FetchScheduleTaskBase {
     kIdle,
     kPreempt,
     kFetchDone,
+    kPrefetchLayer,
   };
   TaskType task_type;
   FetchScheduleTaskBase(TaskType task_type) : task_type(task_type) {}
@@ -36,6 +37,13 @@ class IdleTask : public FetchScheduleTaskBase {
 class PreemptTask : public FetchScheduleTaskBase {
  public:
   PreemptTask() : FetchScheduleTaskBase(kPreempt) {}
+  int layer_idx;
+  int64_t* expert_idxs;
+  size_t num_expert;
+};
+class PrefetchLayerTask : public FetchScheduleTaskBase {
+ public:
+  PrefetchLayerTask() : FetchScheduleTaskBase(kPrefetchLayer) {}
   int layer_idx;
   int64_t* expert_idxs;
   size_t num_expert;
@@ -76,6 +84,7 @@ class FetchScheduleWorker : public WorkerThread<FetchScheduleTaskBase*> {
   void do_one_task_impl(IdleTask *task);
   void do_one_task_impl(PreemptTask *task);
   void do_one_task_impl(FetchDoneTask *task);
+  void do_one_task_impl(PrefetchLayerTask *task);
 
   void pop_next_task(CopyTask &task, bool &found);
 
