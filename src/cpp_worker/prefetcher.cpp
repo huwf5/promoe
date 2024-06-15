@@ -34,7 +34,7 @@ void FetchScheduleWorker::preempt_one_layer_(int layer_idx, int64_t *expert_idxs
         } else if (cur_status == kFetching) {
           not_started_experts.insert(not_started_experts.begin(), expert_idxs[i]);
         } else {
-          CHECK(false);
+          CHECK(false) << "impossible status " << cur_status << " for preempt expert " << e->toString();
         }
       } else {
         not_started_experts.push_back(expert_idxs[i]);
