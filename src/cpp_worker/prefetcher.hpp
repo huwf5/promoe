@@ -90,6 +90,7 @@ class FetchScheduleWorker : public WorkerThread<FetchScheduleTaskBase*> {
 
   void add_tasks_for_one_expert(int layer_idx, int expert_idx, TaskQueue* queue, int starting_mem_buffer = 0, bool is_precise = false);
   void preempt_one_layer_(int layer_idx, int64_t *expert_idxs, size_t num_expert);
+  void preempt_one_layer_without_reorder_(int layer_idx, int64_t *expert_idxs, size_t num_expert);
 
  public:
   void add_one_layer_task(int layer_idx, int64_t *expert_idxs, size_t num_expert);

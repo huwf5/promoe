@@ -94,6 +94,7 @@ def inject_model(
     per_layer_cache : bool = True,
     cache_policy : str = 'lru',
     cache_device : str|int = 'cuda',
+    reorder_experts : bool = True,
     # metadatas of model
     num_moe_layer : int = None,
     num_expert_per_layer : int = None,
@@ -136,6 +137,8 @@ def inject_model(
       Whether to enable per-layer cache. Defaults to True.
     cache_policy (str, optional):
       The cache policy. Defaults to 'lru'.
+    reorder_experts (bool, optional):
+      Whether to reorder experts. Defaults to True.
     cache_device (str, optional):
       The cache device. Defaults to 'cuda'.
     pin_memory (bool, optional):
@@ -172,6 +175,7 @@ def inject_model(
   meta.num_expert_per_token = num_expert_per_token
   meta.per_layer_cache = per_layer_cache
   meta.cache_policy = cache_policy
+  meta.reorder_experts = reorder_experts
 
   model_loader  = cpp_worker.ModelLoader(meta)
   predictor     = cpp_worker.Predictor(meta)

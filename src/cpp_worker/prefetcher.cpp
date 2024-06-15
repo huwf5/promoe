@@ -87,6 +87,70 @@ void FetchScheduleWorker::preempt_one_layer_(int layer_idx, int64_t *expert_idxs
     logger << "reordered expert to " << array_to_str(expert_idxs, num_expert);
   });
 }
+void FetchScheduleWorker::preempt_one_layer_without_reorder_(int layer_idx, int64_t *expert_idxs, size_t num_expert) {
+  TRACE_EVENT_GURAD(kHook, "preempt_one_layer_without_reorder_");
+  LOG_BLOCK(DEBUG, logger, {
+    logger << "preempting one layer " << layer_idx << " with expert " << array_to_str(expert_idxs, num_expert);
+  });
+
+  bool preceeding_experts_in_cache = true;
+
+  predict_thread->consume_prefetch_layer_progress();
+
+  // examine expert status, classify them, and bypass experts that is already fetched.
+  // for ready expert, we need to let cache know we access it and update it's priority
+  // for not-ready but in cache expert, it will have corresponding task, and cache->hit will be called in the task impl
+  // for not-ready and not in cache expert, it will first be called with cache->miss, then be called with cache->hit, which doesn't hurt.
+
+  // ready, current, partial, miss
+  for (int i = 0; i < num_expert; i++) {
+    auto e = model_loader->get_source(layer_idx, expert_idxs[i]);
+    auto cur_status = e->expert_status.get();
+
+    if (cache->is_in_cache(e)) {
+      if (preceeding_experts_in_cache) {
+        if (e->num_ready == metas->num_per_expert_param) {
+          // bypass an already fetched expert, no need to add task
+          e->expert_status.transfer(kReady, kLaunching);
+          cache->hit(e);
+          continue;
+        } else if (e == current_task.expert) {
+          current_task.is_precise = true;
+          if (current_task.mem_buf_idx == metas->num_per_expert_param - 1) {
+            // no need to add a redundant task
+            // where to call cache->hit?
+            // seems must be in fetchdone task, or here
+            // choose in fetchdone for now
+          } else {
+            add_tasks_for_one_expert(layer_idx, e->expert_idx, &precise_job_queue, current_task.mem_buf_idx + 1, true);
+          }
+        } else {
+          // partial expert
+          add_tasks_for_one_expert(layer_idx, e->expert_idx, &precise_job_queue, e->num_ready, true);
+        }
+      } else {
+        // though it is in cache, it may be evicted, so we need to add task for it
+        add_tasks_for_one_expert(layer_idx, e->expert_idx, &precise_job_queue, 0, true);
+      }
+    } else {
+      preceeding_experts_in_cache = false;
+      add_tasks_for_one_expert(layer_idx, e->expert_idx, &precise_job_queue, 0, true);
+    }
+  }
+
+  cache_stats->forward();
+  if (layer_idx == 0) { profiler->push(TimeProfiler::kCntActivatedExpert, 0); }
+  profiler->add(TimeProfiler::kCntActivatedExpert, num_expert);
+
+  if (per_layer_job_queues[layer_idx].empty() == false) {
+    LOG(TRACE) << "preempting one layer " << layer_idx << ", queue is not empty, current task is " << current_task.toString();
+    per_layer_job_queues[layer_idx].clear();
+  } else {
+    LOG(TRACE) << "preempting one layer " << layer_idx << ", queue is empty";
+  }
+
+  predict_thread->add_prefetch_layer_budget();
+}
 void FetchScheduleWorker::add_tasks_for_one_expert(int layer_idx, int expert_idx, TaskQueue* queue, int starting_mem_buffer, bool is_precise) {
   auto expert_handler = model_loader->get_source(layer_idx, expert_idx);
   LOG(TRACE) << "add prefetch task for one param " << expert_handler->toString() << ", starting from " << starting_mem_buffer;
@@ -133,7 +197,7 @@ void PrefetchMngr::preempt_and_launch_one_layer(int layer_idx, torch::Tensor exp
 void PrefetchMngr::wait_expert(int layer_id, int expert_id) {
   auto expert = model_loader->get_source(layer_id, expert_id);
   TRACE_EVENT_GURAD(kHook, "wait:" + expert->toString());
-  LOG(DEBUG) << "waiting expert " << expert->toString();
+  LOG(TRACE) << "waiting expert " << expert->toString();
   // model_loader->get_source(layer_id, expert_id)->expert_status.wait(kReady, kLaunching);
   auto current_status = expert->expert_status.get();;
   if (current_status == kLaunching) {
@@ -143,7 +207,7 @@ void PrefetchMngr::wait_expert(int layer_id, int expert_id) {
     // todo: add timing of waiting expert ready
     expert->expert_status.wait(kLaunching, kLaunching);
   }
-  LOG(DEBUG) << "waiting expert " << expert->toString() << " success";
+  LOG(TRACE) << "waiting expert " << expert->toString() << " success";
 }
 void PrefetchMngr::mark_expert_using(int layer_id, int expert_id) {
   auto expert = model_loader->get_source(layer_id, expert_id);
@@ -281,7 +345,11 @@ void FetchScheduleWorker::do_one_task_impl(FetchScheduleTaskBase *task) {
   }
 }
 void FetchScheduleWorker::do_one_task_impl(PreemptTask *task) {
-  this->preempt_one_layer_(task->layer_idx, task->expert_idxs, task->num_expert);
+  if (metas->reorder_experts) {
+    this->preempt_one_layer_(task->layer_idx, task->expert_idxs, task->num_expert);
+  } else {
+    this->preempt_one_layer_without_reorder_(task->layer_idx, task->expert_idxs, task->num_expert);
+  }
 }
 
 void FetchScheduleWorker::init(ModuleMeta *metas, ModelLoader *model_loader,
@@ -298,14 +366,14 @@ void FetchScheduleWorker::init(ModuleMeta *metas, ModelLoader *model_loader,
   this->add_one_task(&this->idle_task);
 }
 void FetchScheduleWorker::do_one_task_impl(FetchDoneTask *_) {
-  LOG(DEBUG) << "scheduler: received one fetch job done " << current_task.toString();
+  LOG(TRACE) << "scheduler: received one fetch job done " << current_task.toString();
   current_task.expert->num_ready = current_task.mem_buf_idx + 1;
   if (current_task.mem_buf_idx == metas->num_per_expert_param - 1) {
-    LOG(DEBUG) << "scheduler: all fetch job done for expert " << current_task.toString();
+    LOG(TRACE) << "scheduler: all fetch job done for expert " << current_task.toString();
 
-    // if (current_task.is_precise) {
-    //   cache->hit(current_task.expert);
-    // }
+    if (current_task.is_precise && metas->reorder_experts == false) {
+      cache->hit(current_task.expert);
+    }
     current_task.expert->expert_status.transfer(kFetching, current_task.is_precise ? kLaunching : kReady);
   }
   current_task.expert = nullptr;
@@ -320,12 +388,14 @@ void FetchScheduleWorker::do_one_task_impl(IdleTask *idle_task) {
   }
   if (!found || !sent) {
     // re add this idle task
+    current_task.expert = nullptr;
     this->add_one_task(&this->idle_task);
   }
 }
 
 void FetchScheduleWorker::do_one_task_impl(PrefetchLayerTask *task) {
   TRACE_EVENT_GURAD(kPredict, "add task for layer " + std::to_string(task->layer_idx));
+  LOG(DEBUG) << "add prefetch task for layer " << task->layer_idx;
   CHECK(per_layer_job_queues[task->layer_idx].empty());
   CHECK(current_task.expert == nullptr || current_task.expert->layer_idx != task->layer_idx);
   // ready, partial, miss
@@ -349,7 +419,7 @@ void FetchScheduleWorker::do_one_task_impl(PrefetchLayerTask *task) {
 
 bool FetchScheduleWorker::send_one_job(CopyTask *task) {
   TRACE_EVENT_GURAD(kPrefetch, "send:" + task->toString());
-  LOG(DEBUG) << "scheduler: send one prefetch task " << task->toString();
+  LOG(TRACE) << "scheduler: send one prefetch task " << task->toString();
 
   // nullptr and 0: first time task
   // nullptr and >0 : a partial task gets evicted
@@ -377,12 +447,14 @@ bool FetchScheduleWorker::send_one_job(CopyTask *task) {
   }
 
   auto orig_status = task->expert->expert_status.get();
-  CHECK(task->expert->num_ready == task->mem_buf_idx) << "redundant task not allowed: " << task->toString();
+  // we must allow redundant task when expert reorder is disabled
+  // CHECK(task->expert->num_ready == task->mem_buf_idx) << "redundant task not allowed: " << task->toString();
   if (task->expert->num_ready > task->mem_buf_idx) {
-    CHECK(false);
+    CHECK(metas->reorder_experts == false);
     LOG(TRACE) << "scheduler: a duplicated partial task, skip it: expert " << task->toString() << ", " << task->expert->num_ready << ">" << task->mem_buf_idx;
     if (task->expert->num_ready == metas->num_per_expert_param) {
       if (task->is_precise) {
+        // since we don't launch it, there is no corresponding fetchdone task to transfer it to launching state
         task->expert->expert_status.transfer(kReady, kLaunching, false);
         // cache->hit(task->expert);
       }
