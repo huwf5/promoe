@@ -71,14 +71,18 @@ class FetchScheduleWorker : public WorkerThread<FetchScheduleTaskBase*> {
   friend class FetchWorker;
   FetchDoneTask copy_done_task;
 
+  #ifdef DEAD_CODE
   /** protected by queue_lock */
   AtomicQueueLock task_queue_lock;
+  #endif
   std::vector<TaskQueue> per_layer_job_queues; // the fetching thread takes out the first task from queue, then execute it.
   /** no lock requried */
   TaskQueue precise_job_queue;
 
+  #ifdef DEAD_CODE
   inline void lock_task_queue() { task_queue_lock.lock(); }
   inline void unlock_task_queue() { task_queue_lock.unlock(); }
+  #endif
 
   bool send_one_job(CopyTask *task);
   void do_one_task_impl(IdleTask *task);
@@ -93,8 +97,10 @@ class FetchScheduleWorker : public WorkerThread<FetchScheduleTaskBase*> {
   void preempt_one_layer_without_reorder_(int layer_idx, int64_t *expert_idxs, size_t num_expert);
 
  public:
+  #ifdef DEAD_CODE
   void add_one_layer_task(int layer_idx, int64_t *expert_idxs, size_t num_expert);
   void add_one_layer_task(int layer_idx, torch::Tensor experts);
+  #endif
   void init(ModuleMeta *metas, ModelLoader *model_loader, CacheMngr *cache, FetchWorker *fetch_thread, PredictWorker *predict_thread, CacheStatistics *cache_stats, TimeProfiler* profiler);
 
 protected:

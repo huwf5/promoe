@@ -13,7 +13,7 @@ void FetchScheduleWorker::preempt_one_layer_(int layer_idx, int64_t *expert_idxs
   std::vector<ExpertHandler*> partial_experts; // correctly predicted and partially fetched, but is not current task
   std::vector<ExpertHandler*> miss_experts;    // correctly predicted, but not in cache
 
-  predict_thread->consume_prefetch_layer_progress();
+  // predict_thread->consume_prefetch_layer_progress();
 
   // examine expert status, classify them, and bypass experts that is already fetched.
   // for ready expert, we need to let cache know we access it and update it's priority
@@ -95,7 +95,7 @@ void FetchScheduleWorker::preempt_one_layer_without_reorder_(int layer_idx, int6
 
   bool preceeding_experts_in_cache = true;
 
-  predict_thread->consume_prefetch_layer_progress();
+  // predict_thread->consume_prefetch_layer_progress();
 
   // examine expert status, classify them, and bypass experts that is already fetched.
   // for ready expert, we need to let cache know we access it and update it's priority
@@ -186,6 +186,7 @@ void PrefetchMngr::init_gpu_mem_buffer(size_t num_buffers) {
   cache->init_gpu_mem_buffer(num_buffers);
 }
 void PrefetchMngr::preempt_and_launch_one_layer(int layer_idx, torch::Tensor experts) {
+  predict_thread->consume_prefetch_layer_progress();
   PreemptTask preempt_task;
   preempt_task.layer_idx = layer_idx;
   preempt_task.expert_idxs = experts.data_ptr<int64_t>();
@@ -291,6 +292,7 @@ void PrefetchMngr::record_then_predict_and_prefetch(int layer_id, torch::Tensor 
     predict_thread->add_one_task();
   }
 }
+#ifdef DEAD_CODE
 void FetchScheduleWorker::add_one_layer_task(int layer_idx, torch::Tensor experts) {
   CHECK(false) << "Deprecated";
   add_one_layer_task(layer_idx, experts.data_ptr<int64_t>(), experts.size(0));
@@ -313,6 +315,7 @@ void FetchScheduleWorker::add_one_layer_task(int layer_idx, int64_t *expert_idxs
   }
   unlock_task_queue();
 }
+#endif
 PrefetchMngr::~PrefetchMngr() {
   predict_thread->add_one_task();
   predict_thread->add_prefetch_layer_budget();
