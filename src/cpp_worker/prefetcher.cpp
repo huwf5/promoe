@@ -408,7 +408,7 @@ void FetchScheduleWorker::do_one_task_impl(PrefetchLayerTask *task) {
     if (cache->is_in_cache(expert)) { cache->hit(expert); }
     if (expert->num_ready == metas->num_per_expert_param) {
       auto cur_status = expert->expert_status.get();
-      CHECK(cur_status == kReady) << "expert " << expert->toString() << " must be ready, but is " << cur_status;
+      CHECK(cur_status == kReady || cur_status == kUsing) << "expert " << expert->toString() << " must be ready, but is " << cur_status;
       LOG(TRACE) << "skip add prefetch task " << expert->toString();
       continue;
     }
