@@ -117,6 +117,7 @@ class ModuleMeta {
   int max_prefetch_layer_distance = 1;
   bool per_layer_cache = true;
   bool reorder_experts = true;
+  bool promote_hit_in_prefetch = true;
   std::string cache_policy = "fifo";
 
   bool can_do_layer(int cur_preempted_layer, int target_layer) {

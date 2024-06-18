@@ -60,6 +60,13 @@ class FetchScheduleWorker : public WorkerThread<FetchScheduleTaskBase*> {
   ModelLoader*     model_loader;
   CacheMngr*       cache;
 
+  void cache_hit(ExpertHandler* e, bool is_precise) {
+    cache->hit(e);
+  }
+  CacheMngr::CacheLineOccupancyWaiter cache_miss(ExpertHandler* e, bool is_precise) {
+    return cache->miss(e);
+  }
+
   CacheStatistics* cache_stats;
   TimeProfiler*    profiler;
 
@@ -92,7 +99,10 @@ class FetchScheduleWorker : public WorkerThread<FetchScheduleTaskBase*> {
 
   void pop_next_task(CopyTask &task, bool &found);
 
-  void add_tasks_for_one_expert(int layer_idx, int expert_idx, TaskQueue* queue, int starting_mem_buffer = 0, bool is_precise = false);
+  void add_single_tasks_for_one_expert(int layer_idx, int expert_idx, TaskQueue* queue, int start_mem_buf_idx, int stop_mem_buf_idx, bool is_precise);
+  void add_separate_tasks_for_one_expert(int layer_idx, int expert_idx, TaskQueue *queue, int start_mem_buf_idx, int stop_mem_buf_idx, bool is_precise);
+
+  void reorder_experts(int layer_idx, int64_t *expert_idxs, size_t num_expert);
   void preempt_one_layer_(int layer_idx, int64_t *expert_idxs, size_t num_expert);
   void preempt_one_layer_without_reorder_(int layer_idx, int64_t *expert_idxs, size_t num_expert);
 

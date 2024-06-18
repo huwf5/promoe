@@ -90,14 +90,14 @@ class PrefetchMngr;
  */
 class CopyTask : public BaseTask {
  public:
-  int mem_buf_idx;
+  int start_mem_buf_idx, stop_mem_buf_idx;
   bool is_precise = false;
   ExpertHandler *expert = nullptr;
   std::function<void()> lambda_wait = [](){};
   std::string toString() const {
     std::stringstream ss;
     if (expert) {
-      ss << expert->toString() << "." << mem_buf_idx << ", precise " << (is_precise?"true":"false");
+      ss << expert->toString() << ".[" << start_mem_buf_idx << "," << stop_mem_buf_idx << "), precise " << (is_precise?"true":"false");
     } else {
       ss << "null";
     }

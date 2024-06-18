@@ -10,23 +10,23 @@ std::string dump_trace_event_collector_singleton() {
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   py::class_<ModuleMeta, std::shared_ptr<ModuleMeta>>(m, "ModuleMeta")
     .def(py::init<int,int>())
-    .def_readwrite("num_layer", &ModuleMeta::num_layer)
-    .def_readwrite("num_expert", &ModuleMeta::num_expert)
-    .def_readwrite("num_per_expert_param", &ModuleMeta::num_per_expert_param)
+    .def_readwrite("num_layer",                    &ModuleMeta::num_layer)
+    .def_readwrite("num_expert",                   &ModuleMeta::num_expert)
+    .def_readwrite("num_per_expert_param",         &ModuleMeta::num_per_expert_param)
     .def_readwrite("num_predict_expert_per_layer", &ModuleMeta::num_predict_expert_per_layer)
-    .def_readwrite("num_expert_per_token", &ModuleMeta::num_expert_per_token)
-    .def_readwrite("max_prefetch_layer_distance", &ModuleMeta::max_prefetch_layer_distance)
-    .def_readwrite("per_layer_cache", &ModuleMeta::per_layer_cache)
-    .def_readwrite("cache_policy", &ModuleMeta::cache_policy)
-    .def_readwrite("reorder_experts", &ModuleMeta::reorder_experts)
+    .def_readwrite("num_expert_per_token",         &ModuleMeta::num_expert_per_token)
+    .def_readwrite("max_prefetch_layer_distance",  &ModuleMeta::max_prefetch_layer_distance)
+    .def_readwrite("per_layer_cache",              &ModuleMeta::per_layer_cache)
+    .def_readwrite("cache_policy",                 &ModuleMeta::cache_policy)
+    .def_readwrite("reorder_experts",              &ModuleMeta::reorder_experts)
+    .def_readwrite("promote_hit_in_prefetch",      &ModuleMeta::promote_hit_in_prefetch)
     .def("init_param_list", &ModuleMeta::init_param_list)
   ;
 
   py::class_<Predictor, std::shared_ptr<Predictor>>(m, "Predictor")
     .def(py::init<std::shared_ptr<ModuleMeta>>())
-    .def("load_model", &Predictor::load_model)
-    .def("predict", &Predictor::predict)
-    // .def("init_expert_access_buffer", &Predictor::init_expert_access_buffer)
+    .def("load_model",          &Predictor::load_model)
+    .def("predict",             &Predictor::predict)
     .def("clear_access_buffer", &Predictor::clear_access_buffer)
     .def("add_one_layer", static_cast<void (Predictor::*)(int, int64_t*, size_t)>(&Predictor::add_one_layer))
     .def("add_one_layer", static_cast<void (Predictor::*)(int, torch::Tensor)>(&Predictor::add_one_layer))
@@ -44,14 +44,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
   py::class_<PrefetchMngr, std::shared_ptr<PrefetchMngr>>(m, "PrefetchMngr")
     .def(py::init<std::shared_ptr<ModuleMeta>, std::shared_ptr<ModelLoader>, std::shared_ptr<Predictor>>())
-    .def("launch_thread", &PrefetchMngr::launch_thread)
+    .def("launch_thread",       &PrefetchMngr::launch_thread)
     .def("init_gpu_mem_buffer", &PrefetchMngr::init_gpu_mem_buffer)
-    .def("wait_expert", &PrefetchMngr::wait_expert)
-    .def("mark_expert_using", &PrefetchMngr::mark_expert_using)
-    .def("report_one_layer", &PrefetchMngr::report_one_layer)
-    .def("build_timer", &PrefetchMngr::build_timer)
+    .def("wait_expert",         &PrefetchMngr::wait_expert)
+    .def("mark_expert_using",   &PrefetchMngr::mark_expert_using)
+    .def("report_one_layer",    &PrefetchMngr::report_one_layer)
+    .def("one_moe_layer_done",  &PrefetchMngr::one_moe_layer_done)
+    .def("build_timer",         &PrefetchMngr::build_timer)
     .def_readwrite("cache_stats", &PrefetchMngr::cache_stats)
-    .def_readwrite("profiler", &PrefetchMngr::profiler)
+    .def_readwrite("profiler",    &PrefetchMngr::profiler)
   ;
 
   py::class_<TraceEventGuard, std::shared_ptr<TraceEventGuard>>(m, "TraceEventGuard")
@@ -62,13 +63,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
   py::class_<CacheStatistics, std::shared_ptr<CacheStatistics>>(m, "CacheStatistics")
     .def(py::init<>())
-    .def("to_tensor", &CacheStatistics::to_tensor)
-    .def("dump_average", &CacheStatistics::dump_average)
+    .def("to_tensor",              &CacheStatistics::to_tensor)
+    .def("dump_average",           &CacheStatistics::dump_average)
     .def("dump_average_per_layer", &CacheStatistics::dump_average_per_layer)
   ;
 
   py::class_<TimerGuard>(m, "TimerGuard")
-    .def("init", &TimerGuard::init)
+    .def("init",    &TimerGuard::init)
     .def("release", &TimerGuard::release)
   ;
 
@@ -76,9 +77,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
   py::enum_<ThreadType>(m, "ThreadType")
     .value("kPythonMain", ThreadType::kPythonMain)
-    .value("kHook", ThreadType::kHook)
-    .value("kPrefetch", ThreadType::kPrefetch)
-    .value("kGPU", ThreadType::kGPU)
+    .value("kHook",       ThreadType::kHook)
+    .value("kPrefetch",   ThreadType::kPrefetch)
+    .value("kGPU",        ThreadType::kGPU)
     .export_values();
 
   py::enum_<TimeProfiler::TimeType>(m, "TimeType")
