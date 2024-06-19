@@ -40,8 +40,7 @@ void PredictWorker::do_one_task_impl() {
   predictor->clear_access_buffer();
 }
 void ExpertUnlockWorker::do_one_task_impl(ExpertHandler *task) {
-  CHECK(task != nullptr);
-  task->expert_status.wait(kUsing, kUsing);
+  task->expert_status.wait(kUsing);
   CUDA_CALL(cudaEventSynchronize(task->event));
   task->expert_status.transfer(kUsing, kReady);
 }

@@ -295,7 +295,7 @@ void PrefetchMngr::wait_expert(int layer_id, int expert_id) {
   } else {
     cache_stats->miss();
     // todo: add timing of waiting expert ready
-    expert->expert_status.wait(kLaunching, kLaunching);
+    expert->expert_status.wait(kLaunching);
   }
   LOG(TRACE) << "waiting expert " << expert->toString() << " success";
 }

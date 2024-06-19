@@ -69,6 +69,9 @@ class AtomicMultiStatusLock {
       from_ = from;
     };
   }
+  void wait(ExpertStatus target) {
+    while (lock_.load() != target) {};
+  }
   ExpertStatus exchange(ExpertStatus to) {
     return ExpertStatus(lock_.exchange(to));
   }

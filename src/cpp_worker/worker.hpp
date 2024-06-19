@@ -93,7 +93,7 @@ class CopyTask : public BaseTask {
   int start_mem_buf_idx, stop_mem_buf_idx;
   bool is_precise = false;
   ExpertHandler *expert = nullptr;
-  std::function<void()> lambda_wait = [](){};
+  CacheMngr::CacheLineOccupancyWaiter lambda_wait = [](){};
   std::string toString() const {
     std::stringstream ss;
     if (expert) {
@@ -126,7 +126,6 @@ class FetchWorker : public WorkerThread<CopyTask*> {
  * Expert Unlocker, which tracks expert forward progress in python
  */
 class ExpertUnlockWorker : public WorkerThread<ExpertHandler*> {
-  AtomicQueueLock expert_usage_queue_lock;
  protected:
   void do_one_task_impl(ExpertHandler *task) override;
 };
