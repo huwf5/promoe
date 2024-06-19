@@ -177,10 +177,24 @@ class ExpertHook(ModelHook):
   # def init_hook(self, module):
   #   return super().init_hook(module)
   def pre_forward(self, module, *args, **kwargs):
-    self.prefetch_mngr.wait_expert(module._layer_id, module._expert_id)
+    self.prefetch_mngr.report_one_expert(module._layer_id, module._expert_id)
     return args, kwargs
   def post_forward(self, module, output):
-    self.prefetch_mngr.mark_expert_using(module._layer_id, module._expert_id)
+    self.prefetch_mngr.one_expert_done(module._layer_id, module._expert_id)
+    return output
+  # def detach_hook(self, module):
+  #   return super().detach_hook(module)
+
+class MoeLayerHook(ModelHook):
+  def __init__(self, prefetch_mngr):
+    self.prefetch_mngr = prefetch_mngr
+    pass
+  # def init_hook(self, module):
+  #   return super().init_hook(module)
+#   def pre_forward(self, module, *args, **kwargs):
+#     return super().pre_forward(module, *args, **kwargs)
+  def post_forward(self, module, output):
+    self.prefetch_mngr.one_moe_layer_done(module._layer_id)
     return output
   # def detach_hook(self, module):
   #   return super().detach_hook(module)

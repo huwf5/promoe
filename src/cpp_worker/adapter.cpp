@@ -20,6 +20,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     .def_readwrite("cache_policy",                 &ModuleMeta::cache_policy)
     .def_readwrite("reorder_experts",              &ModuleMeta::reorder_experts)
     .def_readwrite("promote_hit_in_prefetch",      &ModuleMeta::promote_hit_in_prefetch)
+    .def_readwrite("early_preempt",                &ModuleMeta::early_preempt)
     .def("init_param_list", &ModuleMeta::init_param_list)
   ;
 
@@ -46,8 +47,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     .def(py::init<std::shared_ptr<ModuleMeta>, std::shared_ptr<ModelLoader>, std::shared_ptr<Predictor>>())
     .def("launch_thread",       &PrefetchMngr::launch_thread)
     .def("init_gpu_mem_buffer", &PrefetchMngr::init_gpu_mem_buffer)
-    .def("wait_expert",         &PrefetchMngr::wait_expert)
-    .def("mark_expert_using",   &PrefetchMngr::mark_expert_using)
+    .def("reload_env",          &PrefetchMngr::reload_env)
+    .def("report_one_expert",   &PrefetchMngr::report_one_expert)
+    .def("one_expert_done",     &PrefetchMngr::one_expert_done)
     .def("report_one_layer",    &PrefetchMngr::report_one_layer)
     .def("one_moe_layer_done",  &PrefetchMngr::one_moe_layer_done)
     .def("build_timer",         &PrefetchMngr::build_timer)

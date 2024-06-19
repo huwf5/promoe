@@ -26,9 +26,10 @@
 // namespace coll_cache_lib {
 // namespace common {
 
+LogLevel LogMessage::min_log_level = MinLogLevelFromEnv();
+
 LogMessage::LogMessage(const char* fname, int line, LogLevel severity)
     : fname_(fname), line_(line), severity_(severity) {
-    static LogLevel min_log_level = MinLogLevelFromEnv();
     should_output_ = (severity_ >= min_log_level);
   }
 

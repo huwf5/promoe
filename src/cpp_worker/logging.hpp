@@ -95,7 +95,9 @@ bool LogTimeFromEnv();
 
 // class LogMessage : public std::basic_ostringstream<char> {
 class LogMessage {
+  static LogLevel min_log_level;
  public:
+  static void reload_env() { min_log_level = MinLogLevelFromEnv(); }
   LogMessage(const char* fname, int line, LogLevel severity);
   ~LogMessage();
 

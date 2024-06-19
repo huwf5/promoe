@@ -125,6 +125,34 @@ void FetchScheduleWorker::reorder_experts(int layer_idx, int64_t *expert_idxs, s
   });
 }
 
+void FetchScheduleWorker::preempt_one_expert(int layer_idx, int64_t expert_idx) {
+  TRACE_EVENT_GURAD(kHook, "preemot_one_expert");
+
+  auto e = model_loader->get_source(layer_idx, expert_idx);
+  auto cur_status = e->expert_status.get();
+
+  if (cache->is_in_cache(e) == false) {
+    // a completely missed expert
+    add_single_tasks_for_one_expert(layer_idx, e->expert_idx, &precise_job_queue, 0, metas->num_per_expert_param, true);
+  } else if (e->num_ready == metas->num_per_expert_param) {
+    // bypass a fully fetched expert, no need to add task
+    e->expert_status.transfer(kReady, kLaunching);
+    cache->hit(e);
+  } else if (e == current_task.expert) {
+    current_task.is_precise = true;
+    if (current_task.stop_mem_buf_idx == metas->num_per_expert_param) {
+      // no need to add a redundant task
+      // note there will be corresponding fetchdone for this task.
+      cache->hit(e);
+    } else {
+      add_single_tasks_for_one_expert(layer_idx, e->expert_idx, &precise_job_queue, current_task.stop_mem_buf_idx, metas->num_per_expert_param, true);
+    }
+  } else {
+    // partial expert
+    add_single_tasks_for_one_expert(layer_idx, e->expert_idx, &precise_job_queue, e->num_ready, metas->num_per_expert_param, true);
+  }
+}
+
 void FetchScheduleWorker::preempt_one_layer_without_reorder_(int layer_idx, int64_t *expert_idxs, size_t num_expert) {
   TRACE_EVENT_GURAD(kHook, "preempt_one_layer_without_reorder_");
   LOG_BLOCK(DEBUG, logger, {
@@ -178,15 +206,6 @@ void FetchScheduleWorker::preempt_one_layer_without_reorder_(int layer_idx, int6
     // partial expert
     add_single_tasks_for_one_expert(layer_idx, e->expert_idx, &precise_job_queue, e->num_ready, metas->num_per_expert_param, true);
   }
-
-  profiler->add(TimeProfiler::kCntActivatedExpert, num_expert);
-
-  if (per_layer_job_queues[layer_idx].empty() == false) {
-    LOG(TRACE) << "preempting one layer " << layer_idx << ", queue is not empty, current task is " << current_task.toString();
-    per_layer_job_queues[layer_idx].clear();
-  } else {
-    LOG(TRACE) << "preempting one layer " << layer_idx << ", queue is empty";
-  }
 }
 void FetchScheduleWorker::add_single_tasks_for_one_expert(int layer_idx, int expert_idx, TaskQueue* queue, int starting_mem_buffer, int stop_mem_buffer, bool is_precise) {
   auto expert_handler = model_loader->get_source(layer_idx, expert_idx);
@@ -228,18 +247,43 @@ void PrefetchMngr::init_gpu_mem_buffer(size_t num_buffers) {
   cache->init_gpu_mem_buffer(num_buffers);
 }
 void PrefetchMngr::preempt_and_launch_one_layer(int layer_idx, torch::Tensor experts) {
-  cache_stats->forward();
-  if (layer_idx == 0) { profiler->push(TimeProfiler::kCntActivatedExpert, 0); }
-  predict_thread->consume_prefetch_layer_progress();
   PreemptTask preempt_task;
   preempt_task.layer_idx = layer_idx;
   preempt_task.expert_idxs = experts.data_ptr<int64_t>();
   preempt_task.num_expert = experts.numel();
   auto handler = fetch_schedule_thread->add_one_task(&preempt_task);
   fetch_schedule_thread->wait_progress(handler);
-  predict_thread->add_prefetch_layer_budget();
   // preempt_one_layer_(layer_idx, experts.data_ptr<int64_t>(), experts.size(0));
 }
+
+void PrefetchMngr::report_one_layer(int layer_id, torch::Tensor experts) {
+  cache_stats->forward();
+  if (layer_id == 0) { profiler->push(TimeProfiler::kCntActivatedExpert, 0); }
+  predict_thread->consume_prefetch_layer_progress();
+  preempt_and_launch_one_layer(layer_id, experts); // handle reorder, launch precise task, clear prefetch queue
+  profiler->add(TimeProfiler::kCntActivatedExpert, experts.numel());
+  record_then_predict_and_prefetch(layer_id, experts);
+}
+void PrefetchMngr::one_moe_layer_done(int layer_id) {
+  if (metas->early_preempt == false) {
+    predict_thread->add_prefetch_layer_budget();
+  }
+}
+
+void PrefetchMngr::report_one_expert(int layer_id, int expert_id) {
+  if (metas->early_preempt == false) {
+    PreemptOneExpertTask task;
+    task.layer_id = layer_id;
+    task.expert_id = expert_id;
+    auto handler = fetch_schedule_thread->add_one_task(&task);
+    fetch_schedule_thread->wait_progress(handler);
+  }
+  this->wait_expert(layer_id, expert_id);
+}
+void PrefetchMngr::one_expert_done(int layer_id, int expert_id) {
+  mark_expert_using(layer_id, expert_id);
+}
+
 void PrefetchMngr::wait_expert(int layer_id, int expert_id) {
   auto expert = model_loader->get_source(layer_id, expert_id);
   TRACE_EVENT_GURAD(kHook, "wait:" + expert->toString());
@@ -368,6 +412,12 @@ PrefetchMngr::~PrefetchMngr() {
   predict_thread->exit();
   expert_unlocker_thread->exit();
   fetch_schedule_thread->exit();
+  if (TraceEventCollector::globally_enabled) {
+    LOG(WARNING) << "dumping trace event to trace.json";
+    std::ofstream f("trace.json", std::ios::out | std::ios::trunc);
+    f << TraceEventCollector::singleton().dump_json_to_string();
+    f.close();
+  }
 }
 void FetchScheduleWorker::do_one_task_impl(FetchScheduleTaskBase *task) {
   switch (task->task_type) {
@@ -387,6 +437,10 @@ void FetchScheduleWorker::do_one_task_impl(FetchScheduleTaskBase *task) {
       do_one_task_impl(dynamic_cast<PrefetchLayerTask*>(task));
       break;
     }
+    case FetchScheduleTaskBase::kPreemptOneExpert: {
+      do_one_task_impl(dynamic_cast<PreemptOneExpertTask*>(task));
+      break;
+    }
     default: {
       CHECK(false) << "unknown task type " << task->task_type;
     }
@@ -394,10 +448,22 @@ void FetchScheduleWorker::do_one_task_impl(FetchScheduleTaskBase *task) {
 }
 void FetchScheduleWorker::do_one_task_impl(PreemptTask *task) {
   if (metas->reorder_experts) {
-    this->preempt_one_layer_(task->layer_idx, task->expert_idxs, task->num_expert);
-  } else {
-    this->preempt_one_layer_without_reorder_(task->layer_idx, task->expert_idxs, task->num_expert);
+    this->reorder_experts(task->layer_idx, task->expert_idxs, task->num_expert);
   }
+  if (metas->early_preempt) {
+    this->preempt_one_layer_without_reorder_(task->layer_idx, task->expert_idxs, task->num_expert);
+    predict_thread->add_prefetch_layer_budget();
+  }
+
+  if (per_layer_job_queues[task->layer_idx].empty() == false) {
+    LOG(TRACE) << "preempting one layer " << task->layer_idx << ", queue is not empty, current task is " << current_task.toString();
+    per_layer_job_queues[task->layer_idx].clear();
+  } else {
+    LOG(TRACE) << "preempting one layer " << task->layer_idx << ", queue is empty";
+  }
+}
+void FetchScheduleWorker::do_one_task_impl(PreemptOneExpertTask *task) {
+  this->preempt_one_expert(task->layer_id, task->expert_id);
 }
 
 void FetchScheduleWorker::init(ModuleMeta *metas, ModelLoader *model_loader,
@@ -511,4 +577,8 @@ bool FetchScheduleWorker::send_one_job(CopyTask *task) {
     fetch_thread->add_one_task(&current_task);
   }
   return true;
+}
+void PrefetchMngr::reload_env() {
+  TraceEventCollector::reload_env();
+  LogMessage::reload_env();
 }

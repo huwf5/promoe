@@ -25,6 +25,7 @@ class FetchScheduleTaskBase {
     kPreempt,
     kFetchDone,
     kPrefetchLayer,
+    kPreemptOneExpert,
   };
   TaskType task_type;
   FetchScheduleTaskBase(TaskType task_type) : task_type(task_type) {}
@@ -40,6 +41,12 @@ class PreemptTask : public FetchScheduleTaskBase {
   int layer_idx;
   int64_t* expert_idxs;
   size_t num_expert;
+};
+class PreemptOneExpertTask : public FetchScheduleTaskBase {
+ public:
+  PreemptOneExpertTask() : FetchScheduleTaskBase(kPreemptOneExpert) {}
+  int layer_id;
+  int64_t expert_id;
 };
 class PrefetchLayerTask : public FetchScheduleTaskBase {
  public:
@@ -94,6 +101,7 @@ class FetchScheduleWorker : public WorkerThread<FetchScheduleTaskBase*> {
   bool send_one_job(CopyTask *task);
   void do_one_task_impl(IdleTask *task);
   void do_one_task_impl(PreemptTask *task);
+  void do_one_task_impl(PreemptOneExpertTask *task);
   void do_one_task_impl(FetchDoneTask *task);
   void do_one_task_impl(PrefetchLayerTask *task);
 
@@ -105,6 +113,7 @@ class FetchScheduleWorker : public WorkerThread<FetchScheduleTaskBase*> {
   void reorder_experts(int layer_idx, int64_t *expert_idxs, size_t num_expert);
   void preempt_one_layer_(int layer_idx, int64_t *expert_idxs, size_t num_expert);
   void preempt_one_layer_without_reorder_(int layer_idx, int64_t *expert_idxs, size_t num_expert);
+  void preempt_one_expert(int layer_idx, int64_t expert_idx);
 
  public:
   #ifdef DEAD_CODE
@@ -138,6 +147,9 @@ class PrefetchMngr {
   void preempt_and_launch_one_layer(int layer_idx, torch::Tensor experts);
   void record_then_predict_and_prefetch(int layer_id, torch::Tensor experts);
 
+  void wait_expert(int layer_id, int expert_id);
+  void mark_expert_using(int layer_id, int expert_id);
+
 public:
   std::shared_ptr<CacheStatistics> cache_stats;
   std::shared_ptr<TimeProfiler> profiler;
@@ -148,14 +160,13 @@ public:
   ~PrefetchMngr();
   void init_gpu_mem_buffer(size_t num_buffers);
 
-  void report_one_layer(int layer_id, torch::Tensor experts) {
-    preempt_and_launch_one_layer(layer_id, experts);
-    record_then_predict_and_prefetch(layer_id, experts);
-  }
+  void report_one_layer(int layer_id, torch::Tensor experts);
+  void one_moe_layer_done(int layer_id);
 
-  void wait_expert(int layer_id, int expert_id);
-  void mark_expert_using(int layer_id, int expert_id);
+  void report_one_expert(int layer_id, int expert_id);
+  void one_expert_done(int layer_id, int expert_id);
 
   void launch_thread();
   TimerGuard build_timer() { return TimerGuard(this->profiler.get()); }
+  void reload_env();
 };

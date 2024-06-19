@@ -1,7 +1,8 @@
 #include "profiler.hpp"
 
-bool TraceEventCollector::globally_enabled = (getenv("SPARSE_CACHE_ENABLE_TRACE") != nullptr);
+bool TraceEventCollector::globally_enabled = false;
 TraceEventCollector::TraceEventCollector() {
+  reload_env();
   event_list.resize(kThreadTypeNum);
 }
 void TraceEventCollector::add_meta_event() {

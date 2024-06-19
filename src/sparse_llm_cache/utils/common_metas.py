@@ -58,7 +58,7 @@ class ModelMetas:
       num_expert_per_token  = 4,
       expert_meta_parser    = parse_expert_meta_from_name,
       expert_name_filter    = RegexFilter(r'.*layers\.(\d+)\.mlp\.experts\.(\d+)$'),
-      moe_layer_name_filter = RegexFilter(r'.*layers\.([1-9]\d*)\.mlp$')
+      moe_layer_name_filter = RegexFilter(r'.*layers\.([0-9]\d*)\.mlp$')
     )
     return asdict(ret) if return_dict else ret
 

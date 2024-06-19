@@ -8,6 +8,8 @@
 #include <functional>
 #include <torch/torch.h>
 
+#include "utils.hpp"
+
 enum ThreadType {
   kPythonMain = 0,
   kHook,
@@ -63,6 +65,9 @@ class TraceEventCollector {
   static TraceEventCollector& singleton() {
     static TraceEventCollector s;
     return s;
+  }
+  static void reload_env() { 
+    TraceEventCollector::globally_enabled = (getenv("SPARSE_CACHE_ENABLE_TRACE") != nullptr && string_is_on(getenv("SPARSE_CACHE_ENABLE_TRACE")));
   }
   void add_event(TraceEvent & e) {
     event_list[e.tid].push_back(e);

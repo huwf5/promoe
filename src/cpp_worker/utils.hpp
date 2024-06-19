@@ -118,6 +118,7 @@ class ModuleMeta {
   bool per_layer_cache = true;
   bool reorder_experts = true;
   bool promote_hit_in_prefetch = true;
+  bool early_preempt = true;
   std::string cache_policy = "fifo";
 
   bool can_do_layer(int cur_preempted_layer, int target_layer) {
@@ -298,3 +299,7 @@ class Queue {
     stop = next(stop);
   }
 };
+
+inline bool string_is_on(const std::string s) {
+  return s == "on" || s == "true" || s == "1" || s == "ON" || s == "TRUE";
+}

@@ -1,3 +1,4 @@
+import os
 import re
 
 from .hooks import *
@@ -65,6 +66,13 @@ def add_hook_to_experts(model, prefetch_mngr, filter=RegexFilter(r'.*layers\.(\d
     hooks.add_hook_to_module(module, hook)
   recursive_traverse_childrens(model, f, filter)
 
+def add_hook_to_moe_layers(model, prefetch_mngr, filter):
+  hook = MoeLayerHook(prefetch_mngr)
+  def f(module, name):
+    # print(f'adding hook to {name}')
+    hooks.add_hook_to_module(module, hook)
+  recursive_traverse_childrens(model, f, filter)
+
 def add_hook_to_some_modules(model, hook, filter=RegexFilter(r'.*'), append=False):
   def f(module, name):
     # print(f'adding hook to {name}')
@@ -95,6 +103,8 @@ def inject_model(
     cache_policy : str = 'lru',
     cache_device : str|int = 'cuda',
     reorder_experts : bool = True,
+    promote_hit_in_prefetch : bool = True,
+    early_preempt : bool = True,
     # metadatas of model
     num_moe_layer : int = None,
     num_expert_per_layer : int = None,
@@ -103,8 +113,9 @@ def inject_model(
     expert_name_filter = None,
     moe_layer_name_filter = None,
     pin_memory : bool  = True,
-    enable_module_trace_event : bool = False,
+    module_trace_event : bool = False,
     enable_model_timer : bool = False,
+    trace_event : bool = False,
   ):
   """
   Injects a model with cache-related functionality.
@@ -176,6 +187,8 @@ def inject_model(
   meta.per_layer_cache = per_layer_cache
   meta.cache_policy = cache_policy
   meta.reorder_experts = reorder_experts
+  meta.promote_hit_in_prefetch = promote_hit_in_prefetch
+  meta.early_preempt = early_preempt
 
   model_loader  = cpp_worker.ModelLoader(meta)
   predictor     = cpp_worker.Predictor(meta)
@@ -193,10 +206,14 @@ def inject_model(
   prefetch_mngr.init_gpu_mem_buffer(cache_len)
 
   add_hook_to_experts(model, prefetch_mngr, expert_name_filter)
+  add_hook_to_moe_layers(model, prefetch_mngr, moe_layer_name_filter)
 
-  if enable_module_trace_event:
-    trace_event_hook = hooks.TraceEventHook()
-    add_hook_to_some_modules(model, trace_event_hook, append=True)
+  if trace_event:
+    os.environ['SPARSE_CACHE_ENABLE_TRACE'] = '1'
+    prefetch_mngr.reload_env()
+    if module_trace_event:
+      trace_event_hook = hooks.TraceEventHook()
+      add_hook_to_some_modules(model, trace_event_hook, append=True)
   if enable_model_timer:
     timing_hook = hooks.TimingHook(prefetch_mngr)
     add_hook_to_some_modules(model, timing_hook, filter=RegexFilter('^$'), append=True)

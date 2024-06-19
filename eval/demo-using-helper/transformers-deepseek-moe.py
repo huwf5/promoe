@@ -35,8 +35,6 @@ sparse_llm_cache.utils.inject_model(
   model,
   **cache_configs,
   pin_memory = True,
-  # enable_module_trace_event = True,
-  enable_module_trace_event = False,
   enable_model_timer=True,
 )
 

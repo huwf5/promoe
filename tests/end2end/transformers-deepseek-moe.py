@@ -3,7 +3,6 @@ import os
 # os.environ['CUDA_VISIBLE_DEVICES'] = '1'
 os.environ['CUDA_VISIBLE_DEVICES'] = '6'
 # os.environ['SPARSE_CACHE_LOG_LEVEL'] = 'DEBUG'
-# os.environ['SPARSE_CACHE_ENABLE_TRACE'] = '1'
 os.environ['HUGGINGFACE_OFFLINE'] = "1"
 
 from transformers.utils import logging
@@ -14,6 +13,7 @@ import sparse_llm_cache
 
 from args import parse_args
 cache_configs = parse_args()
+for k,v in cache_configs.items(): print(k, v)
 
 print("loading model...")
 logging.disable_progress_bar()
@@ -34,8 +34,6 @@ sparse_llm_cache.utils.inject_model(
   model,
   **cache_configs,
   pin_memory = True,
-  # enable_module_trace_event = True,
-  enable_module_trace_event = False,
   enable_model_timer=True,
 )
 
