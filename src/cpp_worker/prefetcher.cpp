@@ -138,13 +138,13 @@ void FetchScheduleWorker::preempt_one_expert(int layer_idx, int64_t expert_idx) 
   } else if (e->num_ready == metas->num_per_expert_param) {
     // bypass a fully fetched expert, no need to add task
     e->expert_status.transfer(kReady, kLaunching);
-    cache->hit(e);
+    cache_hit(e, true);
   } else if (e == current_task.expert) {
     current_task.is_precise = true;
     if (current_task.stop_mem_buf_idx == metas->num_per_expert_param) {
       // no need to add a redundant task
       // note there will be corresponding fetchdone for this task.
-      cache->hit(e);
+      cache_hit(e, true);
     } else {
       add_single_tasks_for_one_expert(layer_idx, e->expert_idx, &precise_job_queue, current_task.stop_mem_buf_idx, metas->num_per_expert_param, true);
     }
@@ -188,7 +188,7 @@ void FetchScheduleWorker::preempt_one_layer_without_reorder_(int layer_idx, int6
     // bypass a fully fetched expert, no need to add task
     if (e->num_ready == metas->num_per_expert_param) {
       e->expert_status.transfer(kReady, kLaunching);
-      cache->hit(e);
+      cache_hit(e, true);
       continue;
     }
 
@@ -197,7 +197,7 @@ void FetchScheduleWorker::preempt_one_layer_without_reorder_(int layer_idx, int6
       if (current_task.stop_mem_buf_idx == metas->num_per_expert_param) {
         // no need to add a redundant task
         // note there will be corresponding fetchdone for this task.
-        cache->hit(e);
+        cache_hit(e, true);
       } else {
         add_single_tasks_for_one_expert(layer_idx, e->expert_idx, &precise_job_queue, current_task.stop_mem_buf_idx, metas->num_per_expert_param, true);
       }
@@ -268,6 +268,9 @@ void PrefetchMngr::report_one_layer(int layer_id, torch::Tensor experts) {
 void PrefetchMngr::one_moe_layer_done(int layer_id) {
   if (metas->early_preempt == false) {
     predict_thread->add_prefetch_layer_budget();
+  }
+  if (layer_id == metas->num_layer - 1) {
+    predict_thread->add_one_task();
   }
 }
 
@@ -378,9 +381,9 @@ void PrefetchMngr::record_then_predict_and_prefetch(int layer_id, torch::Tensor 
   } else {
     LOG(DEBUG) << "identified prefill iteration, skip adding it to prefill " << experts.numel();
   }
-  if (layer_id == metas->num_layer - 1) {
-    predict_thread->add_one_task();
-  }
+  // if (layer_id == metas->num_layer - 1) {
+  //   predict_thread->add_one_task();
+  // }
 }
 #ifdef DEAD_CODE
 void FetchScheduleWorker::add_one_layer_task(int layer_idx, torch::Tensor experts) {
@@ -487,7 +490,7 @@ void FetchScheduleWorker::do_one_task_impl(FetchDoneTask *_) {
     LOG(TRACE) << "scheduler: all fetch job done for expert " << current_task.toString();
 
     if (current_task.is_precise && metas->reorder_experts == false) {
-      cache->hit(current_task.expert);
+      cache_hit(current_task.expert, current_task.is_precise);
     }
     current_task.expert->expert_status.transfer(kFetching, current_task.is_precise ? kLaunching : kReady);
   }
@@ -517,7 +520,7 @@ void FetchScheduleWorker::do_one_task_impl(PrefetchLayerTask *task) {
   for (int i = 0; i < task->num_expert; i++) {
     auto expert = model_loader->get_source(task->layer_idx, task->expert_idxs[i]);
     LOG(TRACE) << "adding prefetch task " << expert->toString();
-    if (metas->promote_hit_in_prefetch && cache->is_in_cache(expert)) { cache->hit(expert); }
+    if (metas->promote_hit_in_prefetch && cache->is_in_cache(expert)) { cache_hit(expert, false); }
     // if (expert->num_ready == metas->num_per_expert_param) {
     //   auto cur_status = expert->expert_status.get();
     //   CHECK(cur_status == kReady || cur_status == kUsing) << "expert " << expert->toString() << " must be ready, but is " << cur_status;

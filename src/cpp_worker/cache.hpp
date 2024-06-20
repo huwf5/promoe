@@ -13,6 +13,8 @@ class CachePolicy {
   virtual void evict(ExpertHandler*) {}
   virtual void access_on_hit(ExpertHandler*) {}
   virtual void access_on_miss(ExpertHandler*) {}
+  virtual void update_priority() {}
+  virtual void update_priority(ExpertHandler* e, float p) {}
 };
 
 class CachePolicyFIFO : public CachePolicy {
@@ -30,7 +32,6 @@ class CachePolicyLRU : public CachePolicy {
   LL linked_list;
   std::unordered_map<ExpertHandler*, LL::Node*> map;
  public:
-  std::queue<ExpertHandler*> fifo_queue;
   using CachePolicy::CachePolicy;
   ~CachePolicyLRU() {
     while (linked_list_node_free_buffer.empty() == false) {
@@ -48,6 +49,48 @@ class CachePolicyLRU : public CachePolicy {
   }
   void access_on_hit(ExpertHandler *e) override;
   void access_on_miss(ExpertHandler *e) override;
+};
+
+class CachePolicyNN : public CachePolicy {
+  using Heap = MinHeap<ExpertHandler*>;
+  std::vector<Heap::Node*> heap_node_free_buffer;
+  Heap heap;
+  std::unordered_map<ExpertHandler*, Heap::Node*> map;
+  // torch::Tensor priority;
+ public:
+  std::function<float(ExpertHandler*)> priority_fn;
+  using CachePolicy::CachePolicy;
+  ~CachePolicyNN() {
+    while (heap_node_free_buffer.empty() == false) {
+      delete heap_node_free_buffer.back();
+      heap_node_free_buffer.pop_back();
+    }
+  }
+  ExpertHandler *select_for_evict(ExpertHandler *) override {
+    return heap.front()->data;
+  }
+  void evict(ExpertHandler *e) override {
+    auto n = heap.remove(map[e]);
+    heap_node_free_buffer.push_back(n);
+    map.erase(e);
+  }
+  void access_on_hit(ExpertHandler *e) override;
+  void access_on_miss(ExpertHandler *e) override;
+  void update_priority() override {
+    for (auto &pair : map) {
+      pair.second->priority = priority_fn(pair.first);
+    }
+    heap.rebuild();
+  }
+  void update_priority(ExpertHandler* e, float p) override {
+    auto orig_p = map[e]->priority;
+    map[e]->priority = p;
+    if (p < orig_p) {
+      heap.heapify_up(map[e]->current_idx);
+    } else {
+      heap.heapify_down(map[e]->current_idx);
+    }
+  }
 };
 
 class CachePolicyFactory {
@@ -90,6 +133,7 @@ class CacheMngr {
   void handle_miss(ExpertHandler *expert);
   CachePolicyFactory policy_factory;
   friend class SlotMapper;
+  torch::Tensor priority;
  public:
   using CacheLineOccupancyWaiter = std::function<void()>;
   size_t cache_len = 0;
@@ -120,7 +164,14 @@ class CacheMngr {
     return cache_slots->to_slot(layer_idx)->full_len;
   }
   ExpertMemHanlder* evict(ExpertHandler *evict_e, ExpertHandler *incoming_e=nullptr, bool reserve_mem = false);
-  void access(ExpertHandler *expert);
-  void hit(ExpertHandler *expert);
-  CacheLineOccupancyWaiter miss(ExpertHandler *expert);
+  void access(ExpertHandler *expert, bool is_precise);
+  void hit(ExpertHandler *expert, bool is_precise);
+  CacheLineOccupancyWaiter miss(ExpertHandler *expert, bool is_precise);
+
+  void update_priority(torch::Tensor p) {
+    priority = p.clone();
+    for (auto & slot : cache_slots->slots) {
+      reinterpret_cast<CachePolicyNN*>(slot.policy.get())->update_priority();
+    }
+  }
 };

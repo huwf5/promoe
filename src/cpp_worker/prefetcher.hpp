@@ -68,10 +68,10 @@ class FetchScheduleWorker : public WorkerThread<FetchScheduleTaskBase*> {
   CacheMngr*       cache;
 
   void cache_hit(ExpertHandler* e, bool is_precise) {
-    cache->hit(e);
+    cache->hit(e, is_precise);
   }
   CacheMngr::CacheLineOccupancyWaiter cache_miss(ExpertHandler* e, bool is_precise) {
-    return cache->miss(e);
+    return cache->miss(e, is_precise);
   }
 
   CacheStatistics* cache_stats;

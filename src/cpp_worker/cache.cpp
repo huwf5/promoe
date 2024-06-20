@@ -39,6 +39,11 @@ CacheMngr::CacheMngr(std::shared_ptr<ModuleMeta> metas,
 
   policy_factory.register_policy("fifo", [this]() -> std::shared_ptr<CachePolicy>{ return std::make_shared<CachePolicyFIFO>(this); });
   policy_factory.register_policy("lru",  [this]() -> std::shared_ptr<CachePolicy>{ return std::make_shared<CachePolicyLRU>(this);  });
+  policy_factory.register_policy("nn",   [this]() -> std::shared_ptr<CachePolicy>{ 
+    auto ret = std::make_shared<CachePolicyNN>(this);
+    ret->priority_fn = [this](ExpertHandler* e)->float{ return this->priority[e->layer_idx][e->expert_idx].item<float>(); };
+    return ret;
+  });
 
 
   if (metas->per_layer_cache) {
@@ -95,19 +100,19 @@ ExpertMemHanlder* CacheMngr::evict(ExpertHandler *e_to_evict, ExpertHandler *inc
   }
   return ret;
 }
-void CacheMngr::access(ExpertHandler *expert) {
+void CacheMngr::access(ExpertHandler *expert, bool is_precise) {
   if (is_in_cache(expert)) {
-    hit(expert);
+    hit(expert, is_precise);
   } else {
-    miss(expert);
+    miss(expert, is_precise);
   }
 }
-void CacheMngr::hit(ExpertHandler *expert) {
+void CacheMngr::hit(ExpertHandler *expert, bool is_precise) {
   handle_hit(expert);
   cache_slots->to_slot(expert)->policy->access_on_hit(expert);
 }
 
-CacheMngr::CacheLineOccupancyWaiter CacheMngr::miss(ExpertHandler *incoming_e) {
+CacheMngr::CacheLineOccupancyWaiter CacheMngr::miss(ExpertHandler *incoming_e, bool is_precise) {
   TRACE_EVENT_GURAD(kCache, "miss:" + incoming_e->toString());
   LOG(TRACE) << "cache miss " << incoming_e->toString();
   auto cache_slot = cache_slots->to_slot(incoming_e);
@@ -116,7 +121,7 @@ CacheMngr::CacheLineOccupancyWaiter CacheMngr::miss(ExpertHandler *incoming_e) {
     auto gpu_data = cache_slot->unused_mems.back();
     incoming_e->gpu_data = gpu_data;
     cache_slot->unused_mems.pop_back();
-    cache_slots->to_slot(incoming_e)->policy->access_on_miss(incoming_e);
+    cache_slot->policy->access_on_miss(incoming_e);
     prefetched_experts[incoming_e] = gpu_data;
   } else {
     auto e_to_evict = cache_slot->policy->select_for_evict(incoming_e);
@@ -127,7 +132,10 @@ CacheMngr::CacheLineOccupancyWaiter CacheMngr::miss(ExpertHandler *incoming_e) {
       CHECK(e_to_evict != incoming_e);
 
       cache_slot->policy->evict(e_to_evict);
-      cache_slots->to_slot(incoming_e)->policy->access_on_miss(incoming_e);
+      cache_slot->policy->access_on_miss(incoming_e);
+      if (is_precise) {
+        cache_slot->policy->update_priority(incoming_e, 1);
+      }
       auto gpu_data = prefetched_experts[e_to_evict];
       prefetched_experts.erase(e_to_evict);
       prefetched_experts[incoming_e] = gpu_data;
@@ -187,4 +195,21 @@ void CachePolicyLRU::access_on_miss(ExpertHandler *e) {
   map[e] = n;
   n->data = e;
   linked_list.push_back(n);
+}
+void CachePolicyNN::access_on_hit(ExpertHandler *e) {
+  CHECK(map.find(e) != map.end());
+}
+void CachePolicyNN::access_on_miss(ExpertHandler *e) {
+  CHECK(map.find(e) == map.end());
+  Heap::Node *n = nullptr;
+  if (heap_node_free_buffer.empty()) {
+    n = new Heap::Node;
+  } else {
+    n = heap_node_free_buffer.back();
+    heap_node_free_buffer.pop_back();
+  }
+  map[e] = n;
+  n->data = e;
+  n->priority = priority_fn(e);
+  heap.push(n);
 }

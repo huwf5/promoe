@@ -219,6 +219,85 @@ struct DoubleLinkedList {
 
 };
 
+template<typename DATA_T>
+struct MinHeap {
+  struct Node {
+    float priority;
+    int current_idx;
+    DATA_T data;
+  };
+  std::vector<Node*> heap_buffer;
+  MinHeap() {}
+  void rebuild() {
+    for (int i = heap_buffer.size() / 2; i >= 0; i--) {
+      heapify_down(i);
+    }
+  }
+  int to_left(int i) { return 2 * i + 1; }
+  int to_right(int i) { return 2 * i + 2; }
+  int to_parent(int i) { return (i - 1) / 2;}
+  void swap(int i, int j) {
+    std::swap(heap_buffer[i], heap_buffer[j]);
+    heap_buffer[i]->current_idx = i;
+    heap_buffer[j]->current_idx = j;
+  }
+  void heapify_down(int i) {
+    int left = to_left(i);
+    int right = to_right(i);
+    int smallest = i;
+    if (left < heap_buffer.size() && heap_buffer[left]->priority < heap_buffer[smallest]->priority) {
+      smallest = left;
+    }
+    if (right < heap_buffer.size() && heap_buffer[right]->priority < heap_buffer[smallest]->priority) {
+      smallest = right;
+    }
+    if (smallest != i) {
+      swap(i, smallest);
+      heapify_down(smallest);
+    }
+  }
+  void push(Node* v) {
+    v->current_idx = heap_buffer.size();
+    heap_buffer.push_back(v);
+    heapify_up(heap_buffer.size() - 1);
+  }
+
+  void heapify_up(int i) {
+    while (i > 0) {
+      int parent = to_parent(i);
+      if (heap_buffer[parent]->priority > heap_buffer[i]->priority) {
+        swap(parent, i);
+        i = parent;
+      } else {
+        break;
+      }
+    }
+  }
+  Node* pop() {
+    Node* ret = heap_buffer[0];
+    heap_buffer[0] = heap_buffer.back();
+    heap_buffer.pop_back();
+    heapify_down(0);
+    return ret;
+  }
+  Node* remove(Node* n) {
+    int i = n->current_idx;
+    swap(i, heap_buffer.size() - 1);
+    heap_buffer.pop_back();
+    if (i < heap_buffer.size()) {
+      heapify_down(i);
+    }
+    return n;
+  }
+  Node* top() {
+    return heap_buffer[0];
+  }
+  Node* front() { return top(); }
+  bool empty() {
+    return heap_buffer.empty();
+  }
+};
+
 struct DummyStruct{};
 
 template<typename T>
