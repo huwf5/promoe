@@ -24,6 +24,7 @@ void ModelLoader::add_one_expert_param(torch::Tensor param, int layer_id,
 }
 void ModelLoader::pin_memory() {
   LOG(INFO) << "pin expert memorys on cpu...";
+  #pragma omp parallel for num_threads(metas->num_layer)
   for (int l = 0; l < metas->num_layer; l++) {
     for (int e = 0; e < metas->num_expert; e++) {
       for (int p = 0; p < metas->num_per_expert_param; p++) {

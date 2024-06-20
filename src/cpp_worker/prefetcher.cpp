@@ -3,10 +3,11 @@
 #include "profiler.hpp"
 #include "logging.hpp"
 
+#ifdef DEAD_CODE
 void FetchScheduleWorker::preempt_one_layer_(int layer_idx, int64_t *expert_idxs, size_t num_expert) {
   this->reorder_experts(layer_idx, expert_idxs, num_expert);
   this->preempt_one_layer_without_reorder_(layer_idx, expert_idxs, num_expert);
-  #ifdef DEAD_CODE
+  return;
   TRACE_EVENT_GURAD(kHook, "preempt_one_layer_");
   LOG_BLOCK(DEBUG, logger, {
     logger << "preempting one layer " << layer_idx << " with expert " << array_to_str(expert_idxs, num_expert);
@@ -84,8 +85,8 @@ void FetchScheduleWorker::preempt_one_layer_(int layer_idx, int64_t *expert_idxs
   LOG_BLOCK(DEBUG, logger, {
     logger << "reordered expert to " << array_to_str(expert_idxs, num_expert);
   });
-  #endif
 }
+#endif
 
 void FetchScheduleWorker::reorder_experts(int layer_idx, int64_t *expert_idxs, size_t num_expert) {
   TRACE_EVENT_GURAD(kHook, "reorder_experts");

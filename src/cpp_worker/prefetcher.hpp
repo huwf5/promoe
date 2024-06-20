@@ -111,7 +111,9 @@ class FetchScheduleWorker : public WorkerThread<FetchScheduleTaskBase*> {
   void add_separate_tasks_for_one_expert(int layer_idx, int expert_idx, TaskQueue *queue, int start_mem_buf_idx, int stop_mem_buf_idx, bool is_precise);
 
   void reorder_experts(int layer_idx, int64_t *expert_idxs, size_t num_expert);
+  #ifdef DEAD_CODE
   void preempt_one_layer_(int layer_idx, int64_t *expert_idxs, size_t num_expert);
+  #endif
   void preempt_one_layer_without_reorder_(int layer_idx, int64_t *expert_idxs, size_t num_expert);
   void preempt_one_expert(int layer_idx, int64_t expert_idx);
 
