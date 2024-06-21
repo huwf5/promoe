@@ -13,10 +13,11 @@
 enum ThreadType {
   kPythonMain = 0,
   kHook,
-  kPrefetch,
+  kFetchScheduler,
   kFetcher,
+  kUnlocker,
   kCache,
-  kPredict,
+  kPredictor,
   kGPU,
   kThreadTypeNum,
 };

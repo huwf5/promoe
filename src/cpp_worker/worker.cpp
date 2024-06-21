@@ -21,11 +21,11 @@ void PredictWorker::do_one_task_impl() {
   });
 
   {
-    TRACE_EVENT_GURAD(kPredict, "add_multi_layer_task");
+    TRACE_EVENT_GURAD(kPredictor, "add_multi_layer_task");
     size_t per_layer_num_expert = predicted_expert.size(1);
     for (int layer_idx = 0; layer_idx < metas->num_layer; layer_idx++) {
       {
-        TRACE_EVENT_GURAD(kPredict, "wait for budget " + std::to_string(layer_idx));
+        TRACE_EVENT_GURAD(kPredictor, "wait for budget " + std::to_string(layer_idx));
         while (sem_trywait(&prefetch_layer_budget) == -1) {
           if (should_exit()) { return; }
         }
@@ -43,12 +43,13 @@ void PredictWorker::do_one_task_impl() {
   predictor->clear_access_buffer();
 }
 void ExpertUnlockWorker::do_one_task_impl(ExpertHandler *task) {
+  TRACE_EVENT_GURAD(kUnlocker, "unlock:" + task->toString());
   task->expert_status.wait(kUsing);
   CUDA_CALL(cudaEventSynchronize(task->event));
   task->expert_status.transfer(kUsing, kReady);
 }
 void FetchWorker::do_one_task_impl(CopyTask *task) {
-  TRACE_EVENT_GURAD(kFetcher, "do:" + task->toString());
+  TRACE_EVENT_GURAD(kFetcher, "fetch:" + task->toString());
   LOG(TRACE) << "fetcher: copying " << task->toString();
   {
     task->lambda_wait();

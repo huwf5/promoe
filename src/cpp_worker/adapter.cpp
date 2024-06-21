@@ -78,10 +78,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("dump_trace_event_collector_singleton", &dump_trace_event_collector_singleton);
 
   py::enum_<ThreadType>(m, "ThreadType")
-    .value("kPythonMain", ThreadType::kPythonMain)
-    .value("kHook",       ThreadType::kHook)
-    .value("kPrefetch",   ThreadType::kPrefetch)
-    .value("kGPU",        ThreadType::kGPU)
+    .value("kPythonMain",     ThreadType::kPythonMain)
+    .value("kHook",           ThreadType::kHook)
+    .value("kFetchScheduler", ThreadType::kFetchScheduler)
+    .value("kGPU",            ThreadType::kGPU)
     .export_values();
 
   py::enum_<TimeProfiler::TimeType>(m, "TimeType")
