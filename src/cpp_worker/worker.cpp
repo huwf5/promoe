@@ -7,7 +7,7 @@ void PredictWorker::do_one_task_impl() {
   // TRACE_EVENT_GURAD(kPredict, "predict thread");
   auto prob = predictor->predict().reshape({metas->num_layer, metas->num_expert});
   if (metas->cache_policy == "nn") {
-    cache->update_priority(prob);
+    cache->update_all_priority(prob);
   }
   auto sorted = prob.sort(-1, true);
   // auto predicted_expert_prob = std::get<0>(sorted).slice(1, 0,

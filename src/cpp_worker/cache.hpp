@@ -13,8 +13,9 @@ class CachePolicy {
   virtual void evict(ExpertHandler*) {}
   virtual void access_on_hit(ExpertHandler*) {}
   virtual void access_on_miss(ExpertHandler*) {}
-  virtual void update_priority() {}
+  virtual void update_all_priority() {}
   virtual void update_priority(ExpertHandler* e, float p) {}
+  virtual std::string toString () { return ""; }
 };
 
 class CachePolicyFIFO : public CachePolicy {
@@ -76,20 +77,25 @@ class CachePolicyNN : public CachePolicy {
   }
   void access_on_hit(ExpertHandler *e) override;
   void access_on_miss(ExpertHandler *e) override;
-  void update_priority() override {
+  void update_all_priority() override {
     for (auto &pair : map) {
       pair.second->priority = priority_fn(pair.first);
     }
     heap.rebuild();
   }
   void update_priority(ExpertHandler* e, float p) override {
-    auto orig_p = map[e]->priority;
-    map[e]->priority = p;
-    if (p < orig_p) {
-      heap.heapify_up(map[e]->current_idx);
-    } else {
-      heap.heapify_down(map[e]->current_idx);
+    heap.update_priority(map[e], p);
+  }
+  std::string toString () override {
+    auto v = heap.heap_buffer;
+    std::sort(v.begin(), v.end(), [](Heap::Node* a, Heap::Node* b) {
+      return a->priority > b->priority;
+    });
+    std::stringstream ss;
+    for (auto n : v) {
+      ss << "(" << n->priority << "," << n->data->expert_idx << "),";
     }
+    return ss.str();
   }
 };
 
@@ -134,6 +140,10 @@ class CacheMngr {
   CachePolicyFactory policy_factory;
   friend class SlotMapper;
   torch::Tensor priority;
+  float max_priority = std::numeric_limits<float>::min();
+  std::function<float(ExpertHandler*)> priority_get_fn = [](ExpertHandler* e) ->float { return 0; };
+  std::function<void(ExpertHandler*, float)> priority_set_fn = [](ExpertHandler* e, float p) {};
+
  public:
   using CacheLineOccupancyWaiter = std::function<void()>;
   size_t cache_len = 0;
@@ -168,10 +178,5 @@ class CacheMngr {
   void hit(ExpertHandler *expert, bool is_precise);
   CacheLineOccupancyWaiter miss(ExpertHandler *expert, bool is_precise);
 
-  void update_priority(torch::Tensor p) {
-    priority = p.clone();
-    for (auto & slot : cache_slots->slots) {
-      reinterpret_cast<CachePolicyNN*>(slot.policy.get())->update_priority();
-    }
-  }
+  void update_all_priority(torch::Tensor p);
 };

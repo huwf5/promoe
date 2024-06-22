@@ -262,6 +262,16 @@ struct MinHeap {
     heapify_up(heap_buffer.size() - 1);
   }
 
+  void update_priority(Node* v, float new_priority) {
+    auto orig_p = v->priority;
+    v->priority = new_priority;
+    if (new_priority < orig_p) {
+      heapify_up(v->current_idx);
+    } else {
+      heapify_down(v->current_idx);
+    }
+  }
+
   void heapify_up(int i) {
     while (i > 0) {
       int parent = to_parent(i);

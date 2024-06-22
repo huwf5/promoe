@@ -37,11 +37,16 @@ CacheMngr::CacheMngr(std::shared_ptr<ModuleMeta> metas,
     : metas(metas), model_loader(model_loader), policy_factory() {
   // prefetched_experts.resize(metas->num_layer);
 
+  if (metas->cache_policy == "nn") {
+    this->priority_get_fn = [this](ExpertHandler* e) ->float { return this->priority.index({e->layer_idx, e->expert_idx}).item<float>(); };
+    this->priority_set_fn = [this](ExpertHandler* e, float p)  { this->priority.index_put_({e->layer_idx, e->expert_idx}, max_priority); };
+  }
+
   policy_factory.register_policy("fifo", [this]() -> std::shared_ptr<CachePolicy>{ return std::make_shared<CachePolicyFIFO>(this); });
   policy_factory.register_policy("lru",  [this]() -> std::shared_ptr<CachePolicy>{ return std::make_shared<CachePolicyLRU>(this);  });
   policy_factory.register_policy("nn",   [this]() -> std::shared_ptr<CachePolicy>{ 
     auto ret = std::make_shared<CachePolicyNN>(this);
-    ret->priority_fn = [this](ExpertHandler* e)->float{ return this->priority[e->layer_idx][e->expert_idx].item<float>(); };
+    ret->priority_fn = this->priority_get_fn;
     return ret;
   });
 
@@ -108,14 +113,24 @@ void CacheMngr::access(ExpertHandler *expert, bool is_precise) {
   }
 }
 void CacheMngr::hit(ExpertHandler *expert, bool is_precise) {
+  auto cache_slot = cache_slots->to_slot(expert);
   handle_hit(expert);
-  cache_slots->to_slot(expert)->policy->access_on_hit(expert);
+  cache_slot->policy->access_on_hit(expert);
+  if (is_precise) {
+    max_priority += 1;
+    cache_slot->policy->update_priority(expert, max_priority);
+    this->priority_set_fn(expert, max_priority);
+  }
 }
 
 CacheMngr::CacheLineOccupancyWaiter CacheMngr::miss(ExpertHandler *incoming_e, bool is_precise) {
   TRACE_EVENT_GURAD(kCache, "miss:" + incoming_e->toString());
   LOG(TRACE) << "cache miss " << incoming_e->toString();
   auto cache_slot = cache_slots->to_slot(incoming_e);
+  if (is_precise) {
+    max_priority += 1;
+    this->priority_set_fn(incoming_e, max_priority);
+  }
   CacheLineOccupancyWaiter lambda_to_wait_expert_occupancy = [](){};
   if (cache_slot->unused_mems.size() > 0) {
     auto gpu_data = cache_slot->unused_mems.back();
@@ -128,14 +143,17 @@ CacheMngr::CacheLineOccupancyWaiter CacheMngr::miss(ExpertHandler *incoming_e, b
     // incoming_e->gpu_data = evict(e_to_evict, incoming_e, true);
     {
       TRACE_EVENT_GURAD(kCache, "evict " + e_to_evict->toString());
+      LOG_BLOCK(DEBUG, logger, {
+        logger << "evict " << e_to_evict->toString() << ", policy state is " << cache_slot->policy->toString();
+      });
       LOG(TRACE) << "cache evict " << e_to_evict->toString();
       CHECK(e_to_evict != incoming_e);
 
       cache_slot->policy->evict(e_to_evict);
       cache_slot->policy->access_on_miss(incoming_e);
-      if (is_precise) {
-        cache_slot->policy->update_priority(incoming_e, 1);
-      }
+      LOG_BLOCK(DEBUG, logger, {
+        logger << "after evict, policy state is " << cache_slot->policy->toString();
+      });
       auto gpu_data = prefetched_experts[e_to_evict];
       prefetched_experts.erase(e_to_evict);
       prefetched_experts[incoming_e] = gpu_data;
@@ -212,4 +230,17 @@ void CachePolicyNN::access_on_miss(ExpertHandler *e) {
   n->data = e;
   n->priority = priority_fn(e);
   heap.push(n);
+}
+void CacheMngr::update_all_priority(torch::Tensor p) {
+  priority = p.clone();
+  max_priority = priority.max().item<float>();
+  for (auto &slot : cache_slots->slots) {
+    reinterpret_cast<CachePolicyNN *>(slot.policy.get())->update_all_priority();
+  }
+  LOG_BLOCK(DEBUG, logger, {
+    logger << "update priority, result: \n";
+    for (int s = 0; s < cache_slots->slots.size(); s++) {
+      logger << "slot " << s << ":" << cache_slots->slots[s].policy->toString() << "\n";
+    }
+  });
 }
