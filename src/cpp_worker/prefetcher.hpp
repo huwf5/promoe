@@ -68,9 +68,11 @@ class FetchScheduleWorker : public WorkerThread<FetchScheduleTaskBase*> {
   CacheMngr*       cache;
 
   void cache_hit(ExpertHandler* e, bool is_precise) {
+    profiler->add(is_precise ? TimeProfiler::kHitCnt : TimeProfiler::kPrefetchHitCnt, 1);
     cache->hit(e, is_precise);
   }
   CacheMngr::CacheLineOccupancyWaiter cache_miss(ExpertHandler* e, bool is_precise) {
+    profiler->add(is_precise ? TimeProfiler::kMissCnt : TimeProfiler::kPrefetchMissCnt, 1);
     return cache->miss(e, is_precise);
   }
 

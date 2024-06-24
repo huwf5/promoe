@@ -245,18 +245,42 @@ class CacheStatistics {
 };
 
 class TimeProfiler {
+  struct MetricMeta {
+    bool is_cum = true;
+    bool should_drop_last = false;
+  };
   std::vector<std::vector<uint64_t>> buffer;
   std::vector<std::function<void(TimeProfiler*)>> reporters;
+  std::vector<MetricMeta> metric_metas;
  public:
   enum TimeType {
-    kModelForward = 0,
-    kCntActivatedExpert,
+    kModelForward = 0,   // per forward
+    kCntActivatedExpert, // per forward
+    kHitCnt,  // per forward
+    kMissCnt, // per forward
+    kReadyCnt,   // per forward
+    kUnreadyCnt, // per forward
+    kPrefetchHitCnt,  // per forward
+    kPrefetchMissCnt, // per forward
     kNumTimeType,
   };
   TimeProfiler() {
+    metric_metas.resize(kNumTimeType);
+    metric_metas[ kModelForward       ].is_cum = false; metric_metas[ kModelForward       ].should_drop_last = false;
+    metric_metas[ kCntActivatedExpert ].is_cum = true; metric_metas[ kCntActivatedExpert ].should_drop_last = true;
+    metric_metas[ kHitCnt             ].is_cum = true; metric_metas[ kHitCnt             ].should_drop_last = true;
+    metric_metas[ kMissCnt            ].is_cum = true; metric_metas[ kMissCnt            ].should_drop_last = true;
+    metric_metas[ kReadyCnt           ].is_cum = true; metric_metas[ kReadyCnt           ].should_drop_last = true;
+    metric_metas[ kUnreadyCnt         ].is_cum = true; metric_metas[ kUnreadyCnt         ].should_drop_last = true;
+    metric_metas[ kPrefetchHitCnt     ].is_cum = true; metric_metas[ kPrefetchHitCnt     ].should_drop_last = true;
+    metric_metas[ kPrefetchMissCnt    ].is_cum = true; metric_metas[ kPrefetchMissCnt    ].should_drop_last = true;
     buffer.resize(kNumTimeType);
-    for (auto & b : buffer) {
+    for (int i = 0; i < kNumTimeType; i++) {
+      auto &b = buffer[i];
       b.reserve(10000);
+      if (metric_metas[i].is_cum) {
+        b.push_back(0);
+      }
     }
   }
   ~TimeProfiler() {
@@ -274,7 +298,11 @@ class TimeProfiler {
     buffer[type].back() += dur;
   }
   torch::Tensor to_tensor(TimeType type) {
-    return torch::from_blob(buffer[type].data(), {static_cast<long>(buffer[type].size())}, torch::kLong).clone();
+    auto ret = torch::from_blob(buffer[type].data(), {static_cast<long>(buffer[type].size())}, torch::kLong).clone();
+    if (metric_metas[type].should_drop_last) {
+      ret = ret.index({torch::indexing::Slice(0, -1)});
+    }
+    return ret;
   }
 };
 

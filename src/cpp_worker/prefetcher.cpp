@@ -175,7 +175,6 @@ void PrefetchMngr::preempt_and_launch_one_layer(int layer_idx, torch::Tensor exp
 void PrefetchMngr::report_one_layer(int layer_id, torch::Tensor experts) {
   TRACE_EVENT_GURAD(kHook, "report_one_layer");
   cache_stats->forward();
-  if (layer_id == 0) { profiler->push(TimeProfiler::kCntActivatedExpert, 0); }
   predict_thread->consume_prefetch_layer_progress();
   preempt_and_launch_one_layer(layer_id, experts); // handle reorder, launch precise task, clear prefetch queue
   profiler->add(TimeProfiler::kCntActivatedExpert, experts.numel());
@@ -185,6 +184,15 @@ void PrefetchMngr::one_moe_layer_done(int layer_id) {
   TRACE_EVENT_GURAD(kHook, "one_moe_layer_done");
   if (metas->early_preempt == false) {
     predict_thread->add_prefetch_layer_budget();
+  }
+  if (layer_id == metas->num_layer - 1) {
+    profiler->push(TimeProfiler::kCntActivatedExpert, 0);
+    profiler->push(TimeProfiler::kHitCnt, 0);
+    profiler->push(TimeProfiler::kMissCnt, 0);
+    profiler->push(TimeProfiler::kReadyCnt, 0);
+    profiler->push(TimeProfiler::kUnreadyCnt, 0);
+    profiler->push(TimeProfiler::kPrefetchHitCnt, 0);
+    profiler->push(TimeProfiler::kPrefetchMissCnt, 0);
   }
   if (layer_id == metas->num_layer - 1) {
     predict_thread->add_one_task();
@@ -215,8 +223,10 @@ void PrefetchMngr::wait_expert(int layer_id, int expert_id) {
   auto current_status = expert->expert_status.get();;
   if (current_status == kLaunching) {
     cache_stats->hit();
+    profiler->add(TimeProfiler::kReadyCnt, 1);
   } else {
     cache_stats->miss();
+    profiler->add(TimeProfiler::kUnreadyCnt, 1);
     // todo: add timing of waiting expert ready
     expert->expert_status.wait(kLaunching);
   }
@@ -256,9 +266,9 @@ PrefetchMngr::PrefetchMngr(std::shared_ptr<ModuleMeta> metas,
     // skip first 10 iteration
     tensor = tensor.index({torch::indexing::Slice(this->metas->num_layer * 10)});
     tensor = tensor.mean(0);
-    std::cout << "decode_stage_hit_cnt:"  << tensor[0].item<float>() << std::endl;
-    std::cout << "decode_stage_miss_cnt:" << tensor[1].item<float>() << std::endl;
-    std::cout << "decode_stage_hit_rate:" << tensor[0].item<float>() / (tensor[0].item<float>() + tensor[1].item<float>()) << std::endl;
+    std::cout << "legacy_decode_stage_hit_cnt:"  << tensor[0].item<float>() << std::endl;
+    std::cout << "legacy_decode_stage_miss_cnt:" << tensor[1].item<float>() << std::endl;
+    std::cout << "legacy_decode_stage_hit_rate:" << tensor[0].item<float>() / (tensor[0].item<float>() + tensor[1].item<float>()) << std::endl;
   });
   cache_stats->add_reporter([this](CacheStatistics* stats){
     auto tensor = stats->to_tensor();
@@ -267,22 +277,42 @@ PrefetchMngr::PrefetchMngr(std::shared_ptr<ModuleMeta> metas,
     // skip first 10 iteration
     tensor = tensor.index({torch::indexing::Slice(this->metas->num_layer * 2)});
     tensor = tensor.mean(0);
-    std::cout << "prefill_stage_hit_cnt:"  << tensor[0].item<float>() << std::endl;
-    std::cout << "prefill_stage_miss_cnt:" << tensor[1].item<float>() << std::endl;
-    std::cout << "prefill_stage_hit_rate:" << tensor[0].item<float>() / (tensor[0].item<float>() + tensor[1].item<float>()) << std::endl;
+    std::cout << "legacy_prefill_stage_hit_cnt:"  << tensor[0].item<float>() << std::endl;
+    std::cout << "legacy_prefill_stage_miss_cnt:" << tensor[1].item<float>() << std::endl;
+    std::cout << "legacy_prefill_stage_hit_rate:" << tensor[0].item<float>() / (tensor[0].item<float>() + tensor[1].item<float>()) << std::endl;
   });
   profiler = std::make_shared<TimeProfiler>();
   profiler->add_reporter([this](TimeProfiler *p){
     auto num_used_expert_tensor = p->to_tensor(TimeProfiler::kCntActivatedExpert);
-    auto forward_time_tensor    = p->to_tensor(TimeProfiler::kModelForward);
+    auto idx_is_prefill = num_used_expert_tensor >  (this->metas->num_expert_per_token * this->metas->num_layer);
+    auto idx_is_decode  = num_used_expert_tensor <= (this->metas->num_expert_per_token * this->metas->num_layer);
+    auto lambda_report_one_pair([this, p](
+        TimeProfiler::TimeType on,
+        TimeProfiler::TimeType off,
+        int skip_first, torch::Tensor idx,
+        std::string on_name,
+        std::string off_name,
+        std::string rate_name) {
+      auto on_val  = p->to_tensor(on  ).index({idx}).index({torch::indexing::Slice(skip_first)}).mean(torch::kFloat32).item<float>();
+      auto off_val = p->to_tensor(off ).index({idx}).index({torch::indexing::Slice(skip_first)}).mean(torch::kFloat32).item<float>();
+      std::cout << on_name   << ":" << on_val  << std::endl;
+      std::cout << off_name  << ":" << off_val << std::endl;
+      std::cout << rate_name << ":" << on_val / (on_val + off_val) << std::endl;
+    });
+
+    lambda_report_one_pair(TimeProfiler::kReadyCnt, TimeProfiler::kUnreadyCnt, 10, idx_is_decode,   "decode_stage_ready_cnt",  "decode_stage_unready_cnt",  "decode_stage_ready_rate");
+    lambda_report_one_pair(TimeProfiler::kReadyCnt, TimeProfiler::kUnreadyCnt,  2, idx_is_prefill, "prefill_stage_ready_cnt", "prefill_stage_unready_cnt", "prefill_stage_ready_rate");
+    lambda_report_one_pair(TimeProfiler::kHitCnt, TimeProfiler::kMissCnt, 10, idx_is_decode,   "decode_stage_hit_cnt",  "decode_stage_miss_cnt",  "decode_stage_hit_rate");
+    lambda_report_one_pair(TimeProfiler::kHitCnt, TimeProfiler::kMissCnt,  2, idx_is_prefill, "prefill_stage_hit_cnt", "prefill_stage_miss_cnt", "prefill_stage_hit_rate");
+    lambda_report_one_pair(TimeProfiler::kPrefetchHitCnt, TimeProfiler::kPrefetchMissCnt, 10, idx_is_decode,   "decode_stage_prefetch_hit_cnt",  "decode_stage_prefetch_miss_cnt",  "decode_stage_prefetch_hit_rate");
+    lambda_report_one_pair(TimeProfiler::kPrefetchHitCnt, TimeProfiler::kPrefetchMissCnt,  2, idx_is_prefill, "prefill_stage_prefetch_hit_cnt", "prefill_stage_prefetch_miss_cnt", "prefill_stage_prefetch_hit_rate");
+
     {
-      auto idx = num_used_expert_tensor <= (this->metas->num_expert_per_token * this->metas->num_layer);
-      auto time = forward_time_tensor.index({idx}).index({torch::indexing::Slice(10)});
+      auto time = p->to_tensor(TimeProfiler::kModelForward).index({idx_is_decode}).index({torch::indexing::Slice(10)}); // skip first 10 and last 1iteration
       std::cout << "decode_stage_forward_time:" << time.mean(torch::kFloat32).item() << std::endl;
     }
     {
-      auto idx = num_used_expert_tensor > (this->metas->num_expert_per_token * this->metas->num_layer);
-      auto time = forward_time_tensor.index({idx}).index({torch::indexing::Slice(2)});
+      auto time = p->to_tensor(TimeProfiler::kModelForward).index({idx_is_prefill}).index({torch::indexing::Slice(2)}); // skip first 2 and last 1iteration
       std::cout << "prefill_stage_forward_time:" << time.mean(torch::kFloat32).item() << std::endl;
     }
   });
@@ -388,7 +418,7 @@ void FetchScheduleWorker::do_one_task_impl(FetchDoneTask *_) {
     LOG(TRACE) << "scheduler: all fetch job done for expert " << current_task.toString();
 
     if (current_task.is_precise && metas->reorder_experts == false) {
-      cache_hit(current_task.expert, current_task.is_precise);
+      // cache_hit(current_task.expert, current_task.is_precise);
     }
     current_task.expert->expert_status.transfer(kFetching, current_task.is_precise ? kLaunching : kReady);
   }
