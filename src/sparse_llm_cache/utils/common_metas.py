@@ -36,6 +36,29 @@ class ModelMetas:
       moe_layer_name_filter = RegexFilter(r'.*layers\.([1-9]\d*)\.mlp$')
     )
     return asdict(ret) if return_dict else ret
+  def build_deepseek_moe_simulate(return_dict = True):
+    def parse_moe_layer_id(name):
+      match = re.match(r'.*layers\.(\d+).*', name)
+      if not match:
+        return None
+      return int(match.group(1))
+    def parse_expert_id(name):
+      match = re.match(r'.*layers\.\d+\.experts\.(\d+).*$', name)
+      if not match:
+        return None
+      return int(match.group(1))
+
+    def parse_expert_meta_from_name(name):
+      return (parse_moe_layer_id(name), parse_expert_id(name))
+    ret = ModelMetas(
+      num_moe_layer         = 27,
+      num_expert_per_layer  = 64,
+      num_expert_per_token  = 6,
+      expert_meta_parser    = parse_expert_meta_from_name,
+      expert_name_filter    = RegexFilter(r'.*layers\.(\d+)\.experts\.(\d+)$'),
+      moe_layer_name_filter = RegexFilter(r'.*layers\.(\d+)$')
+    )
+    return asdict(ret) if return_dict else ret
 
   @staticmethod
   def build_qwen_moe(return_dict = True):
@@ -64,8 +87,9 @@ class ModelMetas:
 
 
 predefined_metas = {
-  'deepseek-ai/deepseek-moe-16b-chat' : ModelMetas.build_deepseek_moe,
-  'Qwen/Qwen1.5-MoE-A2.7B-Chat'       : ModelMetas.build_qwen_moe,
+  'deepseek-ai/deepseek-moe-16b-chat'          : ModelMetas.build_deepseek_moe,
+  'deepseek-ai/deepseek-moe-16b-chat-simulate' : ModelMetas.build_deepseek_moe_simulate,
+  'Qwen/Qwen1.5-MoE-A2.7B-Chat'                : ModelMetas.build_qwen_moe,
 }
 
 def auto_infer_model_metas(model_id, return_dict = True):
