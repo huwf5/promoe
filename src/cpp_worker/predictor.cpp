@@ -6,11 +6,15 @@
 
 void Predictor::add_one_layer(int layer_id, int64_t *experts, size_t num_expert) {
   for (int i = 0; i < num_expert; i++) {
-    expert_access_buffer[layer_id][experts[i]] = 1;
+    expert_access_buffer[layer_id][experts[i]] += 1;
   }
 }
 torch::Tensor Predictor::predict() {
   TRACE_EVENT_GURAD(kPredictor, "predict");
+  if (metas->predict_input_mode == kDecodeCumsum) {
+    this->expert_access_buffer /= this->expert_access_buffer.sum(1, true);
+    this->expert_access_buffer = this->expert_access_buffer.nan_to_num(0);
+  }
   std::vector<torch::jit::IValue> inputs{this->expert_access_buffer.flatten().unsqueeze(0)};
   return predict_model.forward(inputs).toTensor();
 }

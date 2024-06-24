@@ -40,7 +40,9 @@ void PredictWorker::do_one_task_impl() {
       sem_post(&prefetch_layer_progress);
     }
   }
-  predictor->clear_access_buffer();
+  if (metas->predict_input_mode == kOneToken) {
+    predictor->clear_access_buffer();
+  }
 }
 void ExpertUnlockWorker::do_one_task_impl(ExpertHandler *task) {
   TRACE_EVENT_GURAD(kUnlocker, "unlock:" + task->toString());

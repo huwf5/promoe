@@ -117,6 +117,8 @@ def inject_model(
     enable_model_timer : bool = False,
     trace_event : bool = False,
     cache_trace_path : str = None,
+    predictor_model_path : str = None,
+    predict_input_mode = None,
   ):
   """
   Injects a model with cache-related functionality.
@@ -180,6 +182,9 @@ def inject_model(
     else:
       cache_len = round(cache_rate * num_moe_layer * num_expert_per_layer)
 
+  if predict_input_mode is None:
+    predict_input_mode = 'one_token'
+
   meta = cpp_worker.ModuleMeta(num_moe_layer, num_expert_per_layer)
 
   def find_first_expert(model, filter):
@@ -200,6 +205,10 @@ def inject_model(
   meta.reorder_experts = reorder_experts
   meta.promote_hit_in_prefetch = promote_hit_in_prefetch
   meta.early_preempt = early_preempt
+  meta.predict_input_mode = {
+    'one_token': cpp_worker.kOneToken,
+    'decode_cumsum': cpp_worker.kDecodeCumsum,
+  }[predict_input_mode]
 
   model_loader  = cpp_worker.ModelLoader(meta)
   predictor     = cpp_worker.Predictor(meta)
@@ -213,7 +222,9 @@ def inject_model(
   replace_mlp_report_experts(model, prefetch_mngr, predictor, num_moe_layer, num_expert_per_layer, num_predict_expert_per_layer, moe_layer_name_filter)
 
   # fixme: a general model path
-  predictor.load_model(f"/nvme/songxiaoniu/moe/moe-predict-models/{repo_folder_name(repo_id = model_id)}.pt")
+  if predictor_model_path == None:
+    predictor_model_path = f"/nvme/songxiaoniu/moe/moe-predict-models/{repo_folder_name(repo_id = model_id)}.pt"
+  predictor.load_model(predictor_model_path)
   prefetch_mngr.init_gpu_mem_buffer(cache_len)
 
   if meta.cache_policy == 'min':

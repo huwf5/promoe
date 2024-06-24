@@ -105,7 +105,10 @@ class AtomicQueueLock {
   // bool is_locked() {}
 };
 
-
+enum PredictInputMode {
+  kOneToken = 0,
+  kDecodeCumsum,
+};
 
 class ModuleMeta {
   // std::unordered_map<std::string, std::pair<int,int>> module_name_to_expert_idx;
@@ -123,6 +126,7 @@ class ModuleMeta {
   bool promote_hit_in_prefetch = true;
   bool early_preempt = true;
   std::string cache_policy = "fifo";
+  PredictInputMode predict_input_mode = kOneToken;
 
   bool can_do_layer(int cur_preempted_layer, int target_layer) {
     // (cur_preempted_layer, cur_preempted_layer + max_prefetch_layer_distance]

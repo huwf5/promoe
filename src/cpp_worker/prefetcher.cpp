@@ -329,6 +329,7 @@ void PrefetchMngr::record_then_predict_and_prefetch(int layer_id, torch::Tensor 
     predictor->add_one_layer(layer_id, experts);
   } else {
     LOG(TRACE) << "identified prefill iteration, skip adding it to prefill " << experts.numel();
+    predictor->clear_access_buffer();
   }
   // if (layer_id == metas->num_layer - 1) {
   //   predict_thread->add_one_task();

@@ -21,6 +21,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     .def_readwrite("reorder_experts",              &ModuleMeta::reorder_experts)
     .def_readwrite("promote_hit_in_prefetch",      &ModuleMeta::promote_hit_in_prefetch)
     .def_readwrite("early_preempt",                &ModuleMeta::early_preempt)
+    .def_readwrite("predict_input_mode",           &ModuleMeta::predict_input_mode)
     .def("init_param_list", &ModuleMeta::init_param_list)
   ;
 
@@ -92,6 +93,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     .value("kHook",           ThreadType::kHook)
     .value("kFetchScheduler", ThreadType::kFetchScheduler)
     .value("kGPU",            ThreadType::kGPU)
+    .export_values();
+
+  py::enum_<PredictInputMode>(m, "PredictInputMode")
+    .value("kOneToken",     PredictInputMode::kOneToken)
+    .value("kDecodeCumsum", PredictInputMode::kDecodeCumsum)
     .export_values();
 
   py::enum_<TimeProfiler::TimeType>(m, "TimeType")
