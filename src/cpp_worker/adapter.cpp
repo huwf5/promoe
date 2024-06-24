@@ -43,6 +43,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     // .def("add_one_expert", &ModelLoader::add_one_expert)
   ;
 
+  py::class_<CacheMngr, std::shared_ptr<CacheMngr>>(m, "CacheMngr")
+    .def("set_cur_seq",       &CacheMngr::set_cur_seq)
+    .def_readwrite("cache_oracle", &CacheMngr::cache_oracle)
+  ;
+
+  py::class_<CacheOracle, std::shared_ptr<CacheOracle>>(m, "CacheOracle")
+    .def("load_from_file",       &CacheOracle::load_from_file)
+  ;
+
   py::class_<PrefetchMngr, std::shared_ptr<PrefetchMngr>>(m, "PrefetchMngr")
     .def(py::init<std::shared_ptr<ModuleMeta>, std::shared_ptr<ModelLoader>, std::shared_ptr<Predictor>>())
     .def("launch_thread",       &PrefetchMngr::launch_thread)
@@ -55,6 +64,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     .def("build_timer",         &PrefetchMngr::build_timer)
     .def_readwrite("cache_stats", &PrefetchMngr::cache_stats)
     .def_readwrite("profiler",    &PrefetchMngr::profiler)
+    .def_readwrite("cache",       &PrefetchMngr::cache)
   ;
 
   py::class_<TraceEventGuard, std::shared_ptr<TraceEventGuard>>(m, "TraceEventGuard")

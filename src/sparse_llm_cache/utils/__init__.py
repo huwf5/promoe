@@ -116,6 +116,7 @@ def inject_model(
     module_trace_event : bool = False,
     enable_model_timer : bool = False,
     trace_event : bool = False,
+    cache_trace_path : str = None,
   ):
   """
   Injects a model with cache-related functionality.
@@ -180,7 +181,17 @@ def inject_model(
       cache_len = round(cache_rate * num_moe_layer * num_expert_per_layer)
 
   meta = cpp_worker.ModuleMeta(num_moe_layer, num_expert_per_layer)
-  meta.init_param_list([k for k,_ in model.model.layers[1].mlp.experts[0].named_parameters()])
+
+  def find_first_expert(model, filter):
+    first_expert_module = [None]
+    def f(module, name):
+      if first_expert_module[0] is None:
+        first_expert_module[0] = module
+    recursive_traverse_childrens(model, f, filter)
+    return first_expert_module[0]
+  first_expert = find_first_expert(model, expert_name_filter)
+  meta.init_param_list([k for k,_ in first_expert.named_parameters()])
+
   meta.num_predict_expert_per_layer = num_predict_expert_per_layer
   meta.max_prefetch_layer_distance = max_prefetch_layer_distance
   meta.num_expert_per_token = num_expert_per_token
@@ -204,6 +215,9 @@ def inject_model(
   # fixme: a general model path
   predictor.load_model(f"/nvme/songxiaoniu/moe/moe-predict-models/{repo_folder_name(repo_id = model_id)}.pt")
   prefetch_mngr.init_gpu_mem_buffer(cache_len)
+
+  if meta.cache_policy == 'min':
+    prefetch_mngr.cache.cache_oracle.load_from_file(cache_trace_path)
 
   add_hook_to_experts(model, prefetch_mngr, expert_name_filter)
   add_hook_to_moe_layers(model, prefetch_mngr, moe_layer_name_filter)

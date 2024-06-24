@@ -1,3 +1,5 @@
+#include <nlohmann/json.hpp>
+#include <fstream>
 #include "cache.hpp"
 #include "logging.hpp"
 #include "profiler.hpp"
@@ -39,7 +41,11 @@ CacheMngr::CacheMngr(std::shared_ptr<ModuleMeta> metas,
 
   if (metas->cache_policy == "nn") {
     this->priority_get_fn = [this](ExpertHandler* e) ->float { return this->priority.index({e->layer_idx, e->expert_idx}).item<float>(); };
-    this->priority_set_fn = [this](ExpertHandler* e, float p)  { this->priority.index_put_({e->layer_idx, e->expert_idx}, max_priority); };
+    this->priority_set_fn = [this](ExpertHandler* e, float p)  { this->priority.index_put_({e->layer_idx, e->expert_idx}, p); };
+  }
+  if (metas->cache_policy == "min") {
+    this->cache_oracle = std::make_shared<CacheOracle>();
+    cache_oracle->init(metas.get(), model_loader.get());
   }
 
   policy_factory.register_policy("fifo", [this]() -> std::shared_ptr<CachePolicy>{ return std::make_shared<CachePolicyFIFO>(this); });
@@ -47,6 +53,11 @@ CacheMngr::CacheMngr(std::shared_ptr<ModuleMeta> metas,
   policy_factory.register_policy("nn",   [this]() -> std::shared_ptr<CachePolicy>{ 
     auto ret = std::make_shared<CachePolicyNN>(this);
     ret->priority_fn = this->priority_get_fn;
+    return ret;
+  });
+  policy_factory.register_policy("min", [this]()->std::shared_ptr<CachePolicy>{
+    auto ret = std::make_shared<CachePolicyMIN>(this);
+    ret->oracle = this->cache_oracle.get();
     return ret;
   });
 
@@ -243,4 +254,105 @@ void CacheMngr::update_all_priority(torch::Tensor p) {
       logger << "slot " << s << ":" << cache_slots->slots[s].policy->toString() << "\n";
     }
   });
+}
+void CacheOracle::load_from_file(std::string file_path) {
+  std::ifstream trace_file(file_path);
+  nlohmann::json all_traces = nlohmann::json::parse(trace_file);
+  for (auto &el : all_traces.items()) {
+    uint64_t seq_id = std::stoull(el.key());
+    auto & seq_trace = el.value();
+    this->sequence_oracles[seq_id] = SequenceOracle();
+    auto & seq_oracle = this->sequence_oracles[seq_id];
+    uint64_t prompt_len = seq_trace["prompt_len"].get<uint64_t>();
+    uint64_t reply_len = seq_trace["0"].size() - prompt_len;
+    // prompt
+    int64_t time = 0;
+    for (int layer_idx = 0; layer_idx < metas->num_layer; layer_idx++) {
+      auto &layer_trace = seq_trace[std::to_string(layer_idx)];
+      std::set<int> expert_idx_set;
+      for (int prompt_token_idx = 0; prompt_token_idx < prompt_len; prompt_token_idx++) {
+        auto &expert_idx_list = layer_trace[std::to_string(prompt_token_idx)];
+        for (auto &expert_idx : expert_idx_list) {
+          auto expert_idx_int = expert_idx.get<int>();
+          expert_idx_set.insert(expert_idx_int);
+        }
+      }
+      for (auto &expert_idx : expert_idx_set) {
+        auto e = model_loader->get_source(layer_idx, expert_idx);
+        if (seq_oracle.expert_oracles.find(e) == seq_oracle.expert_oracles.end()) {
+          seq_oracle.expert_oracles[e] = ExpertOracle();
+        }
+        seq_oracle.expert_oracles[e].use_times.push_back(time);
+        time += 1;
+      }
+    }
+    // reply
+    for (int reply_token_idx = 0; reply_token_idx < reply_len; reply_token_idx++) {
+      for (int layer_idx = 0; layer_idx < metas->num_layer; layer_idx++) {
+        auto &layer_trace = seq_trace[std::to_string(layer_idx)];
+        auto &expert_idx_list = layer_trace[std::to_string(reply_token_idx + prompt_len)];
+
+        for (auto &expert_idx : expert_idx_list) {
+          auto expert_idx_int = expert_idx.get<int>();
+          auto e = model_loader->get_source(layer_idx, expert_idx_int);
+          if (seq_oracle.expert_oracles.find(e) == seq_oracle.expert_oracles.end()) {
+            seq_oracle.expert_oracles[e] = ExpertOracle();
+          }
+          seq_oracle.expert_oracles[e].use_times.push_back(time);
+          time += 1;
+        }
+      }
+    }
+    for (int l = 0; l < metas->num_layer; l++) {
+      for (int e = 0; e < metas->num_expert; e++) {
+        auto expert = model_loader->get_source(l, e);
+        if (seq_oracle.expert_oracles.find(expert) == seq_oracle.expert_oracles.end()) {
+          seq_oracle.expert_oracles[expert] = ExpertOracle();
+        }
+        seq_oracle.expert_oracles[expert].use_times.push_back(std::numeric_limits<int64_t>::max());
+      }
+    }
+  }
+}
+void CachePolicyMIN::access_on_hit(ExpertHandler *e) {
+  auto &oracle = current_sequence->expert_oracles[e];
+  if (next_use_time_idx.find(e) == next_use_time_idx.end()) {
+    next_use_time_idx[e] = 0;
+  }
+  auto &use_time_idx = next_use_time_idx[e];
+  CHECK(use_time_idx < oracle.use_times.size());
+  CHECK(current_time < oracle.use_times[use_time_idx]);
+  LOG(TRACE) << "current time from " << current_time << " to " << oracle.use_times[use_time_idx];
+  current_time = oracle.use_times[use_time_idx];
+  use_time_idx++;
+
+  auto priority = -oracle.use_times[use_time_idx];
+  heap.update_priority(map[e], priority);
+}
+void CachePolicyMIN::access_on_miss(ExpertHandler *e) {
+  auto &oracle = current_sequence->expert_oracles[e];
+  if (next_use_time_idx.find(e) == next_use_time_idx.end()) {
+    next_use_time_idx[e] = 0;
+  }
+  auto &use_time_idx = next_use_time_idx[e];
+  CHECK(use_time_idx < oracle.use_times.size());
+  CHECK(current_time < oracle.use_times[use_time_idx]);
+  LOG(TRACE) << "current time from " << current_time << " to " << oracle.use_times[use_time_idx];
+  current_time = oracle.use_times[use_time_idx];
+  use_time_idx++;
+
+  auto priority = -oracle.use_times[use_time_idx];
+
+  CHECK(map.find(e) == map.end());
+  Heap::Node *n = nullptr;
+  if (heap_node_free_buffer.empty()) {
+    n = new Heap::Node;
+  } else {
+    n = heap_node_free_buffer.back();
+    heap_node_free_buffer.pop_back();
+  }
+  map[e] = n;
+  n->data = e;
+  n->priority = priority;
+  heap.push(n);
 }
