@@ -96,8 +96,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     .export_values();
 
   py::enum_<PredictInputMode>(m, "PredictInputMode")
-    .value("kOneToken",     PredictInputMode::kOneToken)
-    .value("kDecodeCumsum", PredictInputMode::kDecodeCumsum)
+    .value("kOneToken",            PredictInputMode::kOneToken)
+    .value("kDecodeCumsum",        PredictInputMode::kDecodeCumsum)
+    .value("kLastUseDistance",     PredictInputMode::kLastUseDistance)
+    .value("kWeighedDecodeCumsum", PredictInputMode::kWeighedDecodeCumsum)
     .export_values();
 
   py::enum_<TimeProfiler::TimeType>(m, "TimeType")

@@ -127,7 +127,8 @@ void CacheMngr::hit(ExpertHandler *expert, bool is_precise) {
   auto cache_slot = cache_slots->to_slot(expert);
   handle_hit(expert);
   cache_slot->policy->access_on_hit(expert);
-  if (is_precise && metas->predict_input_mode == kOneToken) {
+  // if (is_precise && metas->predict_input_mode == kOneToken) {
+  if (is_precise) {
     max_priority += 1;
     cache_slot->policy->update_priority(expert, max_priority);
     this->priority_set_fn(expert, max_priority);
@@ -138,7 +139,8 @@ CacheMngr::CacheLineOccupancyWaiter CacheMngr::miss(ExpertHandler *incoming_e, b
   TRACE_EVENT_GURAD(kCache, "miss:" + incoming_e->toString());
   LOG(TRACE) << "cache miss " << incoming_e->toString();
   auto cache_slot = cache_slots->to_slot(incoming_e);
-  if (is_precise && metas->predict_input_mode == kOneToken) {
+  // if (is_precise && metas->predict_input_mode == kOneToken) {
+  if (is_precise) {
     max_priority += 1;
     this->priority_set_fn(incoming_e, max_priority);
   }

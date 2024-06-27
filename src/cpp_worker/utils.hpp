@@ -108,6 +108,8 @@ class AtomicQueueLock {
 enum PredictInputMode {
   kOneToken = 0,
   kDecodeCumsum,
+  kLastUseDistance,
+  kWeighedDecodeCumsum,
 };
 
 class ModuleMeta {
@@ -127,6 +129,8 @@ class ModuleMeta {
   bool early_preempt = true;
   std::string cache_policy = "fifo";
   PredictInputMode predict_input_mode = kOneToken;
+  int predict_input_reuse_distance_max = 10;
+  int predict_input_decay = 2;
 
   bool can_do_layer(int cur_preempted_layer, int target_layer) {
     // (cur_preempted_layer, cur_preempted_layer + max_prefetch_layer_distance]

@@ -208,6 +208,8 @@ def inject_model(
   meta.predict_input_mode = {
     'one_token': cpp_worker.kOneToken,
     'decode_cumsum': cpp_worker.kDecodeCumsum,
+    'last_use_distance': cpp_worker.kLastUseDistance,
+    'weighted_decode_cumsum': cpp_worker.kWeighedDecodeCumsum,
   }[predict_input_mode]
 
   model_loader  = cpp_worker.ModelLoader(meta)

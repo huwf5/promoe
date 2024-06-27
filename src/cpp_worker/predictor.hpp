@@ -7,9 +7,13 @@ class Predictor {
   torch::jit::script::Module predict_model;
   // single sequence for now
   torch::Tensor expert_access_buffer;
+  torch::Tensor last_use_distance_buffer;
+  torch::Tensor weighted_access_freq_sum_buffer;
   void init_expert_access_buffer() {
     auto options = torch::TensorOptions().dtype(torch::kFloat32);
     expert_access_buffer = torch::zeros({metas->num_layer, metas->num_expert}, options);
+    last_use_distance_buffer = torch::zeros({metas->num_layer, metas->num_expert}, options);
+    weighted_access_freq_sum_buffer = torch::zeros({metas->num_layer, metas->num_expert}, options);
   }
 
  public:
@@ -24,5 +28,7 @@ class Predictor {
   void add_one_layer(int layer_id, int64_t *experts, size_t num_expert);
   void clear_access_buffer() {
     expert_access_buffer.fill_(0);
+    last_use_distance_buffer.fill_(0);
+    weighted_access_freq_sum_buffer.fill_(0);
   }
 };
