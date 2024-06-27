@@ -11,6 +11,8 @@ my_app.config_dict = {
   'reorder_experts'              : OptionCmdLine('reorder_experts'),
   'early_preempt'                : OptionCmdLine('early_preempt'),
   'max_prefetch_layer_distance'  : OptionCmdLine('max_prefetch_layer_distance'),
+  'predict_input_mode'           : OptionCmdLine('predict_input_mode'),
+  'predictor_model_path'         : OptionCmdLine('predictor_model_path', readable_name=False, logname=False),
 }
 my_app.result_dict = {
   'decode_stage_forward_time'  : ResultFloat('decode_stage_forward_time'),
