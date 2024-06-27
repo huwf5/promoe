@@ -265,6 +265,15 @@ void CacheOracle::load_from_file(std::string file_path) {
     auto & seq_trace = el.value();
     this->sequence_oracles[seq_id] = SequenceOracle();
     auto & seq_oracle = this->sequence_oracles[seq_id];
+
+
+    for (int l = 0; l < metas->num_layer; l++) {
+      for (int e = 0; e < metas->num_expert; e++) {
+        auto expert = model_loader->get_source(l, e);
+        seq_oracle.expert_oracles[expert] = ExpertOracle();
+      }
+    }
+
     uint64_t prompt_len = seq_trace["prompt_len"].get<uint64_t>();
     uint64_t reply_len = seq_trace["0"].size() - prompt_len;
     // prompt
@@ -281,12 +290,9 @@ void CacheOracle::load_from_file(std::string file_path) {
       }
       for (auto &expert_idx : expert_idx_set) {
         auto e = model_loader->get_source(layer_idx, expert_idx);
-        if (seq_oracle.expert_oracles.find(e) == seq_oracle.expert_oracles.end()) {
-          seq_oracle.expert_oracles[e] = ExpertOracle();
-        }
         seq_oracle.expert_oracles[e].use_times.push_back(time);
-        time += 1;
       }
+      time += 1;
     }
     // reply
     for (int reply_token_idx = 0; reply_token_idx < reply_len; reply_token_idx++) {
@@ -297,20 +303,14 @@ void CacheOracle::load_from_file(std::string file_path) {
         for (auto &expert_idx : expert_idx_list) {
           auto expert_idx_int = expert_idx.get<int>();
           auto e = model_loader->get_source(layer_idx, expert_idx_int);
-          if (seq_oracle.expert_oracles.find(e) == seq_oracle.expert_oracles.end()) {
-            seq_oracle.expert_oracles[e] = ExpertOracle();
-          }
           seq_oracle.expert_oracles[e].use_times.push_back(time);
-          time += 1;
         }
+        time += 1;
       }
     }
     for (int l = 0; l < metas->num_layer; l++) {
       for (int e = 0; e < metas->num_expert; e++) {
         auto expert = model_loader->get_source(l, e);
-        if (seq_oracle.expert_oracles.find(expert) == seq_oracle.expert_oracles.end()) {
-          seq_oracle.expert_oracles[expert] = ExpertOracle();
-        }
         seq_oracle.expert_oracles[expert].use_times.push_back(std::numeric_limits<int64_t>::max());
       }
     }
@@ -323,7 +323,7 @@ void CachePolicyMIN::access_on_hit(ExpertHandler *e) {
   }
   auto &use_time_idx = next_use_time_idx[e];
   CHECK(use_time_idx < oracle.use_times.size());
-  CHECK(current_time < oracle.use_times[use_time_idx]);
+  CHECK(current_time <= oracle.use_times[use_time_idx]);
   LOG(TRACE) << "current time from " << current_time << " to " << oracle.use_times[use_time_idx];
   current_time = oracle.use_times[use_time_idx];
   use_time_idx++;
@@ -338,7 +338,7 @@ void CachePolicyMIN::access_on_miss(ExpertHandler *e) {
   }
   auto &use_time_idx = next_use_time_idx[e];
   CHECK(use_time_idx < oracle.use_times.size());
-  CHECK(current_time < oracle.use_times[use_time_idx]);
+  CHECK(current_time <= oracle.use_times[use_time_idx]);
   LOG(TRACE) << "current time from " << current_time << " to " << oracle.use_times[use_time_idx];
   current_time = oracle.use_times[use_time_idx];
   use_time_idx++;
