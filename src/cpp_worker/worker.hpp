@@ -150,12 +150,13 @@ class PredictWorker : public WorkerThread<void> {
     sem_init(&prefetch_layer_budget, 0, metas->max_prefetch_layer_distance);
     sem_init(&prefetch_layer_progress, 0, 0); 
   }
-  void add_prefetch_layer_budget() {
-    sem_post(&prefetch_layer_budget);
-  }
+  void add_prefetch_layer_budget();
   void consume_prefetch_layer_progress() {
     sem_wait(&prefetch_layer_progress);
   }
- protected:
+  void on_one_iter_done();
+  void on_moe_attn_input_logits_recorded(int layer_id);
+
+protected:
   void do_one_task_impl() override;
 };

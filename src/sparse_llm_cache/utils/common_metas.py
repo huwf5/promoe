@@ -10,6 +10,7 @@ class ModelMetas:
   num_expert_per_token: int
   expert_meta_parser: callable
   expert_name_filter: callable
+  moe_attn_name_filter: callable
   moe_layer_name_filter: callable
 
   @staticmethod
@@ -33,6 +34,7 @@ class ModelMetas:
       num_expert_per_token  = 6,
       expert_meta_parser    = parse_expert_meta_from_name,
       expert_name_filter    = RegexFilter(r'.*layers\.(\d+)\.mlp\.experts\.(\d+)$'),
+      moe_attn_name_filter  = RegexFilter(r'.*layers\.([1-9]\d*)\.self_attn$'),
       moe_layer_name_filter = RegexFilter(r'.*layers\.([1-9]\d*)\.mlp$')
     )
     return asdict(ret) if return_dict else ret
@@ -56,6 +58,7 @@ class ModelMetas:
       num_expert_per_token  = 6,
       expert_meta_parser    = parse_expert_meta_from_name,
       expert_name_filter    = RegexFilter(r'.*layers\.(\d+)\.experts\.(\d+)$'),
+      moe_attn_name_filter  = RegexFilter(r'.*layers\.([1-9]\d*)\.self_attn$'),
       moe_layer_name_filter = RegexFilter(r'.*layers\.(\d+)$')
     )
     return asdict(ret) if return_dict else ret
@@ -81,6 +84,7 @@ class ModelMetas:
       num_expert_per_token  = 4,
       expert_meta_parser    = parse_expert_meta_from_name,
       expert_name_filter    = RegexFilter(r'.*layers\.(\d+)\.mlp\.experts\.(\d+)$'),
+      moe_attn_name_filter  = None,
       moe_layer_name_filter = RegexFilter(r'.*layers\.([0-9]\d*)\.mlp$')
     )
     return asdict(ret) if return_dict else ret

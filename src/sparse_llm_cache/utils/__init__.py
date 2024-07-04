@@ -66,6 +66,13 @@ def add_hook_to_experts(model, prefetch_mngr, filter=RegexFilter(r'.*layers\.(\d
     hooks.add_hook_to_module(module, hook)
   recursive_traverse_childrens(model, f, filter)
 
+def add_hook_to_moe_attns(model, prefetch_mngr, filter):
+  hook = MoEAttnHook(prefetch_mngr)
+  def f(module, name):
+    # print(f'adding hook to {name}')
+    hooks.add_hook_to_module(module, hook)
+  recursive_traverse_childrens(model, f, filter)
+
 def add_hook_to_moe_layers(model, prefetch_mngr, filter):
   hook = MoeLayerHook(prefetch_mngr)
   def f(module, name):
@@ -173,6 +180,7 @@ def inject_model(
     expert_meta_parser    = auto_infered_model_metas.expert_meta_parser
     expert_name_filter    = auto_infered_model_metas.expert_name_filter
     moe_layer_name_filter = auto_infered_model_metas.moe_layer_name_filter
+    moe_attn_name_filter  = auto_infered_model_metas.moe_attn_name_filter
 
   if max_prefetch_layer_distance is None or max_prefetch_layer_distance == -1:
     max_prefetch_layer_distance = num_moe_layer - 1
@@ -210,6 +218,7 @@ def inject_model(
     'decode_cumsum': cpp_worker.kDecodeCumsum,
     'last_use_distance': cpp_worker.kLastUseDistance,
     'weighted_decode_cumsum': cpp_worker.kWeighedDecodeCumsum,
+    'first_moe_attn_input_logits': cpp_worker.kFirstMoeAttnInputLogits,
   }[predict_input_mode]
 
   model_loader  = cpp_worker.ModelLoader(meta)
@@ -233,6 +242,7 @@ def inject_model(
     prefetch_mngr.cache.cache_oracle.load_from_file(cache_trace_path)
 
   add_hook_to_experts(model, prefetch_mngr, expert_name_filter)
+  add_hook_to_moe_attns(model, prefetch_mngr, moe_attn_name_filter)
   add_hook_to_moe_layers(model, prefetch_mngr, moe_layer_name_filter)
 
   if trace_event:

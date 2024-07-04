@@ -170,6 +170,20 @@ def remove_hook_from_module(module: torch.nn.Module, recurse=False):
 
     return module
 
+class MoEAttnHook(ModelHook):
+  def __init__(self, prefetch_mngr):
+    self.prefetch_mngr = prefetch_mngr
+    pass
+  def pre_forward(self, module, *args, **kwargs):
+    # self.prefetch_mngr.report_one_expert(module._layer_id, module._expert_id)
+    self.prefetch_mngr.report_moe_attn_logits(module._layer_id, kwargs['hidden_states'])
+    return args, kwargs
+#   def post_forward(self, module, output):
+#     # self.prefetch_mngr.one_expert_done(module._layer_id, module._expert_id)
+#     return output
+  # def detach_hook(self, module):
+  #   return super().detach_hook(module)
+
 class ExpertHook(ModelHook):
   def __init__(self, prefetch_mngr):
     self.prefetch_mngr = prefetch_mngr

@@ -5,32 +5,99 @@
 #include "profiler.hpp"
 
 void Predictor::add_one_layer(int layer_id, int64_t *experts, size_t num_expert) {
-  last_use_distance_buffer[layer_id] += 1;
-  weighted_access_freq_sum_buffer[layer_id] /= metas->predict_input_decay;
-  for (int i = 0; i < num_expert; i++) {
-    expert_access_buffer[layer_id][experts[i]] += 1;
-    last_use_distance_buffer[layer_id][experts[i]] = 0;
-    weighted_access_freq_sum_buffer[layer_id][experts[i]] += 1;
+  switch (metas->predict_input_mode) {
+    case kOneToken:                 {
+      for (int i = 0; i < num_expert; i++) {
+        expert_access_buffer[layer_id][experts[i]] += 1;
+      }
+      break;
+    }
+    case kDecodeCumsum:             {
+      for (int i = 0; i < num_expert; i++) {
+        expert_access_buffer[layer_id][experts[i]] += 1;
+      }
+      break;
+    }
+    case kLastUseDistance:          { 
+      last_use_distance_buffer[layer_id] += 1;
+      for (int i = 0; i < num_expert; i++) {
+        last_use_distance_buffer[layer_id][experts[i]] = 0;
+      }
+      break;
+    }
+    case kWeighedDecodeCumsum:      {
+      weighted_access_freq_sum_buffer[layer_id] /= metas->predict_input_decay;
+      for (int i = 0; i < num_expert; i++) {
+        weighted_access_freq_sum_buffer[layer_id][experts[i]] += 1;
+      }
+      break;
+    }
+    case kFirstMoeAttnInputLogits : { 
+      break;
+    }
+    default : { CHECK(false) << "Unknown predict input mode"; }
   }
 }
 torch::Tensor Predictor::predict() {
   TRACE_EVENT_GURAD(kPredictor, "predict");
-  torch::Tensor input = this->expert_access_buffer.clone();
-  if (metas->predict_input_mode == kDecodeCumsum) {
-    auto s = input.sum(1, true);
-    input /= s;
-    input = input.nan_to_num(0);
-  } else if (metas->predict_input_mode == kLastUseDistance) {
-    input = this->last_use_distance_buffer.clone();
-    // predict xxx
-    input = torch::max(
-      torch::ones_like(input) * metas->predict_input_reuse_distance_max - input,
-      torch::zeros_like(input)
-    );
-    input /= metas->predict_input_reuse_distance_max;
-  } else if (metas->predict_input_mode == kWeighedDecodeCumsum) {
-    input = this->weighted_access_freq_sum_buffer.clone();
+  LOG(DEBUG) << "predictor, predict";
+  torch::Tensor input;
+  switch (metas->predict_input_mode) {
+    case kOneToken: { 
+      input = this->expert_access_buffer.clone();
+      break;
+    }
+    case kDecodeCumsum: {
+      input = this->expert_access_buffer.clone();
+      auto s = input.sum(1, true);
+      input /= s;
+      input = input.nan_to_num(0);
+      break;
+    }
+    case kLastUseDistance: {
+      input = this->last_use_distance_buffer.clone();
+      input = torch::max(
+        torch::ones_like(input) * metas->predict_input_reuse_distance_max - input,
+        torch::zeros_like(input)
+      );
+      input /= metas->predict_input_reuse_distance_max;
+      break;
+    }
+    case kWeighedDecodeCumsum: {
+      input = this->weighted_access_freq_sum_buffer.clone();
+      break;
+    }
+    case kFirstMoeAttnInputLogits: {
+      if (this->first_moe_attn_input_logits_buffer.numel() == 0) {
+        LOG(DEBUG) << "skip prediction due to prefill";
+        return torch::empty({metas->num_layer, 0}, torch::kFloat32);
+      } else {
+        LOG_BLOCK(DEBUG, logger, {
+          logger << "predictor, predict with input shape " 
+                 << this->first_moe_attn_input_logits_buffer.sizes() 
+                 << " " 
+                 << this->first_moe_attn_input_logits_buffer.numel();
+        });
+      }
+      input = this->first_moe_attn_input_logits_buffer.clone().to(torch::kFloat32);
+      break;
+    }
   }
+  // if (metas->predict_input_mode == kDecodeCumsum) {
+  //   auto s = input.sum(1, true);
+  //   input /= s;
+  //   input = input.nan_to_num(0);
+  // } else if (metas->predict_input_mode == kLastUseDistance) {
+  //   input = this->last_use_distance_buffer.clone();
+  //   // predict xxx
+  //   input = torch::max(
+  //     torch::ones_like(input) * metas->predict_input_reuse_distance_max - input,
+  //     torch::zeros_like(input)
+  //   );
+  //   input /= metas->predict_input_reuse_distance_max;
+  // } else if (metas->predict_input_mode == kWeighedDecodeCumsum) {
+  //   input = this->weighted_access_freq_sum_buffer.clone();
+  // }
   std::vector<torch::jit::IValue> inputs{input.flatten().unsqueeze(0)};
   return predict_model.forward(inputs).toTensor();
 }
@@ -41,4 +108,54 @@ void Predictor::load_model(std::string model_path) {
 }
 void Predictor::add_one_layer(int layer_id, torch::Tensor experts) {
   add_one_layer(layer_id, experts.data_ptr<int64_t>(), experts.numel());
+}
+void Predictor::start_of_new_sequence() {
+  LOG(DEBUG) << "predictor, start_of_new_sequence";
+  switch (metas->predict_input_mode) {
+    case kOneToken:                { break; }
+    case kDecodeCumsum:            { expert_access_buffer.fill_(0); break; }
+    case kLastUseDistance:         { last_use_distance_buffer.fill_(0); break; }
+    case kWeighedDecodeCumsum:     { weighted_access_freq_sum_buffer.fill_(0); break; }
+    case kFirstMoeAttnInputLogits: { break; }
+    default: {
+      CHECK(false) << "Unknown predict input mode";
+    }
+  }
+}
+void Predictor::end_of_one_token_prediction() {
+  LOG(DEBUG) << "predictor, end_of_one_token_prediction";
+  switch (metas->predict_input_mode) {
+    case kOneToken:                { expert_access_buffer.fill_(0); break;}
+    case kDecodeCumsum:            { break;}
+    case kLastUseDistance:         { break;}
+    case kWeighedDecodeCumsum:     { break;}
+    case kFirstMoeAttnInputLogits: { break;}
+    default: {
+      CHECK(false) << "Unknown predict input mode";
+    }
+  }
+}
+void Predictor::record_moe_attn_logits(int layer_id, torch::Tensor attn_logits) {
+  LOG(DEBUG) << "predictor, record_moe_attn_logits " << layer_id;
+  switch (metas->predict_input_mode) {
+    case kOneToken:            { break; }
+    case kDecodeCumsum:        { break; }
+    case kLastUseDistance:     { break; }
+    case kWeighedDecodeCumsum: { break; }
+    case kFirstMoeAttnInputLogits: {
+      if (layer_id == 0) {
+        if (attn_logits.numel() == attn_logits.size(-1)) {
+          LOG(DEBUG) << "predictor, record attn logits";
+          first_moe_attn_input_logits_buffer = attn_logits.to("cpu");
+        } else {
+          LOG(DEBUG) << "predictor, skip record due to prefill";
+          first_moe_attn_input_logits_buffer = torch::empty({0});
+        }
+      }
+      break;
+    }
+    default: {
+      CHECK(false) << "Unknown predict input mode";
+    }
+  }
 }

@@ -42,6 +42,7 @@ CacheMngr::CacheMngr(std::shared_ptr<ModuleMeta> metas,
   if (metas->cache_policy == "nn") {
     this->priority_get_fn = [this](ExpertHandler* e) ->float { return this->priority.index({e->layer_idx, e->expert_idx}).item<float>(); };
     this->priority_set_fn = [this](ExpertHandler* e, float p)  { this->priority.index_put_({e->layer_idx, e->expert_idx}, p); };
+    this->priority = torch::zeros({metas->num_layer, metas->num_expert}, torch::kFloat32);
   }
   if (metas->cache_policy == "min") {
     this->cache_oracle = std::make_shared<CacheOracle>();

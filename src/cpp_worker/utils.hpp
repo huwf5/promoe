@@ -110,6 +110,7 @@ enum PredictInputMode {
   kDecodeCumsum,
   kLastUseDistance,
   kWeighedDecodeCumsum,
+  kFirstMoeAttnInputLogits,
 };
 
 class ModuleMeta {

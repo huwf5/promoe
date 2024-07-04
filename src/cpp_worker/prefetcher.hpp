@@ -170,6 +170,8 @@ public:
   void report_one_expert(int layer_id, int expert_id);
   void one_expert_done(int layer_id, int expert_id);
 
+  void report_moe_attn_logits(int layer_id, torch::Tensor attn_logits);
+
   void launch_thread();
   TimerGuard build_timer() { return TimerGuard(this->profiler.get()); }
   void reload_env();

@@ -11,9 +11,9 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 import sparse_llm_cache
 
-from args import parse_args
+from sparse_llm_cache.utils.runner_util import parse_args
 cache_configs = parse_args()
-for k, v in cache_configs.items(): print(k, v)
+for k, v in cache_configs.items(): print(k,v)
 
 print("loading model...")
 logging.disable_progress_bar()

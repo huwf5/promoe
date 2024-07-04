@@ -29,7 +29,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     .def(py::init<std::shared_ptr<ModuleMeta>>())
     .def("load_model",          &Predictor::load_model)
     .def("predict",             &Predictor::predict)
-    .def("clear_access_buffer", &Predictor::clear_access_buffer)
+    // .def("clear_access_buffer", &Predictor::clear_access_buffer)
     .def("add_one_layer", static_cast<void (Predictor::*)(int, int64_t*, size_t)>(&Predictor::add_one_layer))
     .def("add_one_layer", static_cast<void (Predictor::*)(int, torch::Tensor)>(&Predictor::add_one_layer))
   ;
@@ -62,6 +62,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     .def("one_expert_done",     &PrefetchMngr::one_expert_done)
     .def("report_one_layer",    &PrefetchMngr::report_one_layer)
     .def("one_moe_layer_done",  &PrefetchMngr::one_moe_layer_done)
+    .def("report_moe_attn_logits",    &PrefetchMngr::report_moe_attn_logits)
     .def("build_timer",         &PrefetchMngr::build_timer)
     .def_readwrite("cache_stats", &PrefetchMngr::cache_stats)
     .def_readwrite("profiler",    &PrefetchMngr::profiler)
@@ -96,10 +97,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     .export_values();
 
   py::enum_<PredictInputMode>(m, "PredictInputMode")
-    .value("kOneToken",            PredictInputMode::kOneToken)
-    .value("kDecodeCumsum",        PredictInputMode::kDecodeCumsum)
-    .value("kLastUseDistance",     PredictInputMode::kLastUseDistance)
-    .value("kWeighedDecodeCumsum", PredictInputMode::kWeighedDecodeCumsum)
+    .value("kOneToken",                PredictInputMode::kOneToken)
+    .value("kDecodeCumsum",            PredictInputMode::kDecodeCumsum)
+    .value("kLastUseDistance",         PredictInputMode::kLastUseDistance)
+    .value("kWeighedDecodeCumsum",     PredictInputMode::kWeighedDecodeCumsum)
+    .value("kFirstMoeAttnInputLogits", PredictInputMode::kFirstMoeAttnInputLogits)
     .export_values();
 
   py::enum_<TimeProfiler::TimeType>(m, "TimeType")

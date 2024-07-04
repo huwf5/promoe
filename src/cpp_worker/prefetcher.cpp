@@ -195,7 +195,8 @@ void PrefetchMngr::one_moe_layer_done(int layer_id) {
     profiler->push(TimeProfiler::kPrefetchMissCnt, 0);
   }
   if (layer_id == metas->num_layer - 1) {
-    predict_thread->add_one_task();
+    predict_thread->on_one_iter_done();
+    // predict_thread->add_one_task();
   }
 }
 
@@ -241,7 +242,8 @@ void PrefetchMngr::mark_expert_using(int layer_id, int expert_id) {
 }
 
 void PrefetchMngr::launch_thread() {
-  predict_thread->add_one_task();
+  predict_thread->on_one_iter_done();
+
   fetch_schedule_thread->launch();
   predict_thread->launch();
   expert_unlocker_thread->launch();
@@ -320,6 +322,15 @@ PrefetchMngr::PrefetchMngr(std::shared_ptr<ModuleMeta> metas,
   fetch_thread->init(metas.get(), fetch_schedule_thread.get(), stream);
   fetch_schedule_thread->init(metas.get(), model_loader.get(), this->cache.get(), fetch_thread.get(), predict_thread.get(), cache_stats.get(), profiler.get());
 }
+
+void PrefetchMngr::report_moe_attn_logits(int layer_id, torch::Tensor attn_logits) {
+  LOG_BLOCK(DEBUG, logger, {
+    logger << "prefetch mngr, report_moe_attn_logits " << layer_id << ", " << attn_logits.sizes();
+  });
+  predictor->record_moe_attn_logits(layer_id, attn_logits);
+  predict_thread->on_moe_attn_input_logits_recorded(layer_id);
+}
+
 void PrefetchMngr::record_then_predict_and_prefetch(int layer_id, torch::Tensor experts) {
   TRACE_EVENT_GURAD(kHook, "record_then_predict_and_launch");
   // LOG_BLOCK(DEBUG, logger, {
@@ -329,7 +340,10 @@ void PrefetchMngr::record_then_predict_and_prefetch(int layer_id, torch::Tensor 
     predictor->add_one_layer(layer_id, experts);
   } else {
     LOG(TRACE) << "identified prefill iteration, skip adding it to prefill " << experts.numel();
-    predictor->clear_access_buffer();
+    // predictor->clear_access_buffer();
+    if (layer_id == 0) {
+      predictor->start_of_new_sequence();
+    }
   }
   // if (layer_id == metas->num_layer - 1) {
   //   predict_thread->add_one_task();
