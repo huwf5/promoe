@@ -276,6 +276,8 @@ class CacheMngr {
   CacheLineOccupancyWaiter miss(ExpertHandler *expert, bool is_precise);
 
   void update_all_priority(torch::Tensor p);
+  void update_some_priority(torch::Tensor p, int starting_layer);
+  void update_priority(torch::Tensor p, int starting_layer);
 
   void set_cur_seq(uint64_t seq_id) {
     for (auto &slot : cache_slots->slots) {

@@ -22,6 +22,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     .def_readwrite("promote_hit_in_prefetch",      &ModuleMeta::promote_hit_in_prefetch)
     .def_readwrite("early_preempt",                &ModuleMeta::early_preempt)
     .def_readwrite("predict_input_mode",           &ModuleMeta::predict_input_mode)
+    .def_readwrite("layer_predict_interval",       &ModuleMeta::layer_predict_interval)
+    .def_readwrite("layer_predict_window",         &ModuleMeta::layer_predict_window)
     .def("init_param_list", &ModuleMeta::init_param_list)
   ;
 
@@ -102,6 +104,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     .value("kLastUseDistance",         PredictInputMode::kLastUseDistance)
     .value("kWeighedDecodeCumsum",     PredictInputMode::kWeighedDecodeCumsum)
     .value("kFirstMoeAttnInputLogits", PredictInputMode::kFirstMoeAttnInputLogits)
+    .value("kMoeAttnInputLogits",      PredictInputMode::kMoeAttnInputLogits)
     .export_values();
 
   py::enum_<TimeProfiler::TimeType>(m, "TimeType")

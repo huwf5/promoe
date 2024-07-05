@@ -350,7 +350,7 @@ void PrefetchMngr::record_then_predict_and_prefetch(int layer_id, torch::Tensor 
   // }
 }
 PrefetchMngr::~PrefetchMngr() {
-  predict_thread->add_one_task();
+  predict_thread->add_one_task(PredictJob());
   predict_thread->add_prefetch_layer_budget();
   fetch_thread->exit();
   predict_thread->exit();
@@ -455,7 +455,7 @@ void FetchScheduleWorker::do_one_task_impl(IdleTask *idle_task) {
 }
 
 void FetchScheduleWorker::do_one_task_impl(PrefetchLayerTask *task) {
-  TRACE_EVENT_GURAD(kFetchScheduler, "add task for layer " + std::to_string(task->layer_idx));
+  TRACE_EVENT_GURAD(kFetchScheduler, "add task for layer " + std::to_string(task->layer_idx) + "[" + array_to_str(task->expert_idxs, task->num_expert) + "]");
   LOG(TRACE) << "add prefetch task for layer " << task->layer_idx;
   CHECK(per_layer_job_queues[task->layer_idx].empty());
   CHECK(current_task.expert == nullptr || current_task.expert->layer_idx != task->layer_idx);

@@ -26,7 +26,12 @@ def parse_args():
   parser.add_argument("--cache_policy", type=str, choices=["lru", "fifo", "nn", "min"], default="lru")
   parser.add_argument("--cache_trace_path", type=str, default=None)
   parser.add_argument("--predictor_model_path", type=str, default=None)
-  parser.add_argument("--predict_input_mode", type=str, choices=["one_token", "decode_cumsum", "last_use_distance", "weighted_decode_cumsum", "first_moe_attn_input_logits"], default='one_token')
+  parser.add_argument("--predict_input_mode", type=str, choices=["one_token", "decode_cumsum", "last_use_distance", "weighted_decode_cumsum", "first_moe_attn_input_logits", "moe_attn_input_logits"], default='one_token')
+  # parser.add_argument("--predict_mode", type=str, choices=["entire_token", "layer_window"], default='one_token')
+  # layer_predict_interval
+  # layer_predict_window
+  parser.add_argument("--layer_predict_interval", type=int, default=None)
+  parser.add_argument("--layer_predict_window",   type=int, default=None)
 
   parser.add_argument(        "--per_layer_cache", action=CustomBooleanAction, default=True)
   parser.add_argument( "--enable_per_layer_cache", action="store_true",  dest="per_layer_cache", default=True)

@@ -126,6 +126,8 @@ def inject_model(
     cache_trace_path : str = None,
     predictor_model_path : str = None,
     predict_input_mode = None,
+    layer_predict_interval = None,
+    layer_predict_window = None,
   ):
   """
   Injects a model with cache-related functionality.
@@ -219,7 +221,14 @@ def inject_model(
     'last_use_distance': cpp_worker.kLastUseDistance,
     'weighted_decode_cumsum': cpp_worker.kWeighedDecodeCumsum,
     'first_moe_attn_input_logits': cpp_worker.kFirstMoeAttnInputLogits,
+    'moe_attn_input_logits': cpp_worker.kMoeAttnInputLogits,
   }[predict_input_mode]
+
+  if layer_predict_interval is None:
+    layer_predict_interval = num_moe_layer
+    layer_predict_window = num_moe_layer
+  meta.layer_predict_interval = layer_predict_interval
+  meta.layer_predict_window = layer_predict_window
 
   model_loader  = cpp_worker.ModelLoader(meta)
   predictor     = cpp_worker.Predictor(meta)

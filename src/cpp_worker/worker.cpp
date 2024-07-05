@@ -3,12 +3,13 @@
 #include "profiler.hpp"
 #include "prefetcher.hpp"
 
-void PredictWorker::do_one_task_impl() {
-  // TRACE_EVENT_GURAD(kPredict, "predict thread");
-  auto prob = predictor->predict().reshape({metas->num_layer, -1});
+void PredictWorker::do_one_task_impl(PredictJob job) {
+  TRACE_EVENT_GURAD(kPredictor, "predict thread " + std::to_string(job.input_layer_id));
+  auto num_predicted_layers = std::min(metas->layer_predict_window, metas->num_layer - job.input_layer_id);
+  auto prob = predictor->predict(job.input_layer_id).slice(0, 0, num_predicted_layers);
   CHECK(prob.size(1) == metas->num_expert || prob.size(1) == 0);
   if (metas->cache_policy == "nn" && prob.size(1) > 0) {
-    cache->update_all_priority(prob);
+    cache->update_priority(prob, job.input_layer_id);
   }
   auto sorted = prob.sort(-1, true);
   // auto predicted_expert_prob = std::get<0>(sorted).slice(1, 0,
@@ -18,15 +19,20 @@ void PredictWorker::do_one_task_impl() {
   auto predicted_expert = std::get<1>(sorted).slice(1, 0, per_layer_predict_num_expert_in_cur_iter);
 
   LOG_BLOCK(DEBUG, logger, {
-    for (int l = 0; l < metas->num_layer; l++) {
-      logger << "predicted expert" << l << ":" << tensor_to_str(predicted_expert[l]);
+    logger << "predicted shape " << predicted_expert.sizes() << "\n";
+  });
+  LOG_BLOCK(DEBUG, logger, {
+    for (int l_in_window = 0; l_in_window < num_predicted_layers; l_in_window++) {
+      int l = l_in_window + job.input_layer_id;
+      logger << "predicted expert" << l << ":" << tensor_to_str(predicted_expert[l_in_window]) << "\n";
     }
   });
 
   {
-    TRACE_EVENT_GURAD(kPredictor, "add_multi_layer_task");
+    TRACE_EVENT_GURAD(kPredictor, "add_multi_layer_task [" + std::to_string(job.input_layer_id) + "," + std::to_string(num_predicted_layers + job.input_layer_id) + ")");
     size_t per_layer_num_expert = predicted_expert.size(1);
-    for (int layer_idx = 0; layer_idx < metas->num_layer; layer_idx++) {
+    for (int l_in_window = 0; l_in_window < num_predicted_layers; l_in_window++) {
+      auto layer_idx = l_in_window + job.input_layer_id;
       {
         LOG(DEBUG) << "predict worker: add layer task " << layer_idx << ", wait for budget";
         TRACE_EVENT_GURAD(kPredictor, "wait for budget " + std::to_string(layer_idx));
@@ -37,7 +43,7 @@ void PredictWorker::do_one_task_impl() {
       LOG(DEBUG) << "predict worker: add layer task now " << layer_idx;
       PrefetchLayerTask task;
       task.layer_idx = layer_idx;
-      task.expert_idxs = predicted_expert[layer_idx].data_ptr<int64_t>();
+      task.expert_idxs = predicted_expert[l_in_window].data_ptr<int64_t>();
       task.num_expert = per_layer_num_expert;
       auto wait_handler = fetch_schedule_thread->add_one_task(&task);
       fetch_schedule_thread->wait_progress(wait_handler);
@@ -45,7 +51,9 @@ void PredictWorker::do_one_task_impl() {
       sem_post(&prefetch_layer_progress);
     }
   }
-  predictor->end_of_one_token_prediction();
+  if (num_predicted_layers + job.input_layer_id == metas->num_layer) {
+    predictor->end_of_one_token_prediction();
+  }
   // if (metas->predict_input_mode == kOneToken) {
   //   predictor->clear_access_buffer();
   // }
@@ -85,11 +93,12 @@ void PredictWorker::add_prefetch_layer_budget() {
 void PredictWorker::on_one_iter_done() {
   LOG(DEBUG) << "predict workers, one iter done";
   switch (metas->predict_input_mode) {
-    case kOneToken:                { add_one_task(); break; }
-    case kDecodeCumsum:            { add_one_task(); break; }
-    case kLastUseDistance:         { add_one_task(); break; }
-    case kWeighedDecodeCumsum:     { add_one_task(); break; }
+    case kOneToken:                { add_one_task(PredictJob()); break; }
+    case kDecodeCumsum:            { add_one_task(PredictJob()); break; }
+    case kLastUseDistance:         { add_one_task(PredictJob()); break; }
+    case kWeighedDecodeCumsum:     { add_one_task(PredictJob()); break; }
     case kFirstMoeAttnInputLogits: { break; }
+    case kMoeAttnInputLogits:      { break; }
     default: { CHECK(false) << "Unknown predict input mode"; }
   }
 }
@@ -101,7 +110,13 @@ void PredictWorker::on_moe_attn_input_logits_recorded(int layer_id) {
     case kLastUseDistance:         { break;}
     case kWeighedDecodeCumsum:     { break;}
     case kFirstMoeAttnInputLogits: {
-      if (layer_id == 0) { add_one_task(); }
+      if (layer_id == 0) { add_one_task(PredictJob()); }
+      break;
+    }
+    case kMoeAttnInputLogits:      {
+      if (layer_id % metas->layer_predict_interval == 0) {
+        add_one_task(PredictJob(layer_id));
+      }
       break;
     }
     default: { CHECK(false) << "Unknown predict input mode"; }

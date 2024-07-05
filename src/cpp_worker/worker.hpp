@@ -133,7 +133,12 @@ class ExpertUnlockWorker : public WorkerThread<ExpertHandler*> {
 /**
  * Predict Worker
  */
-class PredictWorker : public WorkerThread<void> {
+struct PredictJob {
+  int input_layer_id = 0;
+  PredictJob() {}
+  PredictJob(int input_layer_id) : input_layer_id(input_layer_id) {}
+};
+class PredictWorker : public WorkerThread<PredictJob> {
   FetchScheduleWorker* fetch_schedule_thread;
   Predictor  * predictor;
   CacheMngr  * cache;
@@ -141,7 +146,7 @@ class PredictWorker : public WorkerThread<void> {
   sem_t prefetch_layer_budget, prefetch_layer_progress;
   friend class PrefetchMngr;
  public:
-  PredictWorker() : WorkerThread<void>() {}
+  PredictWorker() : WorkerThread<PredictJob>() {}
   void init(FetchScheduleWorker* fetch_schedule_thread, Predictor* predictor, CacheMngr* cache, ModuleMeta* metas) {
     this->fetch_schedule_thread = fetch_schedule_thread;
     this->predictor = predictor;
@@ -158,5 +163,5 @@ class PredictWorker : public WorkerThread<void> {
   void on_moe_attn_input_logits_recorded(int layer_id);
 
 protected:
-  void do_one_task_impl() override;
+  void do_one_task_impl(PredictJob job) override;
 };

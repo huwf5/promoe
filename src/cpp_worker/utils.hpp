@@ -111,6 +111,7 @@ enum PredictInputMode {
   kLastUseDistance,
   kWeighedDecodeCumsum,
   kFirstMoeAttnInputLogits,
+  kMoeAttnInputLogits,
 };
 
 class ModuleMeta {
@@ -131,7 +132,9 @@ class ModuleMeta {
   std::string cache_policy = "fifo";
   PredictInputMode predict_input_mode = kOneToken;
   int predict_input_reuse_distance_max = 10;
-  int predict_input_decay = 2;
+  int predict_input_decay = 2;    // decode cumsum weight decay
+  int layer_predict_interval = 1; // the frequency of layer prediction
+  int layer_predict_window = 1;   // the result window len of layer prediction
 
   bool can_do_layer(int cur_preempted_layer, int target_layer) {
     // (cur_preempted_layer, cur_preempted_layer + max_prefetch_layer_distance]

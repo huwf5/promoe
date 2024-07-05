@@ -258,6 +258,23 @@ void CacheMngr::update_all_priority(torch::Tensor p) {
     }
   });
 }
+void CacheMngr::update_some_priority(torch::Tensor p, int starting_layer) {
+  priority.index_put_({torch::indexing::Slice{starting_layer, p.size(0)}}, p);
+  max_priority = priority.max().item<float>();
+  std::unordered_set<CacheSlot*> deduped_slot;
+  for (int i = 0; i < p.size(0); i++) {
+    deduped_slot.insert(cache_slots->to_slot(i + starting_layer));
+  }
+  for (auto s : deduped_slot) {
+    reinterpret_cast<CachePolicyNN *>(s->policy.get())->update_all_priority();
+  }
+  LOG_BLOCK(DEBUG, logger, {
+    logger << "update priority, result: \n";
+    for (int s = 0; s < cache_slots->slots.size(); s++) {
+      logger << "slot " << s << ":" << cache_slots->slots[s].policy->toString() << "\n";
+    }
+  });
+}
 void CacheOracle::load_from_file(std::string file_path) {
   std::ifstream trace_file(file_path);
   nlohmann::json all_traces = nlohmann::json::parse(trace_file);
@@ -358,4 +375,12 @@ void CachePolicyMIN::access_on_miss(ExpertHandler *e) {
   n->data = e;
   n->priority = priority;
   heap.push(n);
+}
+void CacheMngr::update_priority(torch::Tensor p, int starting_layer) {
+  if (p.size(0) == metas->num_layer) {
+    CHECK(starting_layer == 0);
+    update_all_priority(p);
+  } else {
+    update_some_priority(p, starting_layer);
+  }
 }
