@@ -1,8 +1,7 @@
 #include "predictor.hpp"
-
 #include "logging.hpp"
-
 #include "profiler.hpp"
+#include <nlohmann/json.hpp>
 
 void Predictor::add_one_layer(int layer_id, int64_t *experts, size_t num_expert) {
   switch (metas->predict_input_mode) {
@@ -89,7 +88,11 @@ torch::Tensor Predictor::predict(int input_layer_id) {
       input = this->moe_attn_input_logits_buffer_list[input_layer_id];
       if (input.numel() == 0) {
         LOG(DEBUG) << "skip prediction due to prefill";
-        return torch::empty({metas->layer_predict_window, 0}, torch::kFloat32);
+        return torch::empty({static_cast<long>(predict_model_metas[input_layer_id].orig_num_output_layer()), 0}, torch::kFloat32);
+      }
+      if (predict_model_metas[input_layer_id].num_output_layer() == 0) {
+        LOG(DEBUG) << "skip prediction due to empty output layers";
+        return torch::empty({static_cast<long>(predict_model_metas[input_layer_id].orig_num_output_layer()), 0}, torch::kFloat32);
       }
       LOG_BLOCK(DEBUG, logger, {
         logger << "predictor, predict with input shape " << input.sizes() << " " << input.numel();
@@ -118,9 +121,6 @@ torch::Tensor Predictor::predict(int input_layer_id) {
 }
 void Predictor::load_one_model(std::string model_path, int idx) {
   c10::Device cpu_device(c10::DeviceType::CPU);
-  if (predict_model_list.size() < idx + 1) {
-    predict_model_list.resize(idx + 1);
-  }
   predict_model_list[idx] = torch::jit::load(model_path, cpu_device);
   predict_model_list[idx].eval();
 }
@@ -130,6 +130,10 @@ void Predictor::load_model(std::string model_path) {
   CHECK(stat_ret == 0) << "Model file not found: " << model_path;
   if (S_ISREG(path_stat.st_mode)) {
     load_one_model(model_path, 0);
+    CHECK(predict_model_list.size() == 1);
+    predict_model_metas[0] = PredictModelMeta();
+    predict_model_metas[0].orig_output_start_layer = 0;
+    predict_model_metas[0].orig_output_stop_layer = metas->num_layer;
   } else if (S_ISDIR(path_stat.st_mode)) {
     DIR *dir = opendir(model_path.c_str());
     CHECK(dir != nullptr) << "Failed to open directory: " << model_path;
@@ -140,13 +144,50 @@ void Predictor::load_model(std::string model_path) {
       }
       std::string name(entry->d_name);
       std::string file_name_without_ext = std::string(entry->d_name).substr(0, name.find_last_of("."));
-      LOG(ERROR) << "Loading model: " << name << " " << file_name_without_ext;
-      load_one_model(model_path + "/" + name, std::stoi(file_name_without_ext));
+      std::string file_ext = std::string(entry->d_name).substr(name.find_last_of(".") + 1);
+      if (file_ext == "pt") {
+        LOG(ERROR) << "Loading model: " << name << " " << file_name_without_ext;
+        load_one_model(model_path + "/" + name, std::stoi(file_name_without_ext));
+      } else if (file_ext == "json") {
+        LOG(ERROR) << "Loading json: " << name;
+        std::ifstream trace_file(model_path + "/" + name);
+        nlohmann::json output_layers_list = nlohmann::json::parse(trace_file);
+        trace_file.close();
+        for (auto &el : output_layers_list.items()) {
+          uint64_t model_id = std::stoull(el.key());
+          predict_model_metas[model_id] = PredictModelMeta();
+          predict_model_metas[model_id].orig_output_start_layer = el.value()[0].get<int>();
+          predict_model_metas[model_id].orig_output_stop_layer  = el.value()[1].get<int>();
+        }
+      }
     }
     closedir(dir);
   } else {
     CHECK(false) << "Model path is not a regular file or directory: "
                  << model_path;
+  }
+  int stop_l = 0;
+  for (int l = 0; l < metas->num_layer; l += metas->layer_predict_interval) {
+    CHECK(predict_model_metas.find(l) != predict_model_metas.end()) << "No model meta for layer " << l;
+    auto & p_m_metas = predict_model_metas[l];
+    CHECK(p_m_metas.orig_num_output_layer() > 0) << "No output layers for model at layer 0";
+    CHECK(p_m_metas.orig_output_stop_layer <= metas->num_layer) << "Orig model predict more than num_layer";
+    CHECK(p_m_metas.orig_output_start_layer <= stop_l) << "Output layers not in order";
+    p_m_metas.slice_start = stop_l - p_m_metas.orig_output_start_layer;
+
+    // orig layers: [orig_output_start_layer, orig_output_stop_layer)
+    // build a slice: orig_output[slice_start:slice_stop] -> [orig_output_start_layer + slice_start, orig_output_start_layer + slice_stop)
+    // ------
+    // orig_output_start_layer + slice_stop <= orig_output_stop_layer
+    // orig_output_start_layer + slice_stop <= l + metas->layer_predict_max_window
+
+    p_m_metas.slice_stop = std::min<int>(p_m_metas.orig_num_output_layer(), l + metas->layer_predict_max_window - p_m_metas.orig_output_start_layer); 
+    CHECK(p_m_metas.slice_start <= p_m_metas.slice_stop) << "No output layers for model at layer 0";
+    stop_l = p_m_metas.output_layer_stop();
+    LOG(ERROR) << "predict model " << l << ", "
+               << "orig [" << p_m_metas.orig_output_start_layer << ":" << p_m_metas.orig_output_stop_layer << "], "
+               << "slice [" << p_m_metas.slice_start << ":" << p_m_metas.slice_stop << "], "
+               << "into [" << p_m_metas.output_layer_start() << ":" << p_m_metas.output_layer_stop() << "]";
   }
 }
 void Predictor::add_one_layer(int layer_id, torch::Tensor experts) {
@@ -201,13 +242,20 @@ void Predictor::record_moe_attn_logits(int layer_id, torch::Tensor attn_logits) 
       break;
     }
     case kMoeAttnInputLogits: {
-      if (attn_logits.numel() == attn_logits.size(-1)) {
-        LOG(DEBUG) << "predictor, record attn logits";
-        moe_attn_input_logits_buffer_list[layer_id] = attn_logits.to("cpu");
-      } else {
+      CHECK(attn_logits.dim() == 3) << "input logits must be in shape [num_batch, seq_len, num_expert]";
+      CHECK(attn_logits.size(0) == 1) << "batch > 1 not supported";
+      if (layer_id % metas->layer_predict_interval != 0) {
+        LOG(DEBUG) << "predictor, skip record due to interval";
+        moe_attn_input_logits_buffer_list[layer_id] = torch::empty({0});
+        break;
+      }
+      if (attn_logits.size(1) != 1) {
         LOG(DEBUG) << "predictor, skip record due to prefill";
         moe_attn_input_logits_buffer_list[layer_id] = torch::empty({0});
+        break;
       }
+      LOG(DEBUG) << "predictor, record attn logits";
+      moe_attn_input_logits_buffer_list[layer_id] = attn_logits.to("cpu");
       break;
     }
     default: {

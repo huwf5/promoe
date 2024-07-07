@@ -30,8 +30,8 @@ def parse_args():
   # parser.add_argument("--predict_mode", type=str, choices=["entire_token", "layer_window"], default='one_token')
   # layer_predict_interval
   # layer_predict_window
-  parser.add_argument("--layer_predict_interval", type=int, default=None)
-  parser.add_argument("--layer_predict_window",   type=int, default=None)
+  parser.add_argument("--layer_predict_interval",   type=int, default=None)
+  parser.add_argument("--layer_predict_max_window", type=int, default=None)
 
   parser.add_argument(        "--per_layer_cache", action=CustomBooleanAction, default=True)
   parser.add_argument( "--enable_per_layer_cache", action="store_true",  dest="per_layer_cache", default=True)

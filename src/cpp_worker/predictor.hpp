@@ -13,8 +13,8 @@ class Predictor {
   torch::Tensor last_use_distance_buffer;
   torch::Tensor weighted_access_freq_sum_buffer;
   torch::Tensor first_moe_attn_input_logits_buffer;
-  std::vector<torch::Tensor> moe_attn_input_logits_buffer_list;
-  std::vector<torch::jit::script::Module> predict_model_list;
+  std::unordered_map<int, torch::Tensor> moe_attn_input_logits_buffer_list;
+  std::unordered_map<int, torch::jit::script::Module> predict_model_list;
   void init_expert_access_buffer() {
     auto options = torch::TensorOptions().dtype(torch::kFloat32);
     switch (metas->predict_input_mode) {
@@ -36,7 +36,6 @@ class Predictor {
       }
       case kFirstMoeAttnInputLogits : { break; }
       case kMoeAttnInputLogits :      { 
-        moe_attn_input_logits_buffer_list.resize(metas->num_layer);
         break;
       }
       default : { CHECK(false) << "Unknown predict input mode"; }
@@ -45,6 +44,16 @@ class Predictor {
 
   void load_one_model(std::string model_path, int idx = 0);
  public:
+  struct PredictModelMeta {
+    int orig_output_start_layer, orig_output_stop_layer;
+    int slice_start, slice_stop;
+    int orig_num_output_layer() const { return orig_output_stop_layer - orig_output_start_layer; }
+    int output_layer_start() const { return orig_output_start_layer + slice_start; }
+    int output_layer_stop() const { return orig_output_start_layer + slice_stop; }
+    int output_layer(int l_in_slice) const { return orig_output_start_layer + slice_start + l_in_slice; }
+    int num_output_layer() const { return slice_stop - slice_start; }
+  };
+  std::unordered_map<int, PredictModelMeta> predict_model_metas;
   Predictor(std::shared_ptr<ModuleMeta> metas) : metas(metas) {
     init_expert_access_buffer();
   }

@@ -127,7 +127,7 @@ def inject_model(
     predictor_model_path : str = None,
     predict_input_mode = None,
     layer_predict_interval = None,
-    layer_predict_window = None,
+    layer_predict_max_window = None,
   ):
   """
   Injects a model with cache-related functionality.
@@ -226,9 +226,9 @@ def inject_model(
 
   if layer_predict_interval is None:
     layer_predict_interval = num_moe_layer
-    layer_predict_window = num_moe_layer
+    layer_predict_max_window = num_moe_layer
   meta.layer_predict_interval = layer_predict_interval
-  meta.layer_predict_window = layer_predict_window
+  meta.layer_predict_max_window = layer_predict_max_window
 
   model_loader  = cpp_worker.ModelLoader(meta)
   predictor     = cpp_worker.Predictor(meta)

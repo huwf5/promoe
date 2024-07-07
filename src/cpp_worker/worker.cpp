@@ -5,11 +5,16 @@
 
 void PredictWorker::do_one_task_impl(PredictJob job) {
   TRACE_EVENT_GURAD(kPredictor, "predict thread " + std::to_string(job.input_layer_id));
-  auto num_predicted_layers = std::min(metas->layer_predict_window, metas->num_layer - job.input_layer_id);
-  auto prob = predictor->predict(job.input_layer_id).slice(0, 0, num_predicted_layers);
+  const auto & p_m_metas = predictor->predict_model_metas[job.input_layer_id];
+  auto prob = predictor->predict(job.input_layer_id);
+  LOG_BLOCK(DEBUG, logger, {
+    logger << "predict worker: predict " << job.input_layer_id << " " << prob.sizes() << ", slice it with [" << p_m_metas.slice_start << ":" << p_m_metas.slice_stop << "]";
+  });
+  prob = prob.slice(0, p_m_metas.slice_start, p_m_metas.slice_stop);
+  auto num_predicted_layers = prob.size(0);
   CHECK(prob.size(1) == metas->num_expert || prob.size(1) == 0);
   if (metas->cache_policy == "nn" && prob.size(1) > 0) {
-    cache->update_priority(prob, job.input_layer_id);
+    cache->update_priority(prob, p_m_metas.output_layer_start());
   }
   auto sorted = prob.sort(-1, true);
   // auto predicted_expert_prob = std::get<0>(sorted).slice(1, 0,
@@ -22,17 +27,17 @@ void PredictWorker::do_one_task_impl(PredictJob job) {
     logger << "predicted shape " << predicted_expert.sizes() << "\n";
   });
   LOG_BLOCK(DEBUG, logger, {
-    for (int l_in_window = 0; l_in_window < num_predicted_layers; l_in_window++) {
-      int l = l_in_window + job.input_layer_id;
-      logger << "predicted expert" << l << ":" << tensor_to_str(predicted_expert[l_in_window]) << "\n";
+    for (int l_in_slice = 0; l_in_slice < num_predicted_layers; l_in_slice++) {
+      int layer_idx = p_m_metas.output_layer(l_in_slice);
+      logger << "predicted expert" << layer_idx << ":" << tensor_to_str(predicted_expert[l_in_slice]) << "\n";
     }
   });
 
   {
     TRACE_EVENT_GURAD(kPredictor, "add_multi_layer_task [" + std::to_string(job.input_layer_id) + "," + std::to_string(num_predicted_layers + job.input_layer_id) + ")");
     size_t per_layer_num_expert = predicted_expert.size(1);
-    for (int l_in_window = 0; l_in_window < num_predicted_layers; l_in_window++) {
-      auto layer_idx = l_in_window + job.input_layer_id;
+    for (int l_in_slice = 0; l_in_slice < num_predicted_layers; l_in_slice++) {
+      int layer_idx = p_m_metas.output_layer(l_in_slice);
       {
         LOG(DEBUG) << "predict worker: add layer task " << layer_idx << ", wait for budget";
         TRACE_EVENT_GURAD(kPredictor, "wait for budget " + std::to_string(layer_idx));
@@ -43,7 +48,7 @@ void PredictWorker::do_one_task_impl(PredictJob job) {
       LOG(DEBUG) << "predict worker: add layer task now " << layer_idx;
       PrefetchLayerTask task;
       task.layer_idx = layer_idx;
-      task.expert_idxs = predicted_expert[l_in_window].data_ptr<int64_t>();
+      task.expert_idxs = predicted_expert[l_in_slice].data_ptr<int64_t>();
       task.num_expert = per_layer_num_expert;
       auto wait_handler = fetch_schedule_thread->add_one_task(&task);
       fetch_schedule_thread->wait_progress(wait_handler);

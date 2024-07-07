@@ -23,7 +23,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     .def_readwrite("early_preempt",                &ModuleMeta::early_preempt)
     .def_readwrite("predict_input_mode",           &ModuleMeta::predict_input_mode)
     .def_readwrite("layer_predict_interval",       &ModuleMeta::layer_predict_interval)
-    .def_readwrite("layer_predict_window",         &ModuleMeta::layer_predict_window)
+    .def_readwrite("layer_predict_max_window",     &ModuleMeta::layer_predict_max_window)
     .def("init_param_list", &ModuleMeta::init_param_list)
   ;
 
