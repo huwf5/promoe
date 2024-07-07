@@ -259,6 +259,7 @@ void CacheMngr::update_all_priority(torch::Tensor p) {
   });
 }
 void CacheMngr::update_some_priority(torch::Tensor p, int starting_layer) {
+  CHECK(starting_layer + p.size(0) <= metas->num_layer);
   priority.index_put_({torch::indexing::Slice{starting_layer, starting_layer + p.size(0)}}, p);
   max_priority = priority.max().item<float>();
   std::unordered_set<CacheSlot*> deduped_slot;

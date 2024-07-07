@@ -117,6 +117,7 @@ torch::Tensor Predictor::predict(int input_layer_id) {
   //   input = this->weighted_access_freq_sum_buffer.clone();
   // }
   std::vector<torch::jit::IValue> inputs{input.flatten().unsqueeze(0)};
+  torch::NoGradGuard no_grad;
   return model.forward(inputs).toTensor().reshape({-1, metas->num_expert});
 }
 void Predictor::load_one_model(std::string model_path, int idx) {

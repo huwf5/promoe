@@ -261,33 +261,33 @@ PrefetchMngr::PrefetchMngr(std::shared_ptr<ModuleMeta> metas,
   CUDA_CALL(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
   fetch_schedule_thread = std::make_shared<FetchScheduleWorker>();
   cache_stats = std::make_shared<CacheStatistics>();
-  cache_stats->add_reporter([this](CacheStatistics* stats){
+  cache_stats->add_reporter([this, metas = this->metas](CacheStatistics* stats){
     auto tensor = stats->to_tensor();
     // remove iteration of prefill
-    tensor = tensor.index({tensor.sum(1) <= this->metas->num_expert_per_token});
+    tensor = tensor.index({tensor.sum(1) <= metas->num_expert_per_token});
     // skip first 10 iteration
-    tensor = tensor.index({torch::indexing::Slice(this->metas->num_layer * 10)});
+    tensor = tensor.index({torch::indexing::Slice(metas->num_layer * 10)});
     tensor = tensor.mean(0);
     std::cout << "legacy_decode_stage_hit_cnt:"  << tensor[0].item<float>() << std::endl;
     std::cout << "legacy_decode_stage_miss_cnt:" << tensor[1].item<float>() << std::endl;
     std::cout << "legacy_decode_stage_hit_rate:" << tensor[0].item<float>() / (tensor[0].item<float>() + tensor[1].item<float>()) << std::endl;
   });
-  cache_stats->add_reporter([this](CacheStatistics* stats){
+  cache_stats->add_reporter([this, metas = this->metas](CacheStatistics* stats){
     auto tensor = stats->to_tensor();
     // remove iteration of decode
-    tensor = tensor.index({tensor.sum(1) > this->metas->num_expert_per_token});
+    tensor = tensor.index({tensor.sum(1) > metas->num_expert_per_token});
     // skip first 10 iteration
-    tensor = tensor.index({torch::indexing::Slice(this->metas->num_layer * 2)});
+    tensor = tensor.index({torch::indexing::Slice(metas->num_layer * 2)});
     tensor = tensor.mean(0);
     std::cout << "legacy_prefill_stage_hit_cnt:"  << tensor[0].item<float>() << std::endl;
     std::cout << "legacy_prefill_stage_miss_cnt:" << tensor[1].item<float>() << std::endl;
     std::cout << "legacy_prefill_stage_hit_rate:" << tensor[0].item<float>() / (tensor[0].item<float>() + tensor[1].item<float>()) << std::endl;
   });
   profiler = std::make_shared<TimeProfiler>();
-  profiler->add_reporter([this](TimeProfiler *p){
+  profiler->add_reporter([this, metas = this->metas](TimeProfiler *p){
     auto num_used_expert_tensor = p->to_tensor(TimeProfiler::kCntActivatedExpert);
-    auto idx_is_prefill = num_used_expert_tensor >  (this->metas->num_expert_per_token * this->metas->num_layer);
-    auto idx_is_decode  = num_used_expert_tensor <= (this->metas->num_expert_per_token * this->metas->num_layer);
+    auto idx_is_prefill = num_used_expert_tensor >  (metas->num_expert_per_token * metas->num_layer);
+    auto idx_is_decode  = num_used_expert_tensor <= (metas->num_expert_per_token * metas->num_layer);
     auto lambda_report_one_pair([this, p](
         TimeProfiler::TimeType on,
         TimeProfiler::TimeType off,
