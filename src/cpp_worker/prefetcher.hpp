@@ -172,6 +172,8 @@ public:
 
   void report_moe_attn_logits(int layer_id, torch::Tensor attn_logits);
 
+  void report_moe_layer_logits(int layer_id, torch::Tensor layer_logits);
+
   void launch_thread();
   TimerGuard build_timer() { return TimerGuard(this->profiler.get()); }
   void reload_env();

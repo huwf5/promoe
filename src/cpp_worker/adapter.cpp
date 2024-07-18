@@ -24,6 +24,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     .def_readwrite("predict_input_mode",           &ModuleMeta::predict_input_mode)
     .def_readwrite("layer_predict_interval",       &ModuleMeta::layer_predict_interval)
     .def_readwrite("layer_predict_max_window",     &ModuleMeta::layer_predict_max_window)
+    .def_readwrite("layer_predict_replace_first_input_with_last_output",     &ModuleMeta::layer_predict_replace_first_input_with_last_output)
     .def("init_param_list", &ModuleMeta::init_param_list)
   ;
 
@@ -65,6 +66,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     .def("report_one_layer",    &PrefetchMngr::report_one_layer)
     .def("one_moe_layer_done",  &PrefetchMngr::one_moe_layer_done)
     .def("report_moe_attn_logits",    &PrefetchMngr::report_moe_attn_logits)
+    .def("report_moe_layer_logits",   &PrefetchMngr::report_moe_layer_logits)
     .def("build_timer",         &PrefetchMngr::build_timer)
     .def_readwrite("cache_stats", &PrefetchMngr::cache_stats)
     .def_readwrite("profiler",    &PrefetchMngr::profiler)
@@ -105,6 +107,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     .value("kWeighedDecodeCumsum",     PredictInputMode::kWeighedDecodeCumsum)
     .value("kFirstMoeAttnInputLogits", PredictInputMode::kFirstMoeAttnInputLogits)
     .value("kMoeAttnInputLogits",      PredictInputMode::kMoeAttnInputLogits)
+    .value("kMoeLayerLogits",          PredictInputMode::kMoeLayerLogits)
     .export_values();
 
   py::enum_<TimeProfiler::TimeType>(m, "TimeType")

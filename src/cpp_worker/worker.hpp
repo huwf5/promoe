@@ -161,6 +161,7 @@ class PredictWorker : public WorkerThread<PredictJob> {
   }
   void on_one_iter_done();
   void on_moe_attn_input_logits_recorded(int layer_id);
+  void on_moe_layer_logits_recorded(int layer_id);
 
 protected:
   void do_one_task_impl(PredictJob job) override;

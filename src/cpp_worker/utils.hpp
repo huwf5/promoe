@@ -112,6 +112,7 @@ enum PredictInputMode {
   kWeighedDecodeCumsum,
   kFirstMoeAttnInputLogits,
   kMoeAttnInputLogits,
+  kMoeLayerLogits, // for a N moe-layer model, there will be N+1 logits
 };
 
 class ModuleMeta {
@@ -135,6 +136,7 @@ class ModuleMeta {
   int predict_input_decay = 2;    // decode cumsum weight decay
   int layer_predict_interval = 2; // the frequency of layer prediction
   int layer_predict_max_window = 3; // the max distance of layer prediction, n: 0 -> [0,...,n-1]
+  bool layer_predict_replace_first_input_with_last_output = false;
 
   bool can_do_layer(int cur_preempted_layer, int target_layer) {
     // (cur_preempted_layer, cur_preempted_layer + max_prefetch_layer_distance]

@@ -33,6 +33,7 @@ void Predictor::add_one_layer(int layer_id, int64_t *experts, size_t num_expert)
     }
     case kFirstMoeAttnInputLogits : { break; }
     case kMoeAttnInputLogits :      { break; }
+    case kMoeLayerLogits :          { break; }
     default : { CHECK(false) << "Unknown predict input mode"; }
   }
 }
@@ -86,6 +87,22 @@ torch::Tensor Predictor::predict(int input_layer_id) {
     }
     case kMoeAttnInputLogits: {
       input = this->moe_attn_input_logits_buffer_list[input_layer_id];
+      if (input.numel() == 0) {
+        LOG(DEBUG) << "skip prediction due to prefill";
+        return torch::empty({static_cast<long>(predict_model_metas[input_layer_id].orig_num_output_layer()), 0}, torch::kFloat32);
+      }
+      if (predict_model_metas[input_layer_id].num_output_layer() == 0) {
+        LOG(DEBUG) << "skip prediction due to empty output layers";
+        return torch::empty({static_cast<long>(predict_model_metas[input_layer_id].orig_num_output_layer()), 0}, torch::kFloat32);
+      }
+      LOG_BLOCK(DEBUG, logger, {
+        logger << "predictor, predict with input shape " << input.sizes() << " " << input.numel();
+      });
+      model = predict_model_list[input_layer_id];
+      input = input.clone().to(torch::kFloat32);
+    }
+    case kMoeLayerLogits: {
+      input = this->moe_layer_logits_buffer_list[input_layer_id];
       if (input.numel() == 0) {
         LOG(DEBUG) << "skip prediction due to prefill";
         return torch::empty({static_cast<long>(predict_model_metas[input_layer_id].orig_num_output_layer()), 0}, torch::kFloat32);
@@ -167,8 +184,25 @@ void Predictor::load_model(std::string model_path) {
     CHECK(false) << "Model path is not a regular file or directory: "
                  << model_path;
   }
+
+  layer_predict_enabled.resize(metas->num_layer + 1, false);
+  std::vector<int> layers_to_predict;
+  for (int l = 0; l < metas->num_layer; l+= metas->layer_predict_interval) {
+    layers_to_predict.push_back(l);
+    layer_predict_enabled[l] = true;
+  }
+
+  if (metas->layer_predict_replace_first_input_with_last_output) {
+    CHECK(metas->predict_input_mode == kMoeLayerLogits);
+    CHECK(predict_model_list.find(metas->num_layer) != predict_model_list.end());
+    CHECK(layers_to_predict[0] == 0);
+    layers_to_predict[0] = metas->num_layer;
+    layer_predict_enabled[0] = false;
+    layer_predict_enabled[metas->num_layer] = true;
+  }
+
   int stop_l = 0;
-  for (int l = 0; l < metas->num_layer; l += metas->layer_predict_interval) {
+  for (auto l : layers_to_predict) {
     CHECK(predict_model_metas.find(l) != predict_model_metas.end()) << "No model meta for layer " << l;
     auto & p_m_metas = predict_model_metas[l];
     CHECK(p_m_metas.orig_num_output_layer() > 0) << "No output layers for model at layer 0";
@@ -182,7 +216,7 @@ void Predictor::load_model(std::string model_path) {
     // orig_output_start_layer + slice_stop <= orig_output_stop_layer
     // orig_output_start_layer + slice_stop <= l + metas->layer_predict_max_window
 
-    p_m_metas.slice_stop = std::min<int>(p_m_metas.orig_num_output_layer(), l + metas->layer_predict_max_window - p_m_metas.orig_output_start_layer); 
+    p_m_metas.slice_stop = std::min<int>(p_m_metas.orig_num_output_layer(), (l % metas->num_layer) + metas->layer_predict_max_window - p_m_metas.orig_output_start_layer); 
     CHECK(p_m_metas.slice_start <= p_m_metas.slice_stop) << "No output layers for model at layer 0";
     stop_l = p_m_metas.output_layer_stop();
     LOG(ERROR) << "predict model " << l << ", "
@@ -203,6 +237,7 @@ void Predictor::start_of_new_sequence() {
     case kWeighedDecodeCumsum:     { weighted_access_freq_sum_buffer.fill_(0); break; }
     case kFirstMoeAttnInputLogits: { break; }
     case kMoeAttnInputLogits:      { break; }
+    case kMoeLayerLogits:          { break; }
     default: {
       CHECK(false) << "Unknown predict input mode";
     }
@@ -217,13 +252,14 @@ void Predictor::end_of_one_token_prediction() {
     case kWeighedDecodeCumsum:     { break;}
     case kFirstMoeAttnInputLogits: { break;}
     case kMoeAttnInputLogits:      { break;}
+    case kMoeLayerLogits:          { break;}
     default: {
       CHECK(false) << "Unknown predict input mode";
     }
   }
 }
 void Predictor::record_moe_attn_logits(int layer_id, torch::Tensor attn_logits) {
-  TRACE_EVENT_GURAD(kPredictor, "record_moe_attn_logits " + std::to_string(layer_id));
+  TRACE_EVENT_GURAD(kHook, "record_moe_attn_logits " + std::to_string(layer_id));
   LOG(DEBUG) << "predictor, record_moe_attn_logits " << layer_id;
   switch (metas->predict_input_mode) {
     case kOneToken:            { break; }
@@ -257,6 +293,45 @@ void Predictor::record_moe_attn_logits(int layer_id, torch::Tensor attn_logits) 
       }
       LOG(DEBUG) << "predictor, record attn logits";
       moe_attn_input_logits_buffer_list[layer_id] = attn_logits.to("cpu");
+      break;
+    }
+    case kMoeLayerLogits: { break; }
+    default: {
+      CHECK(false) << "Unknown predict input mode";
+    }
+  }
+}
+
+void Predictor::record_moe_layer_logits(int layer_id, torch::Tensor layer_logits) {
+  TRACE_EVENT_GURAD(kHook, "record_moe_layer_logits " + std::to_string(layer_id));
+  LOG(DEBUG) << "predictor, record_moe_layer_logits " << layer_id;
+  switch (metas->predict_input_mode) {
+    case kOneToken:                { break; }
+    case kDecodeCumsum:            { break; }
+    case kLastUseDistance:         { break; }
+    case kWeighedDecodeCumsum:     { break; }
+    case kFirstMoeAttnInputLogits: { break; }
+    case kMoeAttnInputLogits:      { break; }
+    case kMoeLayerLogits: {
+      CHECK(layer_logits.dim() == 3) << "input logits must be in shape [num_batch, seq_len, num_expert], but found " << layer_logits.sizes();
+      CHECK(layer_logits.size(0) == 1) << "batch > 1 not supported";
+      if (layer_logits.size(1) != 1) {
+        LOG(DEBUG) << "predictor, skip record due to prefill";
+        moe_layer_logits_buffer_list[layer_id] = torch::empty({0});
+        break;
+      }
+      if ((layer_id % metas->num_layer) % metas->layer_predict_interval != 0) {
+        LOG(DEBUG) << "predictor, skip record due to interval";
+        moe_layer_logits_buffer_list[layer_id] = torch::empty({0});
+        break;
+      }
+      if (metas->layer_predict_replace_first_input_with_last_output && layer_id == 0) {
+        LOG(DEBUG) << "predictor, skip record due to replace_first_input_with_last_output";
+        moe_layer_logits_buffer_list[layer_id] = torch::empty({0});
+        break;
+      }
+      LOG(DEBUG) << "predictor, record attn logits";
+      moe_layer_logits_buffer_list[layer_id] = layer_logits.to("cpu");
       break;
     }
     default: {

@@ -118,6 +118,7 @@ def inject_model(
     num_expert_per_token : int = None,
     expert_meta_parser = None,
     expert_name_filter = None,
+    moe_mlp_name_filter = None,
     moe_layer_name_filter = None,
     pin_memory : bool  = True,
     module_trace_event : bool = False,
@@ -128,6 +129,9 @@ def inject_model(
     predict_input_mode = None,
     layer_predict_interval = None,
     layer_predict_max_window = None,
+    model_id = None,
+    layer_predict_replace_first_input_with_last_output = False,
+    **kwargs
   ):
   """
   Injects a model with cache-related functionality.
@@ -172,7 +176,10 @@ def inject_model(
       Whether to enable timing of entire model. Defaults to False.
   """
   print("initializing cache lib...")
-  model_id = model.config._name_or_path
+  if len(kwargs) > 0:
+    print("warning, unused kwargs", kwargs)
+  if model_id is None:
+    model_id = model.config._name_or_path
 
   if num_moe_layer is None:
     auto_infered_model_metas = auto_infer_model_metas(model_id, return_dict=False)
@@ -181,6 +188,7 @@ def inject_model(
     num_expert_per_token  = auto_infered_model_metas.num_expert_per_token
     expert_meta_parser    = auto_infered_model_metas.expert_meta_parser
     expert_name_filter    = auto_infered_model_metas.expert_name_filter
+    moe_mlp_name_filter   = auto_infered_model_metas.moe_mlp_name_filter
     moe_layer_name_filter = auto_infered_model_metas.moe_layer_name_filter
     moe_attn_name_filter  = auto_infered_model_metas.moe_attn_name_filter
 
@@ -215,6 +223,7 @@ def inject_model(
   meta.reorder_experts = reorder_experts
   meta.promote_hit_in_prefetch = promote_hit_in_prefetch
   meta.early_preempt = early_preempt
+  meta.layer_predict_replace_first_input_with_last_output = layer_predict_replace_first_input_with_last_output
   meta.predict_input_mode = {
     'one_token': cpp_worker.kOneToken,
     'decode_cumsum': cpp_worker.kDecodeCumsum,
@@ -222,6 +231,7 @@ def inject_model(
     'weighted_decode_cumsum': cpp_worker.kWeighedDecodeCumsum,
     'first_moe_attn_input_logits': cpp_worker.kFirstMoeAttnInputLogits,
     'moe_attn_input_logits': cpp_worker.kMoeAttnInputLogits,
+    'moe_layer_logits': cpp_worker.kMoeLayerLogits,
   }[predict_input_mode]
 
   if layer_predict_interval is None:
@@ -239,7 +249,7 @@ def inject_model(
 
   print("injecting model...")
   register_expert_params(model, model_loader, expert_name_filter)
-  replace_mlp_report_experts(model, prefetch_mngr, predictor, num_moe_layer, num_expert_per_layer, num_predict_expert_per_layer, moe_layer_name_filter)
+  replace_mlp_report_experts(model, prefetch_mngr, predictor, num_moe_layer, num_expert_per_layer, num_predict_expert_per_layer, moe_mlp_name_filter)
 
   # fixme: a general model path
   if predictor_model_path == None:

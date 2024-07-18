@@ -243,6 +243,7 @@ void PrefetchMngr::mark_expert_using(int layer_id, int expert_id) {
 
 void PrefetchMngr::launch_thread() {
   predict_thread->on_one_iter_done();
+  predict_thread->on_moe_layer_logits_recorded(metas->num_layer);
 
   fetch_schedule_thread->launch();
   predict_thread->launch();
@@ -329,6 +330,14 @@ void PrefetchMngr::report_moe_attn_logits(int layer_id, torch::Tensor attn_logit
   });
   predictor->record_moe_attn_logits(layer_id, attn_logits);
   predict_thread->on_moe_attn_input_logits_recorded(layer_id);
+}
+
+void PrefetchMngr::report_moe_layer_logits(int layer_id, torch::Tensor layer_logits) {
+  LOG_BLOCK(DEBUG, logger, {
+    logger << "prefetch mngr, report_moe_layer_logits " << layer_id << ", " << layer_logits.sizes();
+  });
+  predictor->record_moe_layer_logits(layer_id, layer_logits);
+  predict_thread->on_moe_layer_logits_recorded(layer_id);
 }
 
 void PrefetchMngr::record_then_predict_and_prefetch(int layer_id, torch::Tensor experts) {

@@ -104,6 +104,7 @@ void PredictWorker::on_one_iter_done() {
     case kWeighedDecodeCumsum:     { add_one_task(PredictJob()); break; }
     case kFirstMoeAttnInputLogits: { break; }
     case kMoeAttnInputLogits:      { break; }
+    case kMoeLayerLogits:          { break; }
     default: { CHECK(false) << "Unknown predict input mode"; }
   }
 }
@@ -119,11 +120,31 @@ void PredictWorker::on_moe_attn_input_logits_recorded(int layer_id) {
       break;
     }
     case kMoeAttnInputLogits:      {
-      if (layer_id % metas->layer_predict_interval == 0) {
+      if (predictor->layer_predict_enabled[layer_id]) {
+      // if (layer_id % metas->layer_predict_interval == 0) {
         add_one_task(PredictJob(layer_id));
       }
       break;
     }
+    case kMoeLayerLogits:          { break; }
     default: { CHECK(false) << "Unknown predict input mode"; }
+  }
+}
+void PredictWorker::on_moe_layer_logits_recorded(int layer_id) {
+  LOG(DEBUG) << "predict workers, on_moe_layer_logits_recorded " << layer_id;
+  switch (metas->predict_input_mode) {
+    case kOneToken:                { break;}
+    case kDecodeCumsum:            { break;}
+    case kLastUseDistance:         { break;}
+    case kWeighedDecodeCumsum:     { break;}
+    case kFirstMoeAttnInputLogits: { break;}
+    case kMoeAttnInputLogits:      { break;}
+    case kMoeLayerLogits:          {
+      if (predictor->layer_predict_enabled[layer_id]) {
+        add_one_task(PredictJob(layer_id));
+      }
+      break;
+    }
+    default: { CHECK(false) << "Unknown predict input mode in on_moe_layer_logits_recorded"; }
   }
 }

@@ -200,14 +200,25 @@ class ExpertHook(ModelHook):
   #   return super().detach_hook(module)
 
 class MoeLayerHook(ModelHook):
-  def __init__(self, prefetch_mngr):
+  def __init__(self, prefetch_mngr, extract_logits_from_input = None, extract_logits_from_output = None):
     self.prefetch_mngr = prefetch_mngr
+    if extract_logits_from_input is None:
+      def extract_logits_from_input(*args, **kwargs):
+        return args[0]
+    if extract_logits_from_output is None:
+      def extract_logits_from_output(output):
+        return output[0]
+    self.extract_logits_from_input = extract_logits_from_input
+    self.extract_logits_from_output = extract_logits_from_output
     pass
   # def init_hook(self, module):
   #   return super().init_hook(module)
-#   def pre_forward(self, module, *args, **kwargs):
-#     return super().pre_forward(module, *args, **kwargs)
+  def pre_forward(self, module, *args, **kwargs):
+    if module._layer_id == 0:
+      self.prefetch_mngr.report_moe_layer_logits(module._layer_id, self.extract_logits_from_input(*args, **kwargs))
+    return args, kwargs
   def post_forward(self, module, output):
+    self.prefetch_mngr.report_moe_layer_logits(module._layer_id + 1, self.extract_logits_from_output(output))
     self.prefetch_mngr.one_moe_layer_done(module._layer_id)
     return output
   # def detach_hook(self, module):
