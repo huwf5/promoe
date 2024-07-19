@@ -76,16 +76,12 @@ void FetchWorker::do_one_task_impl(CopyTask *task) {
     task->lambda_wait();
   }
   for (int mem_buf_idx = task->start_mem_buf_idx; mem_buf_idx < task->stop_mem_buf_idx; mem_buf_idx++) {
+    task->expert->reference_to_model_param.mem_buffers[mem_buf_idx].map_to(task->expert->gpu_data->mem_buffers[mem_buf_idx]);
     CUDA_CALL(cudaMemcpyAsync(
-      task->expert->gpu_data->mem_buffers[mem_buf_idx].ptr(),
+      task->expert->reference_to_model_param.mem_buffers[mem_buf_idx].ptr(),
       task->expert->host_data.mem_buffers[mem_buf_idx].ptr(),
       task->expert->host_data.mem_buffers[mem_buf_idx].len(),
       cudaMemcpyHostToDevice, this->stream));
-
-    // point model parameter to destination
-    auto gpu_tensor = task->expert->gpu_data->mem_buffers[mem_buf_idx].get_tensor();
-    auto expert_param = task->expert->reference_to_model_param.mem_buffers[mem_buf_idx].get_tensor();
-    expert_param.set_(gpu_tensor, 0, gpu_tensor.sizes(), gpu_tensor.strides());
   }
 
   CUDA_CALL(cudaStreamSynchronize(this->stream));

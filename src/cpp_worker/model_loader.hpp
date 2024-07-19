@@ -10,18 +10,28 @@
 #include "utils.hpp"
 
 class MemBuffer {
-  // void* ptr;
-  // size_t len;
-  // void* ptr;
-  // size_t len;
   torch::Tensor data;
  public:
   MemBuffer() {}
   MemBuffer(torch::Tensor t) : data(t) {}
-  void set_tensor(torch::Tensor t) { data = t; }
   torch::Tensor get_tensor() { return data; }
   void* ptr() {return data.data_ptr();}
   size_t len() {return data.nbytes();}
+  void map_to(MemBuffer& physical) {
+    data.set_(physical.data, 0, physical.data.sizes(), physical.data.strides());
+  }
+  void make_logical(torch::IntArrayRef shape, torch::TensorOptions options) {
+    data = torch::empty({0}, options);
+  }
+  void make_logical(torch::TensorOptions options) {
+    make_logical({0}, options);
+  }
+  void pin_memory() {
+    data = data.pin_memory();
+  }
+  void allocate_like(MemBuffer& other, torch::TensorOptions options) {
+    data = torch::empty_like(other.data, options);
+  }
 };
 
 class ExpertMemHanlder {
@@ -56,22 +66,6 @@ class ModelLoader {
   ModelLoader(std::shared_ptr<ModuleMeta> metas) : metas(metas) {
     source_list.resize(metas->num_layer * metas->num_expert, nullptr);
   }
-  // void add_one_expert(std::shared_ptr<torch::nn::Module> expert, int layer_id, int expert_id) {
-  //   auto params = expert->parameters();
-  //   if (layer_id == 0 && expert_id == 0) {
-  //     metas->num_per_expert_param = params.size();
-  //     metas->param_name_list = expert->named_parameters().keys();
-  //   }
-  //   auto expert_handler = new ExpertHandler();
-  //   // expert_handler->expert_module = expert;
-  //   expert_handler->expert_idx = expert_id;
-  //   expert_handler->layer_idx = layer_id;
-  //   for (int i = 0; i < params.size(); i++) {
-  //     expert_handler->host_data.mem_buffers[i].set_tensor(params[i].pin_memory());
-  //   }
-  //   expert->to(torch::Device("meta"));
-  //   source_list[metas->squeeze_expert_idx(layer_id, expert_id)] = expert_handler;
-  // }
   void add_one_expert_param(torch::Tensor param, int layer_id, int expert_id, std::string param_name) {
     return add_one_expert_param(param, layer_id, expert_id, metas->param_name_to_id[param_name]);
   }

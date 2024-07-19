@@ -15,12 +15,11 @@ void ModelLoader::add_one_expert_param(torch::Tensor param, int layer_id,
   } else {
     expert_handler = source_list[metas->squeeze_expert_idx(layer_id, expert_id)];
   }
-  // expert_handler->host_data.mem_buffers[param_id].set_tensor(param.pin_memory());
-  expert_handler->host_data.mem_buffers[param_id].set_tensor(param);
+  expert_handler->host_data.mem_buffers[param_id] = MemBuffer(param);
 
   // this does not trigger actual memory allocaiton
   auto options = torch::TensorOptions().device("cuda").dtype(param.dtype());
-  expert_handler->reference_to_model_param.mem_buffers[param_id].set_tensor(torch::empty({0}, options));
+  expert_handler->reference_to_model_param.mem_buffers[param_id].make_logical({0}, options);
 }
 void ModelLoader::pin_memory() {
   LOG(INFO) << "pin expert memorys on cpu...";
@@ -28,8 +27,7 @@ void ModelLoader::pin_memory() {
   for (int l = 0; l < metas->num_layer; l++) {
     for (int e = 0; e < metas->num_expert; e++) {
       for (int p = 0; p < metas->num_per_expert_param; p++) {
-        auto orig_tensor = source_list[metas->squeeze_expert_idx(l, e)]->host_data.mem_buffers[p].get_tensor();
-        source_list[metas->squeeze_expert_idx(l, e)]->host_data.mem_buffers[p].set_tensor(orig_tensor.pin_memory());
+        source_list[metas->squeeze_expert_idx(l, e)]->host_data.mem_buffers[p].pin_memory();
       }
     }
   }
