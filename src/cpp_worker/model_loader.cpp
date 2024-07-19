@@ -15,7 +15,7 @@ void ModelLoader::add_one_expert_param(torch::Tensor param, int layer_id,
   } else {
     expert_handler = source_list[metas->squeeze_expert_idx(layer_id, expert_id)];
   }
-  expert_handler->host_data.mem_buffers[param_id] = MemBuffer(param);
+  expert_handler->host_data.mem_buffers[param_id] = HostMemWrapper(param);
 
   // this does not trigger actual memory allocaiton
   auto options = torch::TensorOptions().device("cuda").dtype(param.dtype());

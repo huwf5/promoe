@@ -9,15 +9,74 @@
 
 #include "utils.hpp"
 
-class MemBuffer {
+// class MemBuffer {
+//   torch::Tensor data;
+//  public:
+//   MemBuffer() {}
+//   MemBuffer(torch::Tensor t) : data(t) {}
+//   torch::Tensor get_tensor() { return data; }
+//   void* ptr() {return data.data_ptr();}
+//   size_t len() {return data.nbytes();}
+//   void map_to(MemBuffer& physical) {
+//     data.set_(physical.data, 0, physical.data.sizes(), physical.data.strides());
+//   }
+//   void make_logical(torch::IntArrayRef shape, torch::TensorOptions options) {
+//     data = torch::empty({0}, options);
+//   }
+//   void make_logical(torch::TensorOptions options) {
+//     make_logical({0}, options);
+//   }
+//   void pin_memory() {
+//     data = data.pin_memory();
+//   }
+//   void allocate_like(MemBuffer& other, torch::TensorOptions options) {
+//     data = torch::empty_like(other.data, options);
+//   }
+// };
+
+// class ExpertMemHanlder {
+//  public:
+//   std::vector<MemBuffer> mem_buffers;
+// };
+
+class HostMemWrapper {
+  torch::Tensor data;
+  friend class PhysicalMemHandler;
+ public:
+  HostMemWrapper() {}
+  HostMemWrapper(torch::Tensor t) : data(t) {}
+  void* ptr() {return data.data_ptr();}
+  size_t len() {return data.nbytes();}
+  void pin_memory() {
+    data = data.pin_memory();
+  }
+};
+
+class HostExpertMemHanlder {
+ public:
+  std::vector<HostMemWrapper> mem_buffers;
+};
+
+class PhysicalMemHandler {
+  torch::Tensor data;
+  friend class LogicalMemHandler;
+ public:
+  PhysicalMemHandler() {}
+  // PhysicalMemHandler(torch::Tensor t) : data(t) {}
+  // void* ptr() {return data.data_ptr();}
+  // size_t len() {return data.nbytes();}
+  void allocate_like(HostMemWrapper& other, torch::TensorOptions options) {
+    data = torch::empty_like(other.data, options);
+  }
+};
+class LogicalMemHandler {
   torch::Tensor data;
  public:
-  MemBuffer() {}
-  MemBuffer(torch::Tensor t) : data(t) {}
+  LogicalMemHandler() {}
   torch::Tensor get_tensor() { return data; }
   void* ptr() {return data.data_ptr();}
   size_t len() {return data.nbytes();}
-  void map_to(MemBuffer& physical) {
+  void map_to(PhysicalMemHandler& physical) {
     data.set_(physical.data, 0, physical.data.sizes(), physical.data.strides());
   }
   void make_logical(torch::IntArrayRef shape, torch::TensorOptions options) {
@@ -26,24 +85,23 @@ class MemBuffer {
   void make_logical(torch::TensorOptions options) {
     make_logical({0}, options);
   }
-  void pin_memory() {
-    data = data.pin_memory();
-  }
-  void allocate_like(MemBuffer& other, torch::TensorOptions options) {
-    data = torch::empty_like(other.data, options);
-  }
 };
 
 class ExpertMemHanlder {
  public:
-  std::vector<MemBuffer> mem_buffers;
+  std::vector<PhysicalMemHandler> mem_buffers;
+};
+
+class ExpertParamWrapper {
+ public:
+  std::vector<LogicalMemHandler> mem_buffers;
 };
 
 class ExpertHandler {
  public:
   // std::shared_ptr<torch::nn::Module> expert_module;
-  ExpertMemHanlder host_data;
-  ExpertMemHanlder reference_to_model_param;
+  HostExpertMemHanlder host_data;
+  ExpertParamWrapper reference_to_model_param;
   ExpertMemHanlder* gpu_data = nullptr;
   int num_ready = 0;
   int layer_idx, expert_idx;
