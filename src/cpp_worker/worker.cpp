@@ -76,18 +76,16 @@ void FetchWorker::do_one_task_impl(CopyTask *task) {
     task->lambda_wait();
   }
   for (int mem_buf_idx = task->start_mem_buf_idx; mem_buf_idx < task->stop_mem_buf_idx; mem_buf_idx++) {
-    // LOG(ERROR) << "fetcher: copy from " << task->expert->host_data.mem_buffers[mem_buf_idx].ptr() << " to " << task->expert->reference_to_model_param.mem_buffers[mem_buf_idx].ptr();
+    // LOG(ERROR) << "fetcher: copy from " << task->expert->host_data.ptr(mem_buf_idx) << " to " << task->expert->gpu_data->ptr(mem_buf_idx);
     CUDA_CALL(cudaMemcpyAsync(
-      task->expert->gpu_data->mem_buffers[mem_buf_idx].logical_ptr.ptr(),
-      task->expert->host_data.mem_buffers[mem_buf_idx].ptr(),
-      task->expert->host_data.mem_buffers[mem_buf_idx].len(),
+      task->expert->gpu_data->ptr(mem_buf_idx),
+      task->expert->host_data.ptr(mem_buf_idx),
+      task->expert->host_data.len(mem_buf_idx),
       cudaMemcpyHostToDevice, this->stream));
   }
   if (task->start_mem_buf_idx == 0) {
     task->expert->reference_to_model_param.unmap();
-  }
-  for (int mem_buf_idx = task->start_mem_buf_idx; mem_buf_idx < task->stop_mem_buf_idx; mem_buf_idx++) {
-    task->expert->reference_to_model_param.mem_buffers[mem_buf_idx].map_to(task->expert->gpu_data->mem_buffers[mem_buf_idx], mem_mngr_ctx);
+    task->expert->reference_to_model_param.map_to(task->expert->gpu_data, mem_mngr_ctx);
   }
 
   CUDA_CALL(cudaStreamSynchronize(this->stream));

@@ -9,18 +9,14 @@ void CacheMngr::init_gpu_mem_buffer(size_t num_buffers) {
   CHECK(num_buffers % num_cache_slot == 0);
   size_t per_layer_cache_len = num_buffers / num_cache_slot;
 
-  auto &mem_example = model_loader->get_source(0, 0)->host_data.mem_buffers;
+  auto &mem_example = model_loader->get_source(0, 0)->host_data;
 
   for (auto & cache_slot : cache_slots->slots) {
     cache_slot.full_len = per_layer_cache_len;
     cache_slot.unused_mems.resize(per_layer_cache_len, nullptr);
     for (auto & cache_line : cache_slot.unused_mems) {
       cache_line = new ExpertMemHanlder;
-      cache_line->mem_buffers.resize(mem_example.size());
-      for (int j = 0; j < mem_example.size(); j++) {
-        // cache_line->mem_buffers[j].allocate_like(mem_example[j], torch::TensorOptions().device(torch::kCUDA, model_loader->mem_mngr_ctx->device_id), model_loader->mem_mngr_ctx.get());
-        cache_line->mem_buffers[j].allocate_like(mem_example[j], model_loader->mem_mngr_ctx.get());
-      }
+      cache_line->allocate_like(mem_example, model_loader->mem_mngr_ctx.get());
     }
   }
 }

@@ -56,9 +56,11 @@ class PhysicalMemHandlerTensor;
 class PhysicalMemHandlerCUDriver;
 class HostMemWrapper {
   torch::Tensor data;
-  friend class PhysicalMemHandler;
   friend class PhysicalMemHandlerTensor;
+  friend class LogicalMemHandlerTensor;
   friend class PhysicalMemHandlerCUDriver;
+  friend class LogicalMemHandlerCUDriver;
+  friend class ExpertParamWrapper;
  public:
   HostMemWrapper() {}
   HostMemWrapper(torch::Tensor t) : data(t) {}
@@ -72,6 +74,14 @@ class HostMemWrapper {
 class HostExpertMemHanlder {
  public:
   std::vector<HostMemWrapper> mem_buffers;
+  HostExpertMemHanlder() {}
+  HostExpertMemHanlder(int num) : mem_buffers(num) {}
+  void pin_memory() {
+    for (auto & m : mem_buffers) { m.pin_memory(); }
+  }
+  void*  ptr(int idx) { return mem_buffers[idx].ptr(); }
+  size_t len(int idx) { return mem_buffers[idx].len(); }
+  void set(int idx, torch::Tensor &param);
 };
 class MemMngrCtx;
 
@@ -120,7 +130,6 @@ class LogicalMemHandlerCUDriver {
 };
 
 class PhysicalMemHandlerCUDriver {
-  torch::Tensor data;
   friend class LogicalMemHandlerCUDriver;
   friend class MemMngrCtx;
   CUmemGenericAllocationHandle handle;
@@ -150,12 +159,34 @@ class MemMngrCtx {
 class ExpertMemHanlder {
  public:
   std::vector<PhysicalMemHandler> mem_buffers;
+  void allocate_like(HostExpertMemHanlder& other, MemMngrCtx* ctx) {
+    this->mem_buffers.resize(other.mem_buffers.size());
+    for (int j = 0; j < other.mem_buffers.size(); j++) {
+      this->mem_buffers[j].allocate_like(other.mem_buffers[j], ctx);
+    }
+  }
+  void* ptr(int idx) { return mem_buffers[idx].logical_ptr.ptr(); }
+  // size_t len(int idx) { return mem_buffers[idx].logical_ptr.len(); }
 };
 
 class ExpertParamWrapper {
  public:
   std::vector<LogicalMemHandler> mem_buffers;
+  ExpertParamWrapper() {}
+  ExpertParamWrapper(int num) : mem_buffers(num) {}
   void unmap();
+  void map_to(ExpertMemHanlder* physical, MemMngrCtx* ctx) {
+    for (int i = 0; i < mem_buffers.size(); i++) {
+      mem_buffers[i].map_to(physical->mem_buffers[i], ctx);
+    }
+  }
+  void make_logical(HostExpertMemHanlder& other, MemMngrCtx* ctx) {
+    mem_buffers.resize(other.mem_buffers.size());
+    for (int i = 0; i < other.mem_buffers.size(); i++) {
+      auto options = torch::TensorOptions().device(torch::kCUDA, ctx->device_id).dtype(other.mem_buffers[i].data.dtype());
+      mem_buffers[i].make_logical(other.mem_buffers[i].data.sizes(), options, ctx);
+    }
+  }
 };
 
 class ExpertHandler {
@@ -183,14 +214,22 @@ class ModelLoader {
   std::shared_ptr<ModuleMeta> metas;
  public:
   std::shared_ptr<MemMngrCtx> mem_mngr_ctx;
-  ModelLoader(std::shared_ptr<ModuleMeta> metas) : metas(metas) {
-    source_list.resize(metas->num_layer * metas->num_expert, nullptr);
-    mem_mngr_ctx = std::make_shared<MemMngrCtx>();
-  }
+  ModelLoader(std::shared_ptr<ModuleMeta> metas);
   void add_one_expert_param(torch::Tensor param, int layer_id, int expert_id, std::string param_name) {
     return add_one_expert_param(param, layer_id, expert_id, metas->param_name_to_id[param_name]);
   }
   void add_one_expert_param(torch::Tensor param, int layer_id, int expert_id, int param_id);
+  void build_logical_expert_param() {
+    for (int layer_id = 0; layer_id < metas->num_layer; layer_id++) {
+      for (int expert_id = 0; expert_id < metas->num_expert; expert_id++) {
+        build_logical_expert_param(layer_id, expert_id);
+      }
+    }
+  }
+  void build_logical_expert_param(int layer_id, int expert_id) {
+    auto e = source_list[metas->squeeze_expert_idx(layer_id, expert_id)];
+    e->reference_to_model_param.make_logical(e->host_data, mem_mngr_ctx.get());
+  }
   torch::Tensor ref_one_expert_param(int layer_id, int expert_id, std::string param_name) {
     return ref_one_expert_param(layer_id, expert_id, metas->param_name_to_id[param_name]);
   }

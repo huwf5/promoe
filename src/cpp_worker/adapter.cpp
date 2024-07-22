@@ -42,6 +42,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     .def("pin_memory", &ModelLoader::pin_memory)
     .def("add_one_expert_param", static_cast<void (ModelLoader::*)(torch::Tensor, int, int, std::string)>(&ModelLoader::add_one_expert_param))
     .def("add_one_expert_param", static_cast<void (ModelLoader::*)(torch::Tensor, int, int, int)>(&ModelLoader::add_one_expert_param))
+    .def("build_logical_expert_param", static_cast<void (ModelLoader::*)()>(&ModelLoader::build_logical_expert_param))
     .def("ref_one_expert_param", static_cast<torch::Tensor (ModelLoader::*)(int, int, std::string)>(&ModelLoader::ref_one_expert_param))
     .def("ref_one_expert_param", static_cast<torch::Tensor (ModelLoader::*)(int, int, int)>(&ModelLoader::ref_one_expert_param))
     // .def("add_one_expert", &ModelLoader::add_one_expert)

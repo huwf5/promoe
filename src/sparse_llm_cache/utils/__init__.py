@@ -36,7 +36,10 @@ def register_expert_params(model, model_loader, filter=RegexFilter(r'.*layers\.(
     # print(f'registering expert {name}')
     for k,v in module.named_parameters():
       model_loader.add_one_expert_param(v, module._layer_id, module._expert_id, k)
+  recursive_traverse_childrens(model, f, filter)
 
+  model_loader.build_logical_expert_param()
+  def f(module, name):
     def update_child_param(child_module, child_name):
       for n,_ in child_module.named_parameters():
         child_module._parameters[n] = model_loader.ref_one_expert_param(module._layer_id, module._expert_id, child_name + '.' + n)
