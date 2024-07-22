@@ -10,6 +10,18 @@
 
 #include "utils.hpp"
 
+#define MEM_WRAP_USE_CU_DRIVER
+// #define MEM_WRAP_USE_TORCH_TENSOR
+
+#ifdef MEM_WRAP_USE_TORCH_TENSOR
+#define LogicalMemHandler  LogicalMemHandlerTensor
+#define PhysicalMemHandler PhysicalMemHandlerTensor
+#endif
+#ifdef MEM_WRAP_USE_CU_DRIVER
+#define LogicalMemHandler  LogicalMemHandlerCUDriver
+#define PhysicalMemHandler PhysicalMemHandlerCUDriver
+#endif
+
 // class MemBuffer {
 //   torch::Tensor data;
 //  public:
@@ -40,9 +52,13 @@
 //   std::vector<MemBuffer> mem_buffers;
 // };
 
+class PhysicalMemHandlerTensor;
+class PhysicalMemHandlerCUDriver;
 class HostMemWrapper {
   torch::Tensor data;
   friend class PhysicalMemHandler;
+  friend class PhysicalMemHandlerTensor;
+  friend class PhysicalMemHandlerCUDriver;
  public:
   HostMemWrapper() {}
   HostMemWrapper(torch::Tensor t) : data(t) {}
@@ -58,34 +74,61 @@ class HostExpertMemHanlder {
   std::vector<HostMemWrapper> mem_buffers;
 };
 class MemMngrCtx;
-class PhysicalMemHandler;
-class LogicalMemHandler {
-  torch::Tensor data;
 
-  CUdeviceptr device_ptr;
-  size_t nbytes;
-  friend class PhysicalMemHandler;
+class LogicalMemHandlerTensor {
+  torch::Tensor data;
+  friend class PhysicalMemHandlerTensor;
  public:
-  LogicalMemHandler() {}
+  LogicalMemHandlerTensor() {}
   torch::Tensor get_tensor() { return data; }
   void* ptr() {return data.data_ptr();}
   size_t len() {return data.nbytes();}
-  void map_to(PhysicalMemHandler &physical, MemMngrCtx* ctx);
+  void map_to(PhysicalMemHandlerTensor &physical, MemMngrCtx* ctx);
   void unmap();
   void make_logical(torch::IntArrayRef shape, torch::TensorOptions options, MemMngrCtx* ctx);
   void make_logical(torch::TensorOptions options, MemMngrCtx* ctx) { make_logical({0}, options, ctx); }
 };
 
-class PhysicalMemHandler {
+class PhysicalMemHandlerTensor {
   torch::Tensor data;
-  friend class LogicalMemHandler;
+  friend class LogicalMemHandlerTensor;
+  friend class MemMngrCtx;
+  size_t nbytes;
+ public:
+  LogicalMemHandlerTensor logical_ptr;
+  PhysicalMemHandlerTensor() {}
+  void allocate_like(HostMemWrapper &other, torch::TensorOptions options, MemMngrCtx* ctx);
+  void allocate_like(HostMemWrapper &other, MemMngrCtx* ctx);
+  void allocate(size_t nbytes, MemMngrCtx *ctx);
+};
+
+class LogicalMemHandlerCUDriver {
+  torch::Tensor data;
+
+  CUdeviceptr device_ptr;
+  size_t nbytes;
+  friend class PhysicalMemHandlerCUDriver;
+ public:
+  LogicalMemHandlerCUDriver() {}
+  torch::Tensor get_tensor() { return data; }
+  void* ptr() {return data.data_ptr();}
+  size_t len() {return data.nbytes();}
+  void map_to(PhysicalMemHandlerCUDriver &physical, MemMngrCtx* ctx);
+  void unmap();
+  void make_logical(torch::IntArrayRef shape, torch::TensorOptions options, MemMngrCtx* ctx);
+  void make_logical(torch::TensorOptions options, MemMngrCtx* ctx) { make_logical({0}, options, ctx); }
+};
+
+class PhysicalMemHandlerCUDriver {
+  torch::Tensor data;
+  friend class LogicalMemHandlerCUDriver;
   friend class MemMngrCtx;
   CUmemGenericAllocationHandle handle;
   size_t nbytes;
  public:
-  LogicalMemHandler logical_ptr;
-  PhysicalMemHandler() {}
-  // PhysicalMemHandler(torch::Tensor t) : data(t) {}
+  LogicalMemHandlerCUDriver logical_ptr;
+  PhysicalMemHandlerCUDriver() {}
+  // PhysicalMemHandlerCUDriver(torch::Tensor t) : data(t) {}
   // void* ptr() {return data.data_ptr();}
   // size_t len() {return data.nbytes();}
   void allocate_like(HostMemWrapper &other, torch::TensorOptions options, MemMngrCtx* ctx);
@@ -95,7 +138,7 @@ class PhysicalMemHandler {
 
 class MemMngrCtx {
  public:
-  PhysicalMemHandler dummy_mem;
+  PhysicalMemHandlerCUDriver dummy_mem;
   CUmemAllocationProp prop{};
   size_t granularity = 0;
   CUmemAccessDesc accessDesc = {};
