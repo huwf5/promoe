@@ -17,6 +17,7 @@ setup(
                 'src/cpp_worker/worker.cpp',
             ],
             extra_compile_args={'cxx': ['-g', '-fopenmp'], 'nvcc': ['-g', '-fopenmp']},
+            libraries = ['cuda']
         ),
     ],
     include_dirs=['./3rdparty/json/single_include'],

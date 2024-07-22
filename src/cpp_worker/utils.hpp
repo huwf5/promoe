@@ -409,3 +409,8 @@ class Queue {
 inline bool string_is_on(const std::string s) {
   return s == "on" || s == "true" || s == "1" || s == "ON" || s == "TRUE";
 }
+
+template<typename T>
+inline T round_up(T val, T align) {
+  return ((val + align - 1) / align) * align;
+}

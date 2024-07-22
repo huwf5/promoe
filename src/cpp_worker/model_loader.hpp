@@ -6,6 +6,7 @@
 
 #include <torch/torch.h>
 #include <cuda_runtime.h>
+#include <cuda.h>
 
 #include "utils.hpp"
 
@@ -56,35 +57,51 @@ class HostExpertMemHanlder {
  public:
   std::vector<HostMemWrapper> mem_buffers;
 };
-
-class PhysicalMemHandler {
-  torch::Tensor data;
-  friend class LogicalMemHandler;
- public:
-  PhysicalMemHandler() {}
-  // PhysicalMemHandler(torch::Tensor t) : data(t) {}
-  // void* ptr() {return data.data_ptr();}
-  // size_t len() {return data.nbytes();}
-  void allocate_like(HostMemWrapper& other, torch::TensorOptions options) {
-    data = torch::empty_like(other.data, options);
-  }
-};
+class MemMngrCtx;
+class PhysicalMemHandler;
 class LogicalMemHandler {
   torch::Tensor data;
+
+  CUdeviceptr device_ptr;
+  size_t nbytes;
+  friend class PhysicalMemHandler;
  public:
   LogicalMemHandler() {}
   torch::Tensor get_tensor() { return data; }
   void* ptr() {return data.data_ptr();}
   size_t len() {return data.nbytes();}
-  void map_to(PhysicalMemHandler& physical) {
-    data.set_(physical.data, 0, physical.data.sizes(), physical.data.strides());
-  }
-  void make_logical(torch::IntArrayRef shape, torch::TensorOptions options) {
-    data = torch::empty({0}, options);
-  }
-  void make_logical(torch::TensorOptions options) {
-    make_logical({0}, options);
-  }
+  void map_to(PhysicalMemHandler &physical, MemMngrCtx* ctx);
+  void unmap();
+  void make_logical(torch::IntArrayRef shape, torch::TensorOptions options, MemMngrCtx* ctx);
+  void make_logical(torch::TensorOptions options, MemMngrCtx* ctx) { make_logical({0}, options, ctx); }
+};
+
+class PhysicalMemHandler {
+  torch::Tensor data;
+  friend class LogicalMemHandler;
+  friend class MemMngrCtx;
+  CUmemGenericAllocationHandle handle;
+  size_t nbytes;
+ public:
+  LogicalMemHandler logical_ptr;
+  PhysicalMemHandler() {}
+  // PhysicalMemHandler(torch::Tensor t) : data(t) {}
+  // void* ptr() {return data.data_ptr();}
+  // size_t len() {return data.nbytes();}
+  void allocate_like(HostMemWrapper &other, torch::TensorOptions options, MemMngrCtx* ctx);
+  void allocate_like(HostMemWrapper &other, MemMngrCtx* ctx);
+  void allocate(size_t nbytes, MemMngrCtx *ctx);
+};
+
+class MemMngrCtx {
+ public:
+  PhysicalMemHandler dummy_mem;
+  CUmemAllocationProp prop{};
+  size_t granularity = 0;
+  CUmemAccessDesc accessDesc = {};
+  int device_id = 0;
+
+  MemMngrCtx();
 };
 
 class ExpertMemHanlder {
@@ -95,6 +112,7 @@ class ExpertMemHanlder {
 class ExpertParamWrapper {
  public:
   std::vector<LogicalMemHandler> mem_buffers;
+  void unmap();
 };
 
 class ExpertHandler {
@@ -121,8 +139,10 @@ class ModelLoader {
   std::vector<ExpertHandler*> source_list;
   std::shared_ptr<ModuleMeta> metas;
  public:
+  std::shared_ptr<MemMngrCtx> mem_mngr_ctx;
   ModelLoader(std::shared_ptr<ModuleMeta> metas) : metas(metas) {
     source_list.resize(metas->num_layer * metas->num_expert, nullptr);
+    mem_mngr_ctx = std::make_shared<MemMngrCtx>();
   }
   void add_one_expert_param(torch::Tensor param, int layer_id, int expert_id, std::string param_name) {
     return add_one_expert_param(param, layer_id, expert_id, metas->param_name_to_id[param_name]);

@@ -110,13 +110,15 @@ class FetchScheduleWorker;
 class FetchWorker : public WorkerThread<CopyTask*> {
   ModuleMeta* metas;
   FetchScheduleWorker* fetch_schedule_thread;
+  MemMngrCtx* mem_mngr_ctx;
   cudaStream_t stream;
   friend class PrefetchMngr;
  public:
-  void init(ModuleMeta* metas, FetchScheduleWorker* fetch_schedule_thread, cudaStream_t stream) {
+  void init(ModuleMeta* metas, FetchScheduleWorker* fetch_schedule_thread, MemMngrCtx* mem_mngr_ctx, cudaStream_t stream) {
     this->metas = metas;
     this->fetch_schedule_thread = fetch_schedule_thread;
     this->stream = stream;
+    this->mem_mngr_ctx = mem_mngr_ctx;
   }
  protected:
   void do_one_task_impl(CopyTask *task) override;
