@@ -134,8 +134,8 @@ class ModuleMeta {
   PredictInputMode predict_input_mode = kOneToken;
   int predict_input_reuse_distance_max = 10;
   int predict_input_decay = 2;    // decode cumsum weight decay
-  int layer_predict_interval = 2; // the frequency of layer prediction
-  int layer_predict_max_window = 3; // the max distance of layer prediction, n: 0 -> [0,...,n-1]
+  int layer_predict_interval   = -1; // the frequency of layer prediction
+  int layer_predict_max_window = -1; // the max distance of layer prediction, n: 0 -> [0,...,n-1]
   bool layer_predict_replace_first_input_with_last_output = false;
 
   bool can_do_layer(int cur_preempted_layer, int target_layer) {
@@ -158,6 +158,17 @@ class ModuleMeta {
   }
   inline std::pair<int,int> unsqueeze_expert_idx(int flatten_expert_id) {
     return std::make_pair(flatten_expert_id / num_expert, flatten_expert_id % num_expert);
+  }
+
+  void handle_uninited_configs() {
+    if (layer_predict_interval == -1) {
+      layer_predict_interval = num_layer;
+      layer_predict_max_window = num_layer;
+    }
+    if (max_prefetch_layer_distance == -1) {
+      max_prefetch_layer_distance = num_layer - 1;
+    }
+
   }
 };
 

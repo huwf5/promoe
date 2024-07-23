@@ -130,8 +130,8 @@ def inject_model(
     cache_trace_path : str = None,
     predictor_model_path : str = None,
     predict_input_mode = None,
-    layer_predict_interval = None,
-    layer_predict_max_window = None,
+    layer_predict_interval   = -1,
+    layer_predict_max_window = -1,
     model_id = None,
     layer_predict_replace_first_input_with_last_output = False,
     **kwargs
@@ -195,8 +195,6 @@ def inject_model(
     moe_layer_name_filter = auto_infered_model_metas.moe_layer_name_filter
     moe_attn_name_filter  = auto_infered_model_metas.moe_attn_name_filter
 
-  if max_prefetch_layer_distance is None or max_prefetch_layer_distance == -1:
-    max_prefetch_layer_distance = num_moe_layer - 1
   if cache_len is None:
     if per_layer_cache:
       cache_len = round(cache_rate * num_expert_per_layer) * num_moe_layer
@@ -237,11 +235,10 @@ def inject_model(
     'moe_layer_logits': cpp_worker.kMoeLayerLogits,
   }[predict_input_mode]
 
-  if layer_predict_interval is None:
-    layer_predict_interval = num_moe_layer
-    layer_predict_max_window = num_moe_layer
   meta.layer_predict_interval = layer_predict_interval
   meta.layer_predict_max_window = layer_predict_max_window
+
+  meta.handle_uninited_configs()
 
   model_loader  = cpp_worker.ModelLoader(meta)
   predictor     = cpp_worker.Predictor(meta)
