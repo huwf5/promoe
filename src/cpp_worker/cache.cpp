@@ -15,8 +15,8 @@ void CacheMngr::init_gpu_mem_buffer(size_t num_buffers) {
     cache_slot.full_len = per_layer_cache_len;
     cache_slot.unused_mems.resize(per_layer_cache_len, nullptr);
     for (auto & cache_line : cache_slot.unused_mems) {
-      cache_line = new ExpertMemHanlder;
-      cache_line->allocate_like(mem_example, model_loader->mem_mngr_ctx.get());
+      cache_line = ExpertMemParamFactory::get().create_physical(metas->physical_mem_impl);
+      cache_line->allocate_like(mem_example.get(), model_loader->mem_mngr_ctx.get());
     }
   }
 }
@@ -78,7 +78,7 @@ void CacheMngr::handle_hit(ExpertHandler *expert) {}
 void CacheMngr::handle_miss(ExpertHandler *expert) {
   CHECK(false) << "Deprecated";
 }
-ExpertMemHanlder* CacheMngr::evict(ExpertHandler *e_to_evict, ExpertHandler *incoming_e, bool reserve_mem) {
+ExpertMemHanlderBase* CacheMngr::evict(ExpertHandler *e_to_evict, ExpertHandler *incoming_e, bool reserve_mem) {
   CHECK(false) << "Deprecated";
   TRACE_EVENT_GURAD(kCache, "evict " + e_to_evict->toString());
   LOG(TRACE) << "cache evict " << e_to_evict->toString();

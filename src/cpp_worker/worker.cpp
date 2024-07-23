@@ -79,13 +79,13 @@ void FetchWorker::do_one_task_impl(CopyTask *task) {
     // LOG(ERROR) << "fetcher: copy from " << task->expert->host_data.ptr(mem_buf_idx) << " to " << task->expert->gpu_data->ptr(mem_buf_idx);
     CUDA_CALL(cudaMemcpyAsync(
       task->expert->gpu_data->ptr(mem_buf_idx),
-      task->expert->host_data.ptr(mem_buf_idx),
-      task->expert->host_data.len(mem_buf_idx),
+      task->expert->host_data->ptr(mem_buf_idx),
+      task->expert->host_data->nbytes(mem_buf_idx),
       cudaMemcpyHostToDevice, this->stream));
   }
   if (task->start_mem_buf_idx == 0) {
-    task->expert->reference_to_model_param.unmap();
-    task->expert->reference_to_model_param.map_to(task->expert->gpu_data, mem_mngr_ctx);
+    task->expert->reference_to_model_param->unmap();
+    task->expert->reference_to_model_param->map_to(task->expert->gpu_data, mem_mngr_ctx);
   }
 
   CUDA_CALL(cudaStreamSynchronize(this->stream));

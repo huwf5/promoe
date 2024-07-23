@@ -212,7 +212,7 @@ class CachePolicyFactory {
 
 struct CacheSlot {
   std::shared_ptr<CachePolicy> policy;
-  std::vector<ExpertMemHanlder*> unused_mems;
+  std::vector<ExpertMemHanlderBase*> unused_mems;
   size_t full_len;
 };
 
@@ -247,7 +247,7 @@ class CacheMngr {
   std::shared_ptr<ModuleMeta> metas;
   std::shared_ptr<ModelLoader> model_loader;
 
-  std::unordered_map<ExpertHandler*, ExpertMemHanlder*> prefetched_experts; // the ongoing job also lives in here.
+  std::unordered_map<ExpertHandler*, ExpertMemHanlderBase*> prefetched_experts; // the ongoing job also lives in here.
 
   std::shared_ptr<SlotMapper> cache_slots;
 
@@ -270,7 +270,7 @@ class CacheMngr {
   size_t query_per_layer_cache_len(int layer_idx = 0) {
     return cache_slots->to_slot(layer_idx)->full_len;
   }
-  ExpertMemHanlder* evict(ExpertHandler *evict_e, ExpertHandler *incoming_e=nullptr, bool reserve_mem = false);
+  ExpertMemHanlderBase* evict(ExpertHandler *evict_e, ExpertHandler *incoming_e=nullptr, bool reserve_mem = false);
   void access(ExpertHandler *expert, bool is_precise);
   void hit(ExpertHandler *expert, bool is_precise);
   CacheLineOccupancyWaiter miss(ExpertHandler *expert, bool is_precise);
