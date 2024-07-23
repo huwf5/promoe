@@ -214,7 +214,9 @@ def inject_model(
     recursive_traverse_childrens(model, f, filter)
     return first_expert_module[0]
   first_expert = find_first_expert(model, expert_name_filter)
-  meta.init_param_list([k for k,_ in first_expert.named_parameters()])
+  param_key_list = [k for k,_ in first_expert.named_parameters()]
+  print(param_key_list)
+  meta.init_param_list(param_key_list)
 
   meta.num_predict_expert_per_layer = num_predict_expert_per_layer
   meta.max_prefetch_layer_distance = max_prefetch_layer_distance
