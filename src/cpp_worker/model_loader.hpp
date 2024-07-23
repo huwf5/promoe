@@ -55,13 +55,14 @@
 class PhysicalMemHandlerTensor;
 class PhysicalMemHandlerCUDriver;
 class HostMemWrapper {
-  torch::Tensor data;
   friend class PhysicalMemHandlerTensor;
   friend class LogicalMemHandlerTensor;
   friend class PhysicalMemHandlerCUDriver;
   friend class LogicalMemHandlerCUDriver;
   friend class ExpertParamWrapper;
+  friend class ExpertMemHanlder;
  public:
+  torch::Tensor data;
   HostMemWrapper() {}
   HostMemWrapper(torch::Tensor t) : data(t) {}
   void* ptr() {return data.data_ptr();}
@@ -157,8 +158,9 @@ class MemMngrCtx {
 };
 
 class ExpertMemHanlder {
- public:
   std::vector<PhysicalMemHandler> mem_buffers;
+  friend class ExpertParamWrapper;
+ public:
   void allocate_like(HostExpertMemHanlder& other, MemMngrCtx* ctx) {
     this->mem_buffers.resize(other.mem_buffers.size());
     for (int j = 0; j < other.mem_buffers.size(); j++) {
@@ -170,8 +172,8 @@ class ExpertMemHanlder {
 };
 
 class ExpertParamWrapper {
- public:
   std::vector<LogicalMemHandler> mem_buffers;
+ public:
   ExpertParamWrapper() {}
   ExpertParamWrapper(int num) : mem_buffers(num) {}
   void unmap();
@@ -187,6 +189,7 @@ class ExpertParamWrapper {
       mem_buffers[i].make_logical(other.mem_buffers[i].data.sizes(), options, ctx);
     }
   }
+  torch::Tensor get_tensor(int idx) { return mem_buffers[idx].get_tensor(); }
 };
 
 class ExpertHandler {
@@ -234,7 +237,7 @@ class ModelLoader {
     return ref_one_expert_param(layer_id, expert_id, metas->param_name_to_id[param_name]);
   }
   torch::Tensor ref_one_expert_param(int layer_id, int expert_id, int param_id) {
-    return source_list[metas->squeeze_expert_idx(layer_id, expert_id)]->reference_to_model_param.mem_buffers[param_id].get_tensor();
+    return source_list[metas->squeeze_expert_idx(layer_id, expert_id)]->reference_to_model_param.get_tensor(param_id);
   }
   void pin_memory();
   ExpertHandler* get_source(int layer_id, int expert_id) {
