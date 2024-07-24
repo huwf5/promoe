@@ -161,6 +161,7 @@ void FetchScheduleWorker::pop_next_task(CopyTask &task, bool &found) {
 }
 void PrefetchMngr::init_gpu_mem_buffer(size_t num_buffers) {
   cache->init_gpu_mem_buffer(num_buffers);
+  model_loader->mem_mngr_ctx->dummy_physical = cache->cache_slots->slots.front().unused_mems.front();
 }
 void PrefetchMngr::preempt_and_launch_one_layer(int layer_idx, torch::Tensor experts) {
   PreemptTask preempt_task;

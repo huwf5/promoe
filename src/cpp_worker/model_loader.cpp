@@ -57,15 +57,15 @@ MemMngrCtx::MemMngrCtx() {
   accessDesc.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
 }
 
-void MemMngrCtx::build_dummy(size_t dummy_size) {
-  dummy_mem_nbyte = dummy_size;
-  dummy_mem_nbyte = round_up(dummy_mem_nbyte, granularity);
-  CU_CALL(cuMemCreate(&dummy_mem_handle, dummy_mem_nbyte, &prop, 0));
-}
-void MemMngrCtx::destroy_dummy() {
-  CU_CALL(cuMemRelease(dummy_mem_handle));
-  dummy_mem_nbyte = 0;
-}
+// void MemMngrCtx::build_dummy(size_t dummy_size) {
+//   dummy_mem_nbyte = dummy_size;
+//   dummy_mem_nbyte = round_up(dummy_mem_nbyte, granularity);
+//   CU_CALL(cuMemCreate(&dummy_mem_handle, dummy_mem_nbyte, &prop, 0));
+// }
+// void MemMngrCtx::destroy_dummy() {
+//   CU_CALL(cuMemRelease(dummy_mem_handle));
+//   dummy_mem_nbyte = 0;
+// }
 
 void MemMngrCtx::cu_mem_create(CUmemGenericAllocationHandle *handle, size_t size) {
   CU_CALL(cuMemCreate(handle, size, &prop, 0));

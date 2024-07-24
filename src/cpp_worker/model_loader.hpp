@@ -10,17 +10,21 @@
 
 #include "utils.hpp"
 
+class ExpertMemHanlderBase;
 class MemMngrCtx {
  public:
-  CUmemGenericAllocationHandle dummy_mem_handle = 0;
-  size_t dummy_mem_nbyte = 0;
+  // CUmemGenericAllocationHandle dummy_mem_handle = 0;
+  // size_t dummy_mem_nbyte = 0;
+
+  ExpertMemHanlderBase* dummy_physical;
+
   CUmemAllocationProp prop{};
   size_t granularity = 0;
   CUmemAccessDesc accessDesc = {};
   int device_id = 0;
   MemMngrCtx();
-  void build_dummy(size_t dummy_size);
-  void destroy_dummy();
+  // void build_dummy(size_t dummy_size);
+  // void destroy_dummy();
 
   void cu_mem_create(CUmemGenericAllocationHandle *handle, size_t size);
   static void cu_address_reserve(CUdeviceptr *ptr, size_t size);
@@ -171,6 +175,7 @@ class ExpertParamWrapperTensor : public ExpertParamWrapperBase {
     for (int i = 0; i < model_parameter_reference.size(); i++) {
       model_parameter_reference[i] = torch::empty({0}, torch::TensorOptions().device(torch::kCUDA, ctx->device_id).dtype(other->dtype(i)));
     }
+    this->map_to(ctx->dummy_physical, ctx);
   }
 };
 
@@ -189,10 +194,10 @@ class ExpertParamWrapperCUDriver : public ExpertParamWrapperBase {
     for (int i = 0; i < model_parameter_reference.size(); i++) {
       address_range_nbytes[i] = round_up(other->nbytes(i), ctx->granularity);
       ctx->cu_address_reserve(&ptrs[i], address_range_nbytes[i]);
+    }
 
-      mapped_nbytes[i] = ctx->dummy_mem_nbyte;
-      ctx->cu_map_address(ptrs[i], ctx->dummy_mem_nbyte, ctx->dummy_mem_handle);
-      ctx->cu_set_access(ptrs[i], ctx->dummy_mem_nbyte);
+    this->map_to(ctx->dummy_physical, ctx);
+    for (int i = 0; i < model_parameter_reference.size(); i++) {
       torch::TensorOptions options = torch::TensorOptions().device(torch::kCUDA, ctx->device_id).dtype(other->dtype(i));
       model_parameter_reference[i] = torch::from_blob((void*)ptrs[i], other->get_tensor(i).sizes(), options);
     }
@@ -220,9 +225,7 @@ class ExpertParamWrapperCUDriverUnified : public ExpertParamWrapperBase {
     address_range_nbyte = round_up(address_range_nbyte, ctx->granularity);
     ctx->cu_address_reserve(&ptr, address_range_nbyte);
 
-    mapped_nbyte = ctx->dummy_mem_nbyte;
-    ctx->cu_map_address(ptr, ctx->dummy_mem_nbyte, ctx->dummy_mem_handle);
-    ctx->cu_set_access(ptr, ctx->dummy_mem_nbyte);
+    this->map_to(ctx->dummy_physical, ctx);
 
     for (int i = 0; i < model_parameter_reference.size(); i++) {
       torch::TensorOptions options = torch::TensorOptions().device(torch::kCUDA, ctx->device_id).dtype(other->dtype(i));
@@ -291,11 +294,11 @@ class ModelLoader {
   }
   void add_one_expert_param(torch::Tensor param, int layer_id, int expert_id, int param_id);
   void build_logical_expert_param() {
-    size_t required_dummy_nbytes = 1024;
-    if (metas->logical_mem_impl == "cudriver_unified") {
-      required_dummy_nbytes = source_list[0]->host_data->total_nbytes();
-    }
-    mem_mngr_ctx->build_dummy(required_dummy_nbytes);
+    // size_t required_dummy_nbytes = 1024;
+    // if (metas->logical_mem_impl == "cudriver_unified") {
+    //   required_dummy_nbytes = source_list[0]->host_data->total_nbytes();
+    // }
+    // mem_mngr_ctx->build_dummy(required_dummy_nbytes);
     for (int layer_id = 0; layer_id < metas->num_layer; layer_id++) {
       for (int expert_id = 0; expert_id < metas->num_expert; expert_id++) {
         build_logical_expert_param(layer_id, expert_id);
