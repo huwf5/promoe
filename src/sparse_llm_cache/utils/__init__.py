@@ -47,6 +47,11 @@ def register_expert_params(model, model_loader, filter=RegexFilter(r'.*layers\.(
 
   recursive_traverse_childrens(model, f, filter)
 
+def attach_prefetch_mngr_to_all_module(model, prefetch_mngr):
+  def f(module, name):
+    module._prefetch_mngr = prefetch_mngr
+  recursive_traverse_childrens(model, f, filter=RegexFilter(r'.*'))
+
 def move_non_moe_to_gpu(model, device='cuda', filter=RegexFilter(r'.*layers\.(\d+)\.mlp\.experts\.(\d+)').reverse()):
   def f(module : torch.nn.Module, name:str):
       # print(f'moving {name} to gpu')
@@ -265,6 +270,7 @@ def inject_model(
   add_hook_to_experts(model, prefetch_mngr, expert_name_filter)
   add_hook_to_moe_attns(model, prefetch_mngr, moe_attn_name_filter)
   add_hook_to_moe_layers(model, prefetch_mngr, moe_layer_name_filter)
+  attach_prefetch_mngr_to_all_module(model, prefetch_mngr)
 
   if trace_event:
     os.environ['SPARSE_CACHE_ENABLE_TRACE'] = '1'
