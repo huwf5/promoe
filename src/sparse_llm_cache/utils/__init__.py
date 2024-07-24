@@ -139,6 +139,7 @@ def inject_model(
     layer_predict_max_window = -1,
     model_id = None,
     layer_predict_replace_first_input_with_last_output = False,
+    launch_now = True,
     **kwargs
   ):
   """
@@ -256,13 +257,14 @@ def inject_model(
 
   print("injecting model...")
   register_expert_params(model, model_loader, expert_name_filter)
+  prefetch_mngr.init_gpu_mem_buffer(cache_len)
+  replace_expert_param_reference(model, model_loader, expert_name_filter)
   replace_mlp_report_experts(model, prefetch_mngr, predictor, num_moe_layer, num_expert_per_layer, num_predict_expert_per_layer, moe_mlp_name_filter)
 
   # fixme: a general model path
   if predictor_model_path == None:
     predictor_model_path = f"/nvme/songxiaoniu/moe/moe-predict-models/{repo_folder_name(repo_id = model_id)}.pt"
   predictor.load_model(predictor_model_path)
-  prefetch_mngr.init_gpu_mem_buffer(cache_len)
 
   if meta.cache_policy == 'min':
     prefetch_mngr.cache.cache_oracle.load_from_file(cache_trace_path)
@@ -286,6 +288,13 @@ def inject_model(
     print("pin model parameters on cpu...")
     model_loader.pin_memory()
     print("pin model parameters on cpu...done")
+  model._prefetch_mngr = prefetch_mngr
+  if launch_now:
+    launch(model)
+  return prefetch_mngr
+
+def launch(model : torch.nn.Module):
+  prefetch_mngr = model._prefetch_mngr
   prefetch_mngr.launch_thread()
   torch.set_num_threads(16)
   return prefetch_mngr
