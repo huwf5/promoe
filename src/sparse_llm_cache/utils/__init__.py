@@ -38,6 +38,7 @@ def register_expert_params(model, model_loader, filter=RegexFilter(r'.*layers\.(
       model_loader.add_one_expert_param(v, module._layer_id, module._expert_id, k)
   recursive_traverse_childrens(model, f, filter)
 
+def replace_expert_param_reference(model, model_loader, filter=RegexFilter(r'.*layers\.(\d+)\.mlp\.experts\.(\d+)$')):
   model_loader.build_logical_expert_param()
   def f(module, name):
     def update_child_param(child_module, child_name):
