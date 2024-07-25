@@ -177,4 +177,6 @@ public:
   void launch_thread();
   TimerGuard build_timer() { return TimerGuard(this->profiler.get()); }
   void reload_env();
+
+  void temp_move_expert_to_gpu(int layer_id, int expert_id);
 };

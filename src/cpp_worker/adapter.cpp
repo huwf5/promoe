@@ -70,6 +70,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     .def("report_moe_attn_logits",  &PrefetchMngr::report_moe_attn_logits)
     .def("report_moe_layer_logits", &PrefetchMngr::report_moe_layer_logits)
     .def("build_timer",             &PrefetchMngr::build_timer)
+    .def("temp_move_expert_to_gpu", &PrefetchMngr::temp_move_expert_to_gpu)
     .def_readwrite("metas",         &PrefetchMngr::metas)
     .def_readwrite("model_loader",  &PrefetchMngr::model_loader)
     .def_readwrite("predictor",     &PrefetchMngr::predictor)

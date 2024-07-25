@@ -300,6 +300,57 @@ def launch(model : torch.nn.Module):
   torch.set_num_threads(16)
   return prefetch_mngr
 
+
+'''
+Hiject Transformers
+'''
+import functools
+import importlib
+from transformers.modeling_utils import PreTrainedModel
+
+if importlib.util.find_spec('auto_gptq') is not None:
+  from auto_gptq.nn_modules.qlinear.qlinear_exllama import QuantLinear
+
+def hack_auto_gptq():
+  if hasattr(QuantLinear, '_old_post_init'):
+    return
+  QuantLinear._old_post_init = QuantLinear.post_init
+  @functools.wraps(QuantLinear.post_init)
+  def new_post_init(module):
+    module._prefetch_mngr.temp_move_expert_to_gpu(module._layer_id, module._expert_id)
+    ret = QuantLinear._post_init.__func__(module)
+    return ret
+  QuantLinear.post_init = new_post_init
+
+def hack_transformers(**sparse_cache_kwargs):
+  PreTrainedModel._old_load_pretrained_model = PreTrainedModel._load_pretrained_model
+  @classmethod
+  @functools.wraps(PreTrainedModel._load_pretrained_model)
+  def new_load_pretrained_model(cls, *args, **kwargs):
+    assert len(kwargs['device_map']) == 1 and '' in kwargs['device_map'], "only support single device"
+    orig_device_map = kwargs['device_map']
+    kwargs['device_map'] = {'' : 'cpu'}
+    ret = PreTrainedModel._old_load_pretrained_model.__func__(cls, *args, **kwargs)
+    kwargs['device_map'] = orig_device_map
+    model = ret[0]
+    inject_model(model, **sparse_cache_kwargs, launch_now=False)
+    return ret
+  PreTrainedModel._load_pretrained_model = new_load_pretrained_model
+
+  PreTrainedModel._old_from_pretrained = PreTrainedModel.from_pretrained
+  @classmethod
+  @functools.wraps(PreTrainedModel.from_pretrained)
+  def new_from_pretrained(cls, *args, **kwargs):
+    ret = PreTrainedModel._old_from_pretrained.__func__(cls, *args, **kwargs)
+    model = ret
+    launch(model)
+    return ret
+  PreTrainedModel.from_pretrained = new_from_pretrained
+
+  if importlib.util.find_spec('auto_gptq') is not None:
+    hack_auto_gptq()
+
+
 '''
 Legacy
 '''

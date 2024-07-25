@@ -539,3 +539,20 @@ void PrefetchMngr::reload_env() {
   TraceEventCollector::reload_env();
   LogMessage::reload_env();
 }
+void PrefetchMngr::temp_move_expert_to_gpu(int layer_id, int expert_id) {
+  auto expert = model_loader->get_source(layer_id, expert_id);
+  auto gpu_data = model_loader->mem_mngr_ctx->dummy_physical;
+
+  for (int mem_buf_idx = 0; mem_buf_idx < metas->num_per_expert_param; mem_buf_idx++) {
+    // LOG(ERROR) << "fetcher: copy from " << task.expert->host_data.ptr(mem_buf_idx) << " to " << task.expert->gpu_data->ptr(mem_buf_idx);
+    CUDA_CALL(cudaMemcpyAsync(
+        gpu_data->ptr(mem_buf_idx),
+        expert->host_data->ptr(mem_buf_idx),
+        expert->host_data->nbytes(mem_buf_idx),
+        cudaMemcpyHostToDevice, nullptr));
+  }
+  expert->reference_to_model_param->unmap();
+  expert->reference_to_model_param->map_to(gpu_data, model_loader->mem_mngr_ctx.get());
+
+  CUDA_CALL(cudaStreamSynchronize(nullptr));
+}
