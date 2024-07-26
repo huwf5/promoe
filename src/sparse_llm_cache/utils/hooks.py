@@ -337,3 +337,84 @@ class TimingHook(ModelHook):
 # class GateHook:
 #   def __init__(self) -> None:
 #     pass
+
+def add_hook_to_module_custom_method(module: torch.nn.Module, hook: ModelHook, append: bool = False, method_name = "forward", hook_attr_name = "_hf_hook"):
+    """
+    Adds a hook to a given module. This will rewrite the `method_name` method of the module to include the hook, to remove
+    this behavior and restore the original `method_name` method, use `remove_hook_from_module`.
+
+    <Tip warning={true}>
+
+    If the module already contains a hook, this will replace it with the new hook passed by default. To chain two hooks
+    together, pass `append=True`, so it chains the current and new hook into an instance of the `SequentialHook` class.
+
+    </Tip>
+
+    Args:
+        module (`torch.nn.Module`):
+            The module to attach a hook to.
+        hook (`ModelHook`):
+            The hook to attach.
+        append (`bool`, *optional*, defaults to `False`):
+            Whether the hook should be chained with an existing one (if module already contains a hook) or not.
+
+    Returns:
+        `torch.nn.Module`: The same module, with the hook attached (the module is modified in place, so the result can
+        be discarded).
+    """
+
+    old_method_name = f"_old_{method_name}"
+    new_method_name = method_name
+
+    if append and (getattr(module, hook_attr_name, None) is not None):
+        assert False, "append is not supported"
+        old_hook = getattr(module, hook_attr_name)
+        remove_hook_from_module(module)
+        hook = SequentialHook(old_hook, hook)
+
+    if hasattr(module, hook_attr_name) and hasattr(module, old_method_name):
+        # If we already put some hook on this module, we replace it with the new one.
+        old_method = getattr(module, f"_old_{method_name}")
+    else:
+        old_method = getattr(module, method_name)
+        setattr(module, old_method_name, old_method)
+
+    module = hook.init_hook(module)
+    setattr(module, hook_attr_name, hook)
+
+    def new_m(module, *args, **kwargs):
+        hook  = getattr(module, hook_attr_name)
+        old_m = getattr(module, f"_old_{method_name}")
+        pre   = getattr(hook,    f"pre_{method_name}")
+        post  = getattr(hook,   f"post_{method_name}")
+        args, kwargs = pre(module, *args, **kwargs)
+        if hook.no_grad:
+            with torch.no_grad():
+                output = old_m(*args, **kwargs)
+        else:
+            output = old_m(*args, **kwargs)
+        return post(module, output)
+
+    setattr(module, method_name, functools.update_wrapper(functools.partial(new_m, module), old_method))
+
+    return module
+
+class AutoGPTQPostInitHook:
+    no_grad = False
+
+    def __init__(self, prefetch_mngr) -> None:
+      self.prefetch_mngr = prefetch_mngr
+      pass
+
+    def init_hook(self, module):
+        return module
+
+    def pre_post_init(self, module, *args, **kwargs):
+        self.prefetch_mngr.temp_move_expert_to_gpu(module._layer_id, module._expert_id)
+        return args, kwargs
+
+    def post_post_init(self, module, output):
+        return output
+
+    def detach_hook(self, module):
+        return module

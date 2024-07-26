@@ -95,6 +95,15 @@ def add_hook_to_moe_layers(model, prefetch_mngr, filter):
     hooks.add_hook_to_module(module, hook)
   recursive_traverse_childrens(model, f, filter)
 
+def add_hook_to_expert_first_auto_gptq_post_init(model, prefetch_mngr, filter):
+  hook = AutoGPTQPostInitHook(prefetch_mngr)
+  def f(module, name):
+    for name, submodule in module.named_modules():
+      if hasattr(submodule, "QUANT_TYPE"):
+        hooks.add_hook_to_module_custom_method(submodule, hook, method_name='post_init', hook_attr_name='_post_init_hook')
+        break
+  recursive_traverse_childrens(model, f, filter)
+
 def add_hook_to_some_modules(model, hook, filter=RegexFilter(r'.*'), append=False):
   def f(module, name):
     # print(f'adding hook to {name}')
@@ -280,6 +289,7 @@ def inject_model(
   add_hook_to_experts(model, prefetch_mngr, expert_name_filter)
   add_hook_to_moe_attns(model, prefetch_mngr, moe_attn_name_filter)
   add_hook_to_moe_layers(model, prefetch_mngr, moe_layer_name_filter)
+  add_hook_to_expert_first_auto_gptq_post_init(model, prefetch_mngr, expert_name_filter)
   attach_prefetch_mngr_to_all_module(model, prefetch_mngr)
 
   if trace_event:
@@ -355,8 +365,8 @@ def hack_transformers(**sparse_cache_kwargs):
     return ret
   PreTrainedModel.from_pretrained = new_from_pretrained
 
-  if importlib.util.find_spec('auto_gptq') is not None:
-    hack_auto_gptq()
+  # if importlib.util.find_spec('auto_gptq') is not None:
+  #   hack_auto_gptq()
 
 
 '''
