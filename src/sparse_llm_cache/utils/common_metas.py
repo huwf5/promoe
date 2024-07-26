@@ -126,6 +126,7 @@ predefined_metas = {
   'deepseek-ai/deepseek-moe-16b-chat-simulate' : ModelMetas.build_deepseek_moe_simulate,
   'Qwen/Qwen1.5-MoE-A2.7B-Chat'                : ModelMetas.build_qwen_moe,
   'mistralai/Mixtral-8x7B-Instruct-v0.1'       : ModelMetas.build_mixtral,
+  'TheBloke/Mixtral-8x7B-Instruct-v0.1-GPTQ'   : ModelMetas.build_mixtral,
 }
 
 def auto_infer_model_metas(model_id, return_dict = True):

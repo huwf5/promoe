@@ -36,6 +36,9 @@ def register_expert_params(model, model_loader, filter=RegexFilter(r'.*layers\.(
     # print(f'registering expert {name}')
     for k,v in module.named_parameters():
       model_loader.add_one_expert_param(v, module._layer_id, module._expert_id, k)
+    for k,v in module.named_buffers():
+      if k.find('qweight') == -1: continue
+      model_loader.add_one_expert_param(v, module._layer_id, module._expert_id, k)
   recursive_traverse_childrens(model, f, filter)
 
 def replace_expert_param_reference(model, model_loader, filter=RegexFilter(r'.*layers\.(\d+)\.mlp\.experts\.(\d+)$')):
@@ -44,6 +47,9 @@ def replace_expert_param_reference(model, model_loader, filter=RegexFilter(r'.*l
     def update_child_param(child_module, child_name):
       for n,_ in child_module.named_parameters():
         child_module._parameters[n] = model_loader.ref_one_expert_param(module._layer_id, module._expert_id, child_name + '.' + n)
+      for n,_ in child_module.named_buffers():
+        if n.find('qweight') == -1: continue
+        child_module._buffers[n] = model_loader.ref_one_expert_param(module._layer_id, module._expert_id, child_name + '.' + n)
     recursive_traverse_childrens_leaf_only(module, update_child_param)
 
   recursive_traverse_childrens(model, f, filter)
@@ -222,6 +228,7 @@ def inject_model(
     return first_expert_module[0]
   first_expert = find_first_expert(model, expert_name_filter)
   param_key_list = [k for k,_ in first_expert.named_parameters()]
+  param_key_list += [k for k,_ in first_expert.named_buffers() if k.find('qweight') != -1]
   print(param_key_list)
   meta.init_param_list(param_key_list)
 
@@ -317,8 +324,9 @@ def hack_auto_gptq():
   QuantLinear._old_post_init = QuantLinear.post_init
   @functools.wraps(QuantLinear.post_init)
   def new_post_init(module):
-    module._prefetch_mngr.temp_move_expert_to_gpu(module._layer_id, module._expert_id)
-    ret = QuantLinear._post_init.__func__(module)
+    if hasattr(module, '_expert_id'):
+      module._prefetch_mngr.temp_move_expert_to_gpu(module._layer_id, module._expert_id)
+    ret = QuantLinear._old_post_init(module)
     return ret
   QuantLinear.post_init = new_post_init
 
