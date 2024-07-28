@@ -41,6 +41,7 @@ void ModelLoader::pin_memory() {
 }
 
 MemMngrCtx::MemMngrCtx() {
+  CUDA_CALL(cudaSetDevice(0));
   prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
   prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
   prop.location.id = 0;
