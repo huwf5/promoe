@@ -3,6 +3,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <dirent.h>
+#include <cuda_runtime.h>
 #include "utils.hpp"
 
 class Predictor {
@@ -16,6 +17,12 @@ class Predictor {
   std::unordered_map<int, torch::Tensor> moe_attn_input_logits_buffer_list;
   std::unordered_map<int, torch::Tensor> moe_layer_logits_buffer_list;
   std::unordered_map<int, torch::jit::script::Module> predict_model_list;
+  std::unordered_map<int, cudaEvent_t> logits_record_event;
+
+ public:
+  cudaStream_t compute_stream;
+
+ private:
   void init_expert_access_buffer() {
     auto options = torch::TensorOptions().dtype(torch::kFloat32);
     switch (metas->predict_input_mode) {
@@ -56,9 +63,7 @@ class Predictor {
   };
   std::unordered_map<int, PredictModelMeta> predict_model_metas;
   std::vector<bool> layer_predict_enabled;
-  Predictor(std::shared_ptr<ModuleMeta> metas) : metas(metas) {
-    init_expert_access_buffer();
-  }
+  Predictor(std::shared_ptr<ModuleMeta> metas);
   void load_model(std::string model_path);
 
   torch::Tensor predict(int input_layer_id);

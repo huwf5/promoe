@@ -183,6 +183,12 @@ class TraceEventGuard {
     } \
   }
 
+#define TRACE_EVENT_GURAD_NAME(tid, name, guard_name) TraceEventGuard guard_name; { \
+    if (TraceEventCollector::globally_enabled) { \
+      guard_name.init(tid, name); \
+    } \
+  }
+
 #define TRACE_EVENT_GURAD_WITH_ARGS(tid, name, phase, arg_var, CODE_BLOCK) TraceEventGuard guard; { \
     if (TraceEventCollector::globally_enabled) { \
       guard.init(tid, name, phase); \

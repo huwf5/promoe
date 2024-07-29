@@ -1,7 +1,8 @@
+#include <nlohmann/json.hpp>
+#include <cuda_runtime.h>
 #include "predictor.hpp"
 #include "logging.hpp"
 #include "profiler.hpp"
-#include <nlohmann/json.hpp>
 
 void Predictor::add_one_layer(int layer_id, int64_t *experts, size_t num_expert) {
   switch (metas->predict_input_mode) {
@@ -42,6 +43,10 @@ torch::Tensor Predictor::predict(int input_layer_id) {
   LOG(DEBUG) << "predictor, predict " + std::to_string(input_layer_id);
   torch::Tensor input;
   auto model = predict_model_list[0];
+  {
+    TRACE_EVENT_GURAD_NAME(kPredictor, "logits copy", guardguard);
+    CUDA_CALL(cudaEventSynchronize(logits_record_event[input_layer_id]));
+  }
   switch (metas->predict_input_mode) {
     case kOneToken: { 
       CHECK(input_layer_id == 0);
@@ -164,7 +169,7 @@ void Predictor::load_model(std::string model_path) {
       std::string file_name_without_ext = std::string(entry->d_name).substr(0, name.find_last_of("."));
       std::string file_ext = std::string(entry->d_name).substr(name.find_last_of(".") + 1);
       if (file_ext == "pt") {
-        LOG(ERROR) << "Loading model: " << name << " " << file_name_without_ext;
+        LOG(TRACE) << "Loading model: " << name << " " << file_name_without_ext;
         load_one_model(model_path + "/" + name, std::stoi(file_name_without_ext));
       } else if (file_ext == "json") {
         LOG(ERROR) << "Loading json: " << name;
@@ -270,7 +275,10 @@ void Predictor::record_moe_attn_logits(int layer_id, torch::Tensor attn_logits) 
       if (layer_id == 0) {
         if (attn_logits.numel() == attn_logits.size(-1)) {
           LOG(DEBUG) << "predictor, record attn logits";
-          first_moe_attn_input_logits_buffer = attn_logits.to("cpu");
+          first_moe_attn_input_logits_buffer = torch::empty_like(attn_logits, attn_logits.options().device(torch::kCPU).pinned_memory(true));
+          CUDA_CALL(cudaMemcpyAsync(first_moe_attn_input_logits_buffer.data_ptr(), attn_logits.data_ptr(), attn_logits.nbytes(), cudaMemcpyDeviceToHost, this->compute_stream));
+          CUDA_CALL(cudaEventRecord(logits_record_event[layer_id], this->compute_stream));
+          // first_moe_attn_input_logits_buffer = attn_logits.to("cpu");
         } else {
           LOG(DEBUG) << "predictor, skip record due to prefill";
           first_moe_attn_input_logits_buffer = torch::empty({0});
@@ -292,7 +300,10 @@ void Predictor::record_moe_attn_logits(int layer_id, torch::Tensor attn_logits) 
         break;
       }
       LOG(DEBUG) << "predictor, record attn logits";
-      moe_attn_input_logits_buffer_list[layer_id] = attn_logits.to("cpu");
+      moe_attn_input_logits_buffer_list[layer_id] = torch::empty_like(attn_logits, attn_logits.options().device(torch::kCPU).pinned_memory(true));
+      CUDA_CALL(cudaMemcpyAsync(moe_attn_input_logits_buffer_list[layer_id].data_ptr(), attn_logits.data_ptr(), attn_logits.nbytes(), cudaMemcpyDeviceToHost, this->compute_stream));
+      CUDA_CALL(cudaEventRecord(logits_record_event[layer_id], this->compute_stream));
+      // moe_attn_input_logits_buffer_list[layer_id] = attn_logits.to("cpu");
       break;
     }
     case kMoeLayerLogits: { break; }
@@ -331,11 +342,21 @@ void Predictor::record_moe_layer_logits(int layer_id, torch::Tensor layer_logits
         break;
       }
       LOG(DEBUG) << "predictor, record attn logits";
-      moe_layer_logits_buffer_list[layer_id] = layer_logits.to("cpu");
+      moe_layer_logits_buffer_list[layer_id] = torch::empty_like(layer_logits, layer_logits.options().device(torch::kCPU).pinned_memory(true));
+      CUDA_CALL(cudaMemcpyAsync(moe_layer_logits_buffer_list[layer_id].data_ptr(), layer_logits.data_ptr(), layer_logits.nbytes(), cudaMemcpyDeviceToHost, this->compute_stream));
+      CUDA_CALL(cudaEventRecord(logits_record_event[layer_id], this->compute_stream));
+      // moe_layer_logits_buffer_list[layer_id] = layer_logits.to("cpu");
       break;
     }
     default: {
       CHECK(false) << "Unknown predict input mode";
     }
+  }
+}
+Predictor::Predictor(std::shared_ptr<ModuleMeta> metas) : metas(metas) {
+  init_expert_access_buffer();
+  for (int l = 0; l <= metas->num_layer; l++) {
+    logits_record_event[l] = 0;
+    CUDA_CALL(cudaEventCreateWithFlags(&logits_record_event[l], cudaEventDisableTiming));
   }
 }

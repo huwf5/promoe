@@ -324,6 +324,8 @@ PrefetchMngr::PrefetchMngr(std::shared_ptr<ModuleMeta> metas,
   predict_thread->init(fetch_schedule_thread.get(), predictor.get(), cache.get(), metas.get());
   fetch_thread->init(metas.get(), fetch_schedule_thread.get(), model_loader->mem_mngr_ctx.get(), (cudaStream_t)copy_stream);
   fetch_schedule_thread->init(metas.get(), model_loader.get(), this->cache.get(), fetch_thread.get(), predict_thread.get(), cache_stats.get(), profiler.get());
+
+  predictor->compute_stream = (cudaStream_t)compute_stream;
 }
 
 void PrefetchMngr::report_moe_attn_logits(int layer_id, torch::Tensor attn_logits) {
