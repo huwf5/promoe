@@ -77,6 +77,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     .def_readwrite("cache_stats",   &PrefetchMngr::cache_stats)
     .def_readwrite("profiler",      &PrefetchMngr::profiler)
     .def_readwrite("cache",         &PrefetchMngr::cache)
+    .def_readwrite("copy_stream",    &PrefetchMngr::copy_stream)
+    .def_readwrite("compute_stream", &PrefetchMngr::compute_stream)
   ;
 
   py::class_<TraceEventGuard, std::shared_ptr<TraceEventGuard>>(m, "TraceEventGuard")

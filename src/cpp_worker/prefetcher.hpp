@@ -8,6 +8,7 @@
 #include <queue>
 #include <cuda_runtime.h>
 #include <semaphore.h>
+#include <ATen/cuda/CUDAContext.h>
 
 #include "worker.hpp"
 #include "utils.hpp"
@@ -157,6 +158,10 @@ public:
   std::shared_ptr<CacheStatistics> cache_stats;
   std::shared_ptr<TimeProfiler>    profiler;
   std::shared_ptr<CacheMngr>       cache;
+
+  int64_t compute_stream = 0, copy_stream = 0;
+  // cudaStream_t compute_stream = nullptr, copy_stream = nullptr;
+  // at::cuda::CUDAStream compute_stream, copy_stream;
 
   PrefetchMngr(std::shared_ptr<ModuleMeta> metas,
                std::shared_ptr<ModelLoader> model_loader,

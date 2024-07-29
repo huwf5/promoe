@@ -236,7 +236,7 @@ void PrefetchMngr::wait_expert(int layer_id, int expert_id) {
 }
 void PrefetchMngr::mark_expert_using(int layer_id, int expert_id) {
   auto expert = model_loader->get_source(layer_id, expert_id);
-  CUDA_CALL(cudaEventRecord(expert->event, nullptr));
+  CUDA_CALL(cudaEventRecord(expert->event, (cudaStream_t)(this->compute_stream)));
   expert->expert_status.transfer(kLaunching, kUsing);
 
   expert_unlocker_thread->add_one_task(expert);
@@ -259,8 +259,9 @@ PrefetchMngr::PrefetchMngr(std::shared_ptr<ModuleMeta> metas,
   predict_thread = std::make_shared<PredictWorker>();
   expert_unlocker_thread = std::make_shared<ExpertUnlockWorker>();
   fetch_thread = std::make_shared<FetchWorker>();
-  cudaStream_t stream;
-  CUDA_CALL(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+  // cudaStream_t stream;
+  CUDA_CALL(cudaStreamCreateWithFlags((cudaStream_t*)(&compute_stream), cudaStreamNonBlocking));
+  CUDA_CALL(cudaStreamCreateWithFlags((cudaStream_t*)(&copy_stream),    cudaStreamNonBlocking));
   fetch_schedule_thread = std::make_shared<FetchScheduleWorker>();
   cache_stats = std::make_shared<CacheStatistics>();
   cache_stats->add_reporter([this, metas = this->metas](CacheStatistics* stats){
@@ -321,7 +322,7 @@ PrefetchMngr::PrefetchMngr(std::shared_ptr<ModuleMeta> metas,
     }
   });
   predict_thread->init(fetch_schedule_thread.get(), predictor.get(), cache.get(), metas.get());
-  fetch_thread->init(metas.get(), fetch_schedule_thread.get(), model_loader->mem_mngr_ctx.get(), stream);
+  fetch_thread->init(metas.get(), fetch_schedule_thread.get(), model_loader->mem_mngr_ctx.get(), (cudaStream_t)copy_stream);
   fetch_schedule_thread->init(metas.get(), model_loader.get(), this->cache.get(), fetch_thread.get(), predict_thread.get(), cache_stats.get(), profiler.get());
 }
 

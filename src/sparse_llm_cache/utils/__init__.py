@@ -268,6 +268,7 @@ def inject_model(
   model_loader  = cpp_worker.ModelLoader(meta)
   predictor     = cpp_worker.Predictor(meta)
   prefetch_mngr = cpp_worker.PrefetchMngr(meta, model_loader, predictor)
+  torch.cuda.set_stream(torch.cuda.ExternalStream(prefetch_mngr.compute_stream, 0))
   print("initializing cache lib...done")
 
   add_metadata_to_submodules(model, expert_meta_parser)
