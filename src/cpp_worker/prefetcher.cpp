@@ -290,8 +290,10 @@ PrefetchMngr::PrefetchMngr(std::shared_ptr<ModuleMeta> metas,
   profiler = std::make_shared<TimeProfiler>();
   profiler->add_reporter([this, metas = this->metas](TimeProfiler *p){
     auto num_used_expert_tensor = p->to_tensor(TimeProfiler::kCntActivatedExpert);
-    auto idx_is_prefill = num_used_expert_tensor >  (metas->num_expert_per_token * metas->num_layer);
-    auto idx_is_decode  = num_used_expert_tensor <= (metas->num_expert_per_token * metas->num_layer);
+    // auto idx_is_prefill = num_used_expert_tensor >  (metas->num_expert_per_token * metas->num_layer);
+    // auto idx_is_decode  = num_used_expert_tensor <= (metas->num_expert_per_token * metas->num_layer);
+    auto idx_is_prefill = p->to_tensor(TimeProfiler::kSeqLen) > 1;
+    auto idx_is_decode  = p->to_tensor(TimeProfiler::kSeqLen) <= 1;
     auto lambda_report_one_pair([this, p](
         TimeProfiler::TimeType on,
         TimeProfiler::TimeType off,
@@ -343,6 +345,10 @@ void PrefetchMngr::report_moe_layer_logits(int layer_id, torch::Tensor layer_log
   });
   predictor->record_moe_layer_logits(layer_id, layer_logits);
   predict_thread->on_moe_layer_logits_recorded(layer_id);
+  if (layer_id == 0) {
+    auto seq_len = layer_logits.size(1);
+    profiler->push(TimeProfiler::kSeqLen, seq_len);
+  }
 }
 
 void PrefetchMngr::record_then_predict_and_prefetch(int layer_id, torch::Tensor experts) {

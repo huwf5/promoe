@@ -18,6 +18,8 @@ class CustomBooleanAction(argparse.Action):
 def parse_args():
   parser = argparse.ArgumentParser()
   parser.add_argument("--model_id", type=str, default=None)
+  parser.add_argument("--model_revision", type=str, default=None)
+  parser.add_argument("--batch_size", type=int, default=1)
   parser.add_argument("--num_predict_expert_per_layer", type=int)
   parser.add_argument("--cache_rate", type=float)
   parser.add_argument("--cache_len", type=int, default=None)

@@ -268,6 +268,7 @@ class TimeProfiler {
     kUnreadyCnt, // per forward
     kPrefetchHitCnt,  // per forward
     kPrefetchMissCnt, // per forward
+    kSeqLen, // per forward
     kNumTimeType,
   };
   TimeProfiler() {
@@ -280,6 +281,7 @@ class TimeProfiler {
     metric_metas[ kUnreadyCnt         ].is_cum = true; metric_metas[ kUnreadyCnt         ].should_drop_last = true;
     metric_metas[ kPrefetchHitCnt     ].is_cum = true; metric_metas[ kPrefetchHitCnt     ].should_drop_last = true;
     metric_metas[ kPrefetchMissCnt    ].is_cum = true; metric_metas[ kPrefetchMissCnt    ].should_drop_last = true;
+    metric_metas[ kSeqLen             ].is_cum = false; metric_metas[ kSeqLen             ].should_drop_last = false;
     buffer.resize(kNumTimeType);
     for (int i = 0; i < kNumTimeType; i++) {
       auto &b = buffer[i];

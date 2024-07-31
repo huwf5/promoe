@@ -138,9 +138,15 @@ torch::Tensor Predictor::predict(int input_layer_id) {
   // } else if (metas->predict_input_mode == kWeighedDecodeCumsum) {
   //   input = this->weighted_access_freq_sum_buffer.clone();
   // }
-  std::vector<torch::jit::IValue> inputs{input.flatten().unsqueeze(0)};
+  auto bs = input.size(0);
+  std::vector<torch::jit::IValue> inputs{input.flatten(1, -1)};
+  // std::vector<torch::jit::IValue> inputs{input.flatten().unsqueeze(0)};
   torch::NoGradGuard no_grad;
-  return model.forward(inputs).toTensor().reshape({-1, metas->num_expert});
+  auto output = model.forward(inputs).toTensor();
+  output = output.reshape({bs, -1, metas->num_expert});
+  output = output.sum({0});
+  return output;
+  // return model.forward(inputs).toTensor().reshape({-1, metas->num_expert});
 }
 void Predictor::load_one_model(std::string model_path, int idx) {
   c10::Device cpu_device(c10::DeviceType::CPU);
@@ -325,7 +331,7 @@ void Predictor::record_moe_layer_logits(int layer_id, torch::Tensor layer_logits
     case kMoeAttnInputLogits:      { break; }
     case kMoeLayerLogits: {
       CHECK(layer_logits.dim() == 3) << "input logits must be in shape [num_batch, seq_len, num_expert], but found " << layer_logits.sizes();
-      CHECK(layer_logits.size(0) == 1) << "batch > 1 not supported";
+      // CHECK(layer_logits.size(0) == 1) << "batch > 1 not supported";
       if (layer_logits.size(1) != 1) {
         LOG(DEBUG) << "predictor, skip record due to prefill";
         moe_layer_logits_buffer_list[layer_id] = torch::empty({0});

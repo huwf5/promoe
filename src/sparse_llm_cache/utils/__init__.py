@@ -154,6 +154,7 @@ def inject_model(
     layer_predict_interval   = -1,
     layer_predict_max_window = -1,
     model_id = None,
+    model_revision = None,
     layer_predict_replace_first_input_with_last_output = False,
     launch_now = True,
     **kwargs
