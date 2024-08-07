@@ -322,3 +322,5 @@ class ModelLoader {
     return source_list[metas->squeeze_expert_idx(layer_id, expert_id)];
   }
 };
+
+torch::Tensor to_um(torch::Tensor t);

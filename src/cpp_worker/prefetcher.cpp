@@ -263,6 +263,11 @@ PrefetchMngr::PrefetchMngr(std::shared_ptr<ModuleMeta> metas,
   CUDA_CALL(cudaStreamCreateWithFlags((cudaStream_t*)(&compute_stream), cudaStreamNonBlocking));
   CUDA_CALL(cudaStreamCreateWithFlags((cudaStream_t*)(&copy_stream),    cudaStreamNonBlocking));
   at::cuda::setCurrentCUDAStream(at::cuda::getStreamFromExternal((cudaStream_t)compute_stream, model_loader->mem_mngr_ctx->device_id));
+  {
+    auto blas_handle = at::cuda::getCurrentCUDABlasHandle();
+    cublasStatus_t ret = cublasSetStream(blas_handle, at::cuda::getCurrentCUDAStream());
+    CHECK(ret == CUBLAS_STATUS_SUCCESS);
+  }
   fetch_schedule_thread = std::make_shared<FetchScheduleWorker>();
   cache_stats = std::make_shared<CacheStatistics>();
   cache_stats->add_reporter([this, metas = this->metas](CacheStatistics* stats){
@@ -553,16 +558,33 @@ void PrefetchMngr::temp_move_expert_to_gpu(int layer_id, int expert_id) {
   auto expert = model_loader->get_source(layer_id, expert_id);
   auto gpu_data = model_loader->mem_mngr_ctx->dummy_physical;
 
+  // use compute stream to avoid race
   for (int mem_buf_idx = 0; mem_buf_idx < metas->num_per_expert_param; mem_buf_idx++) {
     // LOG(ERROR) << "fetcher: copy from " << task.expert->host_data.ptr(mem_buf_idx) << " to " << task.expert->gpu_data->ptr(mem_buf_idx);
     CUDA_CALL(cudaMemcpyAsync(
         gpu_data->ptr(mem_buf_idx),
         expert->host_data->ptr(mem_buf_idx),
         expert->host_data->nbytes(mem_buf_idx),
-        cudaMemcpyHostToDevice, nullptr));
+        cudaMemcpyHostToDevice, (cudaStream_t)compute_stream));
   }
   expert->reference_to_model_param->unmap();
   expert->reference_to_model_param->map_to(gpu_data, model_loader->mem_mngr_ctx.get());
 
-  CUDA_CALL(cudaStreamSynchronize(nullptr));
+  CUDA_CALL(cudaStreamSynchronize((cudaStream_t)compute_stream));
+}
+void PrefetchMngr::temp_move_expert_back_to_host(int layer_id, int expert_id) {
+  auto expert = model_loader->get_source(layer_id, expert_id);
+  auto gpu_data = model_loader->mem_mngr_ctx->dummy_physical;
+
+  // use compute stream to avoid race
+  for (int mem_buf_idx = 0; mem_buf_idx < metas->num_per_expert_param; mem_buf_idx++) {
+    // LOG(ERROR) << "fetcher: copy from " << task.expert->host_data.ptr(mem_buf_idx) << " to " << task.expert->gpu_data->ptr(mem_buf_idx);
+    CUDA_CALL(cudaMemcpyAsync(
+        expert->host_data->ptr(mem_buf_idx),
+        gpu_data->ptr(mem_buf_idx),
+        expert->host_data->nbytes(mem_buf_idx),
+        cudaMemcpyDeviceToHost, (cudaStream_t)compute_stream));
+  }
+
+  CUDA_CALL(cudaStreamSynchronize((cudaStream_t)compute_stream));
 }

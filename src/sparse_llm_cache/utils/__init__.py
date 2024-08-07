@@ -95,13 +95,19 @@ def add_hook_to_moe_layers(model, prefetch_mngr, filter):
     hooks.add_hook_to_module(module, hook)
   recursive_traverse_childrens(model, f, filter)
 
-def add_hook_to_expert_first_auto_gptq_post_init(model, prefetch_mngr, filter):
-  hook = AutoGPTQPostInitHook(prefetch_mngr)
+def add_hook_to_quant_expert_post_init(model, prefetch_mngr, filter):
+  first_hook = AutoGPTQFirstPostInitHook(prefetch_mngr)
+  last_hook  = AutoGPTQLastPostInitHook(prefetch_mngr)
   def f(module, name):
+    first_module = None
+    last_module  = None
     for name, submodule in module.named_modules():
-      if hasattr(submodule, "QUANT_TYPE"):
-        hooks.add_hook_to_module_custom_method(submodule, hook, method_name='post_init', hook_attr_name='_post_init_hook')
-        break
+      if hasattr(submodule, "QUANT_TYPE") == False: continue
+      if first_module is None:
+        first_module = submodule
+      last_module = submodule
+    hooks.add_hook_to_module_custom_method(first_module, first_hook, method_name='post_init', hook_attr_name='_post_init_hook')
+    hooks.add_hook_to_module_custom_method(last_module,  last_hook,  method_name='post_init', hook_attr_name='_post_init_hook')
   recursive_traverse_childrens(model, f, filter)
 
 def add_hook_to_some_modules(model, hook, filter=RegexFilter(r'.*'), append=False):
@@ -291,7 +297,7 @@ def inject_model(
   add_hook_to_experts(model, prefetch_mngr, expert_name_filter)
   add_hook_to_moe_attns(model, prefetch_mngr, moe_attn_name_filter)
   add_hook_to_moe_layers(model, prefetch_mngr, moe_layer_name_filter)
-  add_hook_to_expert_first_auto_gptq_post_init(model, prefetch_mngr, expert_name_filter)
+  add_hook_to_quant_expert_post_init(model, prefetch_mngr, expert_name_filter)
   attach_prefetch_mngr_to_all_module(model, prefetch_mngr)
 
   if trace_event:

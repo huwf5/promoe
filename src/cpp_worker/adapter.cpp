@@ -7,6 +7,8 @@ std::string dump_trace_event_collector_singleton() {
   return TraceEventCollector::singleton().dump_json_to_string();
 }
 
+torch::Tensor to_um(torch::Tensor t);
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   py::class_<ModuleMeta, std::shared_ptr<ModuleMeta>>(m, "ModuleMeta")
     .def(py::init<int,int>())
@@ -71,6 +73,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     .def("report_moe_layer_logits", &PrefetchMngr::report_moe_layer_logits)
     .def("build_timer",             &PrefetchMngr::build_timer)
     .def("temp_move_expert_to_gpu", &PrefetchMngr::temp_move_expert_to_gpu)
+    .def("temp_move_expert_back_to_host", &PrefetchMngr::temp_move_expert_back_to_host)
     .def_readwrite("metas",         &PrefetchMngr::metas)
     .def_readwrite("model_loader",  &PrefetchMngr::model_loader)
     .def_readwrite("predictor",     &PrefetchMngr::predictor)
@@ -100,6 +103,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   ;
 
   m.def("dump_trace_event_collector_singleton", &dump_trace_event_collector_singleton);
+  m.def("to_um", &to_um);
 
   py::enum_<ThreadType>(m, "ThreadType")
     .value("kPythonMain",     ThreadType::kPythonMain)

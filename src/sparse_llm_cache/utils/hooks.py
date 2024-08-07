@@ -15,7 +15,7 @@ class ModelHook:
       the `torch.no_grad()` context manager.
     """
 
-    no_grad = False
+    no_grad = True
 
     def init_hook(self, module):
         """
@@ -399,8 +399,8 @@ def add_hook_to_module_custom_method(module: torch.nn.Module, hook: ModelHook, a
 
     return module
 
-class AutoGPTQPostInitHook:
-    no_grad = False
+class AutoGPTQFirstPostInitHook:
+    no_grad = True
 
     def __init__(self, prefetch_mngr) -> None:
       self.prefetch_mngr = prefetch_mngr
@@ -414,6 +414,26 @@ class AutoGPTQPostInitHook:
         return args, kwargs
 
     def post_post_init(self, module, output):
+        return output
+
+    def detach_hook(self, module):
+        return module
+
+class AutoGPTQLastPostInitHook:
+    no_grad = True
+
+    def __init__(self, prefetch_mngr) -> None:
+      self.prefetch_mngr = prefetch_mngr
+      pass
+
+    def init_hook(self, module):
+        return module
+
+    def pre_post_init(self, module, *args, **kwargs):
+        return args, kwargs
+
+    def post_post_init(self, module, output):
+        self.prefetch_mngr.temp_move_expert_back_to_host(module._layer_id, module._expert_id)
         return output
 
     def detach_hook(self, module):

@@ -184,4 +184,5 @@ public:
   void reload_env();
 
   void temp_move_expert_to_gpu(int layer_id, int expert_id);
+  void temp_move_expert_back_to_host(int layer_id, int expert_id);
 };

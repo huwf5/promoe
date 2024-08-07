@@ -131,3 +131,11 @@ void ExpertParamWrapperCUDriverUnified::unmap() {
   TRACE_EVENT_GURAD(kCache, "unmap");
   MemMngrCtx::cu_unmap_address(ptr, mapped_nbyte);
 }
+
+torch::Tensor to_um(torch::Tensor t) {
+  void* ptr = nullptr;
+  CUDA_CALL(cudaMallocManaged(&ptr, t.nbytes()));
+  CUDA_CALL(cudaMemcpyAsync(ptr, t.data_ptr(), t.nbytes(), cudaMemcpyDefault, 0));
+  CUDA_CALL(cudaStreamSynchronize(0));
+  return torch::from_blob(ptr, t.sizes(), t.options().device(torch::kCUDA, 0));
+}
