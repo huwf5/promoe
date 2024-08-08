@@ -106,8 +106,9 @@ def add_hook_to_quant_expert_post_init(model, prefetch_mngr, filter):
       if first_module is None:
         first_module = submodule
       last_module = submodule
-    hooks.add_hook_to_module_custom_method(first_module, first_hook, method_name='post_init', hook_attr_name='_post_init_hook')
-    hooks.add_hook_to_module_custom_method(last_module,  last_hook,  method_name='post_init', hook_attr_name='_post_init_hook')
+    if first_module != None:
+      hooks.add_hook_to_module_custom_method(first_module, first_hook, method_name='post_init', hook_attr_name='_post_init_hook')
+      hooks.add_hook_to_module_custom_method(last_module,  last_hook,  method_name='post_init', hook_attr_name='_post_init_hook')
   recursive_traverse_childrens(model, f, filter)
 
 def add_hook_to_some_modules(model, hook, filter=RegexFilter(r'.*'), append=False):
