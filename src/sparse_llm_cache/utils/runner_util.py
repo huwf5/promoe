@@ -19,6 +19,8 @@ def parse_args():
   parser = argparse.ArgumentParser()
   parser.add_argument("--model_id", type=str, default=None)
   parser.add_argument("--model_revision", type=str, default=None)
+  parser.add_argument("--dataset", type=str, default='shareGPT-small')
+  parser.add_argument("--max_num_batch", type=int, default=20)
   parser.add_argument("--batch_size", type=int, default=1)
   parser.add_argument("--num_predict_expert_per_layer", type=int)
   parser.add_argument("--cache_rate", type=float)
