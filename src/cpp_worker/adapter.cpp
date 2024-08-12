@@ -58,6 +58,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
   py::class_<CacheOracle, std::shared_ptr<CacheOracle>>(m, "CacheOracle")
     .def("load_from_file",       &CacheOracle::load_from_file)
+    .def("load_from_tensor",     &CacheOracle::load_from_tensor)
   ;
 
   py::class_<PrefetchMngr, std::shared_ptr<PrefetchMngr>>(m, "PrefetchMngr")

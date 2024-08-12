@@ -12,7 +12,9 @@ class CachePolicy {
   virtual ExpertHandler* select_for_evict(ExpertHandler*) { return nullptr; }
   virtual void evict(ExpertHandler*) {}
   virtual void access_on_hit(ExpertHandler*) {}
+  virtual void access_on_hit(ExpertHandler* e, bool is_precise) { return access_on_hit(e); }
   virtual void access_on_miss(ExpertHandler*) {}
+  virtual void access_on_miss(ExpertHandler* e, bool is_precise) { return access_on_miss(e); }
   virtual void update_all_priority() {}
   virtual void update_priority(ExpertHandler* e, float p) {}
   virtual void set_cur_seq(uint64_t seq_id) {}
@@ -113,6 +115,7 @@ class CacheOracle {
   ModelLoader* model_loader;
   std::unordered_map<uint64_t, SequenceOracle> sequence_oracles;
   void load_from_file(std::string file_path);
+  void load_from_tensor(torch::Tensor entry_metas, torch::Tensor prefill_expert_len, torch::Tensor prefill_expert_selection, torch::Tensor decode_expert_selection);
   void init(ModuleMeta* metas, ModelLoader* model_loader) {
     this->metas = metas;
     this->model_loader = model_loader;
@@ -168,7 +171,9 @@ class CachePolicyMIN: public CachePolicy {
     map.erase(e);
   }
   void access_on_hit(ExpertHandler *e) override;
+  void access_on_hit(ExpertHandler *e, bool is_precise) override;
   void access_on_miss(ExpertHandler *e) override;
+  void access_on_miss(ExpertHandler *e, bool is_precise) override;
   // void update_all_priority() override {
   //   // for (auto &pair : map) {
   //   //   pair.second->priority = priority_fn(pair.first);

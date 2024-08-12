@@ -124,7 +124,7 @@ void CacheMngr::access(ExpertHandler *expert, bool is_precise) {
 void CacheMngr::hit(ExpertHandler *expert, bool is_precise) {
   auto cache_slot = cache_slots->to_slot(expert);
   handle_hit(expert);
-  cache_slot->policy->access_on_hit(expert);
+  cache_slot->policy->access_on_hit(expert, is_precise);
   // if (is_precise && metas->predict_input_mode == kOneToken) {
   if (is_precise) {
     max_priority += 1;
@@ -147,7 +147,7 @@ CacheMngr::CacheLineOccupancyWaiter CacheMngr::miss(ExpertHandler *incoming_e, b
     auto gpu_data = cache_slot->unused_mems.back();
     incoming_e->gpu_data = gpu_data;
     cache_slot->unused_mems.pop_back();
-    cache_slot->policy->access_on_miss(incoming_e);
+    cache_slot->policy->access_on_miss(incoming_e, is_precise);
     prefetched_experts[incoming_e] = gpu_data;
   } else {
     auto e_to_evict = cache_slot->policy->select_for_evict(incoming_e);
@@ -161,7 +161,7 @@ CacheMngr::CacheLineOccupancyWaiter CacheMngr::miss(ExpertHandler *incoming_e, b
       CHECK(e_to_evict != incoming_e);
 
       cache_slot->policy->evict(e_to_evict);
-      cache_slot->policy->access_on_miss(incoming_e);
+      cache_slot->policy->access_on_miss(incoming_e, is_precise);
       LOG_BLOCK(DEBUG, logger, {
         logger << "after evict, policy state is " << cache_slot->policy->toString();
       });
@@ -333,13 +333,14 @@ void CacheOracle::load_from_file(std::string file_path) {
   }
 }
 void CachePolicyMIN::access_on_hit(ExpertHandler *e) {
+  // LOG(ERROR) << "min access on hit " << e->toString();
   auto &oracle = current_sequence->expert_oracles[e];
   if (next_use_time_idx.find(e) == next_use_time_idx.end()) {
     next_use_time_idx[e] = 0;
   }
   auto &use_time_idx = next_use_time_idx[e];
   CHECK(use_time_idx < oracle.use_times.size());
-  CHECK(current_time <= oracle.use_times[use_time_idx]);
+  CHECK(current_time <= oracle.use_times[use_time_idx]) << current_time << " > " << oracle.use_times[use_time_idx];
   LOG(TRACE) << "current time from " << current_time << " to " << oracle.use_times[use_time_idx];
   current_time = oracle.use_times[use_time_idx];
   use_time_idx++;
@@ -347,17 +348,68 @@ void CachePolicyMIN::access_on_hit(ExpertHandler *e) {
   auto priority = -oracle.use_times[use_time_idx];
   heap.update_priority(map[e], priority);
 }
+void CachePolicyMIN::access_on_hit(ExpertHandler *e, bool is_precise) {
+  // LOG(ERROR) << "min access on hit " << e->toString() << ", is_precise:" << is_precise;
+  if (is_precise) {
+    return access_on_hit(e);
+  }
+  auto &oracle = current_sequence->expert_oracles[e];
+  if (next_use_time_idx.find(e) == next_use_time_idx.end()) {
+    next_use_time_idx[e] = 0;
+  }
+  auto &use_time_idx = next_use_time_idx[e];
+  // CHECK(use_time_idx < oracle.use_times.size());
+  // CHECK(current_time <= oracle.use_times[use_time_idx]);
+  // LOG(TRACE) << "current time from " << current_time << " to " << oracle.use_times[use_time_idx];
+  // current_time = oracle.use_times[use_time_idx];
+  // use_time_idx++;
+
+  auto priority = -oracle.use_times[use_time_idx];
+  heap.update_priority(map[e], priority);
+}
 void CachePolicyMIN::access_on_miss(ExpertHandler *e) {
+  // LOG(ERROR) << "min access on miss " << e->toString();
   auto &oracle = current_sequence->expert_oracles[e];
   if (next_use_time_idx.find(e) == next_use_time_idx.end()) {
     next_use_time_idx[e] = 0;
   }
   auto &use_time_idx = next_use_time_idx[e];
   CHECK(use_time_idx < oracle.use_times.size());
-  CHECK(current_time <= oracle.use_times[use_time_idx]);
+  CHECK(current_time <= oracle.use_times[use_time_idx]) << current_time << " > " << oracle.use_times[use_time_idx];
   LOG(TRACE) << "current time from " << current_time << " to " << oracle.use_times[use_time_idx];
   current_time = oracle.use_times[use_time_idx];
   use_time_idx++;
+
+  auto priority = -oracle.use_times[use_time_idx];
+
+  CHECK(map.find(e) == map.end());
+  Heap::Node *n = nullptr;
+  if (heap_node_free_buffer.empty()) {
+    n = new Heap::Node;
+  } else {
+    n = heap_node_free_buffer.back();
+    heap_node_free_buffer.pop_back();
+  }
+  map[e] = n;
+  n->data = e;
+  n->priority = priority;
+  heap.push(n);
+}
+void CachePolicyMIN::access_on_miss(ExpertHandler *e, bool is_precise) {
+  // LOG(ERROR) << "min access on miss " << e->toString() << ", is_precise:" << is_precise;
+  if (is_precise) {
+    return access_on_miss(e);
+  }
+  auto &oracle = current_sequence->expert_oracles[e];
+  if (next_use_time_idx.find(e) == next_use_time_idx.end()) {
+    next_use_time_idx[e] = 0;
+  }
+  auto &use_time_idx = next_use_time_idx[e];
+  // CHECK(use_time_idx < oracle.use_times.size());
+  // CHECK(current_time <= oracle.use_times[use_time_idx]);
+  // LOG(TRACE) << "current time from " << current_time << " to " << oracle.use_times[use_time_idx];
+  // current_time = oracle.use_times[use_time_idx];
+  // use_time_idx++;
 
   auto priority = -oracle.use_times[use_time_idx];
 
@@ -380,5 +432,58 @@ void CacheMngr::update_priority(torch::Tensor p, int starting_layer) {
     update_all_priority(p);
   } else {
     update_some_priority(p, starting_layer);
+  }
+}
+void CacheOracle::load_from_tensor(torch::Tensor entry_metas, torch::Tensor prefill_expert_len, torch::Tensor prefill_expert_selection, torch::Tensor decode_expert_selection) {
+  auto num_seq = prefill_expert_len.size(0);  
+  auto per_seq_rply_len = entry_metas.index({torch::indexing::Slice{}, 0}).bincount();
+  uint64_t cur_seq_entry_begin = 0;
+  for (uint64_t seq_id = 0; seq_id < num_seq; seq_id++) {
+    this->sequence_oracles[seq_id] = SequenceOracle();
+
+    auto & seq_oracle = this->sequence_oracles[seq_id];
+
+    for (int l = 0; l < metas->num_layer; l++) {
+      for (int e = 0; e < metas->num_expert; e++) {
+        auto expert = model_loader->get_source(l, e);
+        seq_oracle.expert_oracles[expert] = ExpertOracle();
+      }
+    }
+    uint64_t reply_len = per_seq_rply_len[seq_id].item<int64_t>();
+
+    LOG(ERROR) << "seq_id:" << seq_id << ", reply_len:" << reply_len;
+
+    // prompt
+    int64_t time = 0;
+    for (int layer_idx = 0; layer_idx < metas->num_layer; layer_idx++) {
+      uint32_t cur_layer_prefill_expert_len = prefill_expert_len[seq_id][layer_idx].item<int32_t>();
+      for (uint32_t offset = 0; offset < cur_layer_prefill_expert_len; offset++) {
+        uint32_t expert_idx = prefill_expert_selection[seq_id][layer_idx][offset].item<int32_t>();
+        auto e = model_loader->get_source(layer_idx, expert_idx);
+        seq_oracle.expert_oracles[e].use_times.push_back(time);
+      }
+      time += 1;
+    }
+
+    // reply
+    for (int reply_token_idx = 0; reply_token_idx < reply_len; reply_token_idx++) {
+      CHECK(entry_metas[cur_seq_entry_begin + reply_token_idx][0].item<int64_t>() == seq_id)          << cur_seq_entry_begin << "," << reply_token_idx << ":" << entry_metas[cur_seq_entry_begin + reply_token_idx][0].item<int64_t>() << "," << seq_id;
+      CHECK(entry_metas[cur_seq_entry_begin + reply_token_idx][1].item<int64_t>() == reply_token_idx) << cur_seq_entry_begin << "," << reply_token_idx << ":" << entry_metas[cur_seq_entry_begin + reply_token_idx][1].item<int64_t>() << "," << reply_token_idx;
+      for (int layer_idx = 0; layer_idx < metas->num_layer; layer_idx++) {
+        for (uint32_t offset = 0; offset < decode_expert_selection.size(2); offset++) {
+          uint32_t expert_idx = decode_expert_selection[cur_seq_entry_begin + reply_token_idx][layer_idx][offset].item<int32_t>();
+          auto e = model_loader->get_source(layer_idx, expert_idx);
+          seq_oracle.expert_oracles[e].use_times.push_back(time);
+        }
+        time += 1;
+      }
+    }
+    cur_seq_entry_begin += reply_len;
+    for (int l = 0; l < metas->num_layer; l++) {
+      for (int e = 0; e < metas->num_expert; e++) {
+        auto expert = model_loader->get_source(l, e);
+        seq_oracle.expert_oracles[expert].use_times.push_back(std::numeric_limits<int64_t>::max());
+      }
+    }
   }
 }

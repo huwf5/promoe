@@ -185,7 +185,7 @@ predefined_metas = {
   'TheBloke/Mixtral-8x7B-Instruct-v0.1-GPTQ'   : ModelMetas.build_mixtral,
 }
 
-def auto_infer_model_metas(model_id, return_dict = True):
+def auto_infer_model_metas(model_id, return_dict = True) -> ModelMetas|dict:
   if model_id in predefined_metas:
     return predefined_metas[model_id](return_dict)
   raise ValueError(f"model {model_id} is not supported")

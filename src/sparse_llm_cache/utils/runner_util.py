@@ -15,7 +15,7 @@ class CustomBooleanAction(argparse.Action):
     else:
       raise ValueError("invalid boolean value {}".format(self.values))
 
-def parse_args():
+def parse_args(args = None):
   parser = argparse.ArgumentParser()
   parser.add_argument("--model_id", type=str, default=None)
   parser.add_argument("--model_revision", type=str, default=None)
@@ -54,6 +54,6 @@ def parse_args():
   parser.add_argument(        "--module_trace_event", action=CustomBooleanAction, default=False)
   parser.add_argument( "--enable_module_trace_event", action="store_true",   dest="module_trace_event", default=False)
   parser.add_argument("--disable_module_trace_event", action="store_false",  dest="module_trace_event", default=False)
-  args = parser.parse_args()
+  args = parser.parse_args(args)
 
   return vars(args)

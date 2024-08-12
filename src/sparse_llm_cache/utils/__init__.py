@@ -293,7 +293,12 @@ def inject_model(
   predictor.load_model(predictor_model_path)
 
   if meta.cache_policy == 'min':
-    prefetch_mngr.cache.cache_oracle.load_from_file(cache_trace_path)
+    # prefetch_mngr.cache.cache_oracle.load_from_file(cache_trace_path)
+    prefill_expert_len       = torch.load(f'{cache_trace_path}/prefill_expert_len.pt')
+    prefill_expert_selection = torch.load(f'{cache_trace_path}/prefill_expert_selection.pt')
+    decode_expert_selection  = torch.load(f'{cache_trace_path}/decode_expert_selection.pt')
+    entry_to_metas           = torch.load(f'{cache_trace_path}/entry_to_metas.pt')
+    prefetch_mngr.cache.cache_oracle.load_from_tensor(entry_to_metas, prefill_expert_len, prefill_expert_selection, decode_expert_selection)
 
   add_hook_to_experts(model, prefetch_mngr, expert_name_filter)
   add_hook_to_moe_attns(model, prefetch_mngr, moe_attn_name_filter)
