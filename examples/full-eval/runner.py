@@ -55,7 +55,7 @@ template_cfg_list = (base_cfg_list.copy()
 full_list.concat(template_cfg_list.copy()
   .override('model_id', ['deepseek-ai/deepseek-moe-16b-chat',])
   .override('cache_rate', [cache_item/64 for cache_item in [1, 2, 4, 8, 12, 16, 24, 32]])
-  .override('predictor_model_path', ['/code/predict-models/models--deepseek-ai--deepseek-moe-16b-chat/moe-layer-logits'])
+  .override('predictor_model_path', ['/code/moe/predict-models/models--deepseek-ai--deepseek-moe-16b-chat/moe-layer-logits'])
   .hyper_override(['num_predict_expert_per_layer', 'reorder_experts', 'early_preempt'], [
     [0, False, False], ## weak baseline
     [6,  True,  True], ## +p+opt

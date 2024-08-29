@@ -53,7 +53,7 @@ def gen_batch(text_list, do_print=False, max_new_tokens=100):
     print(text_list, output_str, flush=True)
   return input_len, output_len
 
-dataset_path = f'/code/dataset/{cache_configs["dataset"]}/prompt_list.pt'
+dataset_path = f'/code/sparse-llm-cache-scripts/dataset/{cache_configs["dataset"]}/prompt_list.pt'
 print(dataset_path)
 prompts = torch.load(dataset_path)
 
