@@ -1,0 +1,30 @@
+FROM nvidia/cuda:12.1.0-devel-ubuntu22.04 as cuda-devel-env
+FROM ghcr.io/huggingface/text-generation-inference:2.2.0 as base
+
+ENV LANG=en_US.UTF-8
+ENV LC_ALL=C.UTF-8
+
+RUN chmod 1777 /tmp
+
+COPY --from=cuda-devel-env /usr/local/cuda-12.1 /usr/local/cuda-12.1
+
+RUN pip install ninja --no-cache-dir
+RUN pip install optimum==1.21.2 gekko==1.2.1 rouge==1.0.1 --no-deps
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        vim wget git curl \
+        && rm -rf /var/lib/apt/lists/*
+
+ENV HUGGINGFACE_HUB_CACHE="/root/.cache/huggingface/hub"
+
+ENTRYPOINT [""]
+
+ENV LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/cuda/lib64/stubs
+ENV LIBRARY_PATH=$LIBRARY_PATH:/usr/local/cuda/lib64/stubs
+
+# Final image
+FROM base
+
+RUN mkdir /code
+
+WORKDIR /code
