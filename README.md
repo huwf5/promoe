@@ -1,5 +1,9 @@
 # MoE Cache
 
+## Install
+
+Please refer to [./install.md](./install.md)
+
 ## Prepare the model
 
 ```bash
