@@ -6,6 +6,7 @@
 
 void Predictor::add_one_layer(int layer_id, int64_t *experts, size_t num_expert) {
   switch (metas->predict_input_mode) {
+    case kNoPredict:                { break; }
     case kOneToken:                 {
       for (int i = 0; i < num_expert; i++) {
         expert_access_buffer[layer_id][experts[i]] += 1;
@@ -48,6 +49,9 @@ torch::Tensor Predictor::predict(int input_layer_id) {
     CUDA_CALL(cudaEventSynchronize(logits_record_event[input_layer_id]));
   }
   switch (metas->predict_input_mode) {
+    case kNoPredict:                {
+      return torch::empty({metas->num_layer, 0}, torch::kFloat32);
+    }
     case kOneToken: { 
       CHECK(input_layer_id == 0);
       input = this->expert_access_buffer.clone();
@@ -154,6 +158,16 @@ void Predictor::load_one_model(std::string model_path, int idx) {
   predict_model_list[idx].eval();
 }
 void Predictor::load_model(std::string model_path) {
+  if (metas->predict_input_mode == kNoPredict) {
+    predict_model_metas[0] = PredictModelMeta();
+    predict_model_metas[0].orig_output_start_layer = 0;
+    predict_model_metas[0].orig_output_stop_layer = metas->num_layer;
+    predict_model_metas[0].slice_start = 0;
+    predict_model_metas[0].slice_stop = metas->num_layer;
+    layer_predict_enabled.resize(metas->num_layer + 1, false);
+    layer_predict_enabled[0] = true;
+    return;
+  }
   struct stat path_stat;
   auto stat_ret = stat(model_path.c_str(), &path_stat);
   CHECK(stat_ret == 0) << "Model file not found: " << model_path;
@@ -242,6 +256,7 @@ void Predictor::add_one_layer(int layer_id, torch::Tensor experts) {
 void Predictor::start_of_new_sequence() {
   LOG(DEBUG) << "predictor, start_of_new_sequence";
   switch (metas->predict_input_mode) {
+    case kNoPredict:               { break; }
     case kOneToken:                { break; }
     case kDecodeCumsum:            { expert_access_buffer.fill_(0); break; }
     case kLastUseDistance:         { last_use_distance_buffer.fill_(0); break; }
@@ -257,6 +272,7 @@ void Predictor::start_of_new_sequence() {
 void Predictor::end_of_one_token_prediction() {
   LOG(DEBUG) << "predictor, end_of_one_token_prediction";
   switch (metas->predict_input_mode) {
+    case kNoPredict:               { break; }
     case kOneToken:                { expert_access_buffer.fill_(0); break;}
     case kDecodeCumsum:            { break;}
     case kLastUseDistance:         { break;}
@@ -273,6 +289,7 @@ void Predictor::record_moe_attn_logits(int layer_id, torch::Tensor attn_logits) 
   TRACE_EVENT_GURAD(kHook, "record_moe_attn_logits " + std::to_string(layer_id));
   LOG(DEBUG) << "predictor, record_moe_attn_logits " << layer_id;
   switch (metas->predict_input_mode) {
+    case kNoPredict:               { break; }
     case kOneToken:            { break; }
     case kDecodeCumsum:        { break; }
     case kLastUseDistance:     { break; }
@@ -323,6 +340,7 @@ void Predictor::record_moe_layer_logits(int layer_id, torch::Tensor layer_logits
   TRACE_EVENT_GURAD(kHook, "record_moe_layer_logits " + std::to_string(layer_id));
   LOG(DEBUG) << "predictor, record_moe_layer_logits " << layer_id;
   switch (metas->predict_input_mode) {
+    case kNoPredict:               { break; }
     case kOneToken:                { break; }
     case kDecodeCumsum:            { break; }
     case kLastUseDistance:         { break; }

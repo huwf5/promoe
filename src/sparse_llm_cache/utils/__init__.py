@@ -259,6 +259,7 @@ def inject_model(
   meta.early_preempt = early_preempt
   meta.layer_predict_replace_first_input_with_last_output = layer_predict_replace_first_input_with_last_output
   meta.predict_input_mode = {
+    'no_predict': cpp_worker.kNoPredict,
     'one_token': cpp_worker.kOneToken,
     'decode_cumsum': cpp_worker.kDecodeCumsum,
     'last_use_distance': cpp_worker.kLastUseDistance,
@@ -289,8 +290,10 @@ def inject_model(
 
   # fixme: a general model path
   if predictor_model_path == None:
-    predictor_model_path = f"/nvme/songxiaoniu/moe/moe-predict-models/{repo_folder_name(repo_id = model_id)}.pt"
-  predictor.load_model(predictor_model_path)
+    print("skip loading predict model path")
+    pass
+  if predictor_model_path != None:
+    predictor.load_model(predictor_model_path)
 
   if meta.cache_policy == 'min':
     # prefetch_mngr.cache.cache_oracle.load_from_file(cache_trace_path)

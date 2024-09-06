@@ -98,6 +98,8 @@ void PredictWorker::add_prefetch_layer_budget() {
 void PredictWorker::on_one_iter_done() {
   LOG(DEBUG) << "predict workers, one iter done";
   switch (metas->predict_input_mode) {
+    // case kNoPredict:               { break; }
+    case kNoPredict:                { add_one_task(PredictJob()); break; }
     case kOneToken:                { add_one_task(PredictJob()); break; }
     case kDecodeCumsum:            { add_one_task(PredictJob()); break; }
     case kLastUseDistance:         { add_one_task(PredictJob()); break; }
@@ -111,6 +113,7 @@ void PredictWorker::on_one_iter_done() {
 void PredictWorker::on_moe_attn_input_logits_recorded(int layer_id) {
   LOG(DEBUG) << "predict workers, on_moe_attn_input_logits_recorded " << layer_id;
   switch (metas->predict_input_mode) {
+    case kNoPredict:               { break; }
     case kOneToken:                { break;}
     case kDecodeCumsum:            { break;}
     case kLastUseDistance:         { break;}
@@ -133,6 +136,7 @@ void PredictWorker::on_moe_attn_input_logits_recorded(int layer_id) {
 void PredictWorker::on_moe_layer_logits_recorded(int layer_id) {
   LOG(DEBUG) << "predict workers, on_moe_layer_logits_recorded " << layer_id;
   switch (metas->predict_input_mode) {
+    case kNoPredict:               { break; }
     case kOneToken:                { break;}
     case kDecodeCumsum:            { break;}
     case kLastUseDistance:         { break;}

@@ -106,7 +106,8 @@ class AtomicQueueLock {
 };
 
 enum PredictInputMode {
-  kOneToken = 0,
+  kNoPredict = 0,
+  kOneToken,
   kDecodeCumsum,
   kLastUseDistance,
   kWeighedDecodeCumsum,

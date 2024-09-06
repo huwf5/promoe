@@ -26,6 +26,7 @@ class Predictor {
   void init_expert_access_buffer() {
     auto options = torch::TensorOptions().dtype(torch::kFloat32);
     switch (metas->predict_input_mode) {
+      case kNoPredict:               { break; }
       case kOneToken: {
         expert_access_buffer = torch::zeros({metas->num_layer, metas->num_expert}, options);
         break;

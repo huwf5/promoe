@@ -114,6 +114,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     .export_values();
 
   py::enum_<PredictInputMode>(m, "PredictInputMode")
+    .value("kNoPredict",               PredictInputMode::kNoPredict)
     .value("kOneToken",                PredictInputMode::kOneToken)
     .value("kDecodeCumsum",            PredictInputMode::kDecodeCumsum)
     .value("kLastUseDistance",         PredictInputMode::kLastUseDistance)
