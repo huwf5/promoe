@@ -68,7 +68,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     .def("reload_env",              &PrefetchMngr::reload_env)
     .def("report_one_expert",       &PrefetchMngr::report_one_expert)
     .def("one_expert_done",         &PrefetchMngr::one_expert_done)
-    .def("report_one_layer",        &PrefetchMngr::report_one_layer)
+    .def("report_one_layer",        static_cast<void (PrefetchMngr::*)(int,torch::Tensor)>(&PrefetchMngr::report_one_layer))
     .def("one_moe_layer_done",      &PrefetchMngr::one_moe_layer_done)
     .def("report_moe_attn_logits",  &PrefetchMngr::report_moe_attn_logits)
     .def("report_moe_layer_logits", &PrefetchMngr::report_moe_layer_logits)

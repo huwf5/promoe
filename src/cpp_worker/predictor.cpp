@@ -332,6 +332,11 @@ void Predictor::record_moe_layer_logits(int layer_id, torch::Tensor layer_logits
     case kMoeLayerLogits: {
       CHECK(layer_logits.dim() == 3) << "input logits must be in shape [num_batch, seq_len, num_expert], but found " << layer_logits.sizes();
       // CHECK(layer_logits.size(0) == 1) << "batch > 1 not supported";
+      if (layer_logits.size(1) == 0) {
+        LOG(ERROR) << "predictor, skip record due to empty";
+        moe_layer_logits_buffer_list[layer_id] = torch::empty({0});
+        break;
+      }
       if (layer_logits.size(1) != 1) {
         LOG(DEBUG) << "predictor, skip record due to prefill";
         moe_layer_logits_buffer_list[layer_id] = torch::empty({0});

@@ -145,8 +145,8 @@ class PrefetchMngr {
    * for already in cache, directly lock it
    * for fetching, lock it after fetching is done
    */
-  void preempt_and_launch_one_layer(int layer_idx, torch::Tensor experts);
-  void record_then_predict_and_prefetch(int layer_id, torch::Tensor experts);
+  void preempt_and_launch_one_layer(int layer_idx, int64_t* experts, int64_t num_expert);
+  void record_then_predict_and_prefetch(int layer_id, int64_t* experts, int64_t num_expert);
 
   void wait_expert(int layer_id, int expert_id);
   void mark_expert_using(int layer_id, int expert_id);
@@ -165,11 +165,14 @@ public:
 
   PrefetchMngr(std::shared_ptr<ModuleMeta> metas,
                std::shared_ptr<ModelLoader> model_loader,
-               std::shared_ptr<Predictor> predictor);
+               std::shared_ptr<Predictor> predictor,
+               int64_t compute_stream = 0,
+               bool create_compute_stream = true);
   ~PrefetchMngr();
   void init_gpu_mem_buffer(size_t num_buffers);
 
   void report_one_layer(int layer_id, torch::Tensor experts);
+  void report_one_layer(int layer_id, int64_t* experts, int64_t num_expert);
   void one_moe_layer_done(int layer_id);
 
   void report_one_expert(int layer_id, int expert_id);

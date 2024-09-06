@@ -72,7 +72,7 @@ void FetchScheduleWorker::preempt_one_expert(int layer_idx, int64_t expert_idx) 
 void FetchScheduleWorker::preempt_one_layer_without_reorder_(int layer_idx, int64_t *expert_idxs, size_t num_expert) {
   TRACE_EVENT_GURAD(kFetchScheduler, "preempt_one_layer_without_reorder_");
   LOG_BLOCK(DEBUG, logger, {
-    logger << "preempting one layer " << layer_idx << " with expert " << array_to_str(expert_idxs, num_expert);
+    logger << "scheduler: preempting one layer " << layer_idx << " with expert " << array_to_str(expert_idxs, num_expert);
   });
 
   bool preceeding_experts_in_cache = true;
@@ -125,12 +125,12 @@ void FetchScheduleWorker::preempt_one_layer_without_reorder_(int layer_idx, int6
 }
 void FetchScheduleWorker::add_single_tasks_for_one_expert(int layer_idx, int expert_idx, TaskQueue* queue, int starting_mem_buffer, int stop_mem_buffer, bool is_precise) {
   auto expert_handler = model_loader->get_source(layer_idx, expert_idx);
-  LOG(TRACE) << "add prefetch task for one param " << expert_handler->toString() << ", starting from " << starting_mem_buffer;
   CopyTask task;
   task.start_mem_buf_idx = starting_mem_buffer;
   task.stop_mem_buf_idx = stop_mem_buffer;
   task.expert = expert_handler;
   task.is_precise = is_precise;
+  LOG(TRACE) << "scheduler: add prefetch task for one param " << task.toString();
   queue->push(task);
 }
 
@@ -163,23 +163,26 @@ void PrefetchMngr::init_gpu_mem_buffer(size_t num_buffers) {
   cache->init_gpu_mem_buffer(num_buffers);
   model_loader->mem_mngr_ctx->dummy_physical = cache->cache_slots->slots.front().unused_mems.front();
 }
-void PrefetchMngr::preempt_and_launch_one_layer(int layer_idx, torch::Tensor experts) {
+void PrefetchMngr::preempt_and_launch_one_layer(int layer_idx, int64_t* experts, int64_t num_expert) {
   PreemptTask preempt_task;
   preempt_task.layer_idx = layer_idx;
-  preempt_task.expert_idxs = experts.data_ptr<int64_t>();
-  preempt_task.num_expert = experts.numel();
+  preempt_task.expert_idxs = experts;
+  preempt_task.num_expert = num_expert;
   auto handler = fetch_schedule_thread->add_one_task(&preempt_task);
   fetch_schedule_thread->wait_progress(handler);
   // preempt_one_layer_(layer_idx, experts.data_ptr<int64_t>(), experts.size(0));
 }
 
 void PrefetchMngr::report_one_layer(int layer_id, torch::Tensor experts) {
+  report_one_layer(layer_id, experts.data_ptr<int64_t>(), experts.numel());
+}
+void PrefetchMngr::report_one_layer(int layer_id, int64_t* experts, int64_t num_expert) {
   TRACE_EVENT_GURAD(kHook, "report_one_layer");
   cache_stats->forward();
   predict_thread->consume_prefetch_layer_progress();
-  preempt_and_launch_one_layer(layer_id, experts); // handle reorder, launch precise task, clear prefetch queue
-  profiler->add(TimeProfiler::kCntActivatedExpert, experts.numel());
-  record_then_predict_and_prefetch(layer_id, experts);
+  preempt_and_launch_one_layer(layer_id, experts, num_expert); // handle reorder, launch precise task, clear prefetch queue
+  profiler->add(TimeProfiler::kCntActivatedExpert, num_expert);
+  record_then_predict_and_prefetch(layer_id, experts, num_expert);
 }
 void PrefetchMngr::one_moe_layer_done(int layer_id) {
   TRACE_EVENT_GURAD(kHook, "one_moe_layer_done");
@@ -253,21 +256,26 @@ void PrefetchMngr::launch_thread() {
 }
 PrefetchMngr::PrefetchMngr(std::shared_ptr<ModuleMeta> metas,
                            std::shared_ptr<ModelLoader> model_loader,
-                           std::shared_ptr<Predictor> predictor)
+                           std::shared_ptr<Predictor> predictor,
+                           int64_t compute_stream_param,
+                           bool create_compute_stream)
     : metas(metas), model_loader(model_loader), predictor(predictor) {
   this->cache = std::make_shared<CacheMngr>(metas, model_loader);
   predict_thread = std::make_shared<PredictWorker>();
   expert_unlocker_thread = std::make_shared<ExpertUnlockWorker>();
   fetch_thread = std::make_shared<FetchWorker>();
   // cudaStream_t stream;
-  CUDA_CALL(cudaStreamCreateWithFlags((cudaStream_t*)(&compute_stream), cudaStreamNonBlocking));
-  CUDA_CALL(cudaStreamCreateWithFlags((cudaStream_t*)(&copy_stream),    cudaStreamNonBlocking));
-  at::cuda::setCurrentCUDAStream(at::cuda::getStreamFromExternal((cudaStream_t)compute_stream, model_loader->mem_mngr_ctx->device_id));
-  {
-    auto blas_handle = at::cuda::getCurrentCUDABlasHandle();
-    cublasStatus_t ret = cublasSetStream(blas_handle, at::cuda::getCurrentCUDAStream());
-    CHECK(ret == CUBLAS_STATUS_SUCCESS);
+  compute_stream = compute_stream_param;
+  if (compute_stream == 0 && create_compute_stream) {
+    CUDA_CALL(cudaStreamCreateWithFlags((cudaStream_t*)(&compute_stream), cudaStreamNonBlocking));
+    at::cuda::setCurrentCUDAStream(at::cuda::getStreamFromExternal((cudaStream_t)compute_stream, model_loader->mem_mngr_ctx->device_id));
+    {
+      auto blas_handle = at::cuda::getCurrentCUDABlasHandle();
+      cublasStatus_t ret = cublasSetStream(blas_handle, at::cuda::getCurrentCUDAStream());
+      CHECK(ret == CUBLAS_STATUS_SUCCESS);
+    }
   }
+  CUDA_CALL(cudaStreamCreateWithFlags((cudaStream_t*)(&copy_stream),    cudaStreamNonBlocking));
   fetch_schedule_thread = std::make_shared<FetchScheduleWorker>();
   cache_stats = std::make_shared<CacheStatistics>();
   cache_stats->add_reporter([this, metas = this->metas](CacheStatistics* stats){
@@ -356,15 +364,15 @@ void PrefetchMngr::report_moe_layer_logits(int layer_id, torch::Tensor layer_log
   }
 }
 
-void PrefetchMngr::record_then_predict_and_prefetch(int layer_id, torch::Tensor experts) {
+void PrefetchMngr::record_then_predict_and_prefetch(int layer_id, int64_t* experts, int64_t num_expert) {
   TRACE_EVENT_GURAD(kHook, "record_then_predict_and_launch");
   // LOG_BLOCK(DEBUG, logger, {
   //   logger << "actual " << layer_id << ":" << tensor_to_str(experts);
   // });
-  if (experts.numel() <= metas->num_expert_per_token) {
-    predictor->add_one_layer(layer_id, experts);
+  if (num_expert <= metas->num_expert_per_token) {
+    predictor->add_one_layer(layer_id, experts, num_expert);
   } else {
-    LOG(TRACE) << "identified prefill iteration, skip adding it to prefill " << experts.numel();
+    LOG(TRACE) << "identified prefill iteration, skip adding it to prefill " << num_expert;
     // predictor->clear_access_buffer();
     if (layer_id == 0) {
       predictor->start_of_new_sequence();
@@ -426,10 +434,10 @@ void FetchScheduleWorker::do_one_task_impl(PreemptTask *task) {
   }
 
   if (per_layer_job_queues[task->layer_idx].empty() == false) {
-    LOG(TRACE) << "preempting one layer " << task->layer_idx << ", queue is not empty, current task is " << current_task.toString();
+    LOG(TRACE) << "scheduler: do PreemptTask, preempting one layer " << task->layer_idx << ", queue is not empty, current task is " << current_task.toString();
     per_layer_job_queues[task->layer_idx].clear();
   } else {
-    LOG(TRACE) << "preempting one layer " << task->layer_idx << ", queue is empty";
+    LOG(TRACE) << "scheduler: do PreemptTask, preempting one layer " << task->layer_idx << ", queue is empty";
   }
 }
 void FetchScheduleWorker::do_one_task_impl(PreemptOneExpertTask *task) {
@@ -481,13 +489,13 @@ void FetchScheduleWorker::do_one_task_impl(IdleTask *idle_task) {
 
 void FetchScheduleWorker::do_one_task_impl(PrefetchLayerTask *task) {
   TRACE_EVENT_GURAD(kFetchScheduler, "add task for layer " + std::to_string(task->layer_idx) + "[" + array_to_str(task->expert_idxs, task->num_expert) + "]");
-  LOG(TRACE) << "add prefetch task for layer " << task->layer_idx;
+  LOG(TRACE) << "scheduler: do PrefetchLayerTask, add prefetch task for layer " << task->layer_idx;
   CHECK(per_layer_job_queues[task->layer_idx].empty());
   CHECK(current_task.expert == nullptr || current_task.expert->layer_idx != task->layer_idx);
   // ready, partial, miss
   for (int i = 0; i < task->num_expert; i++) {
     auto expert = model_loader->get_source(task->layer_idx, task->expert_idxs[i]);
-    LOG(TRACE) << "adding prefetch task " << expert->toString();
+    LOG(TRACE) << "scheduler: do PrefetchLayerTask, adding prefetch task " << expert->toString();
     if (metas->promote_hit_in_prefetch && cache->is_in_cache(expert)) { cache_hit(expert, false); }
     // if (expert->num_ready == metas->num_per_expert_param) {
     //   auto cur_status = expert->expert_status.get();
