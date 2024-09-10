@@ -4,6 +4,7 @@
 #include "utils.hpp"
 #include "model_loader.hpp"
 #include "predictor.hpp"
+#include "profiler.hpp"
 
 template<typename TASK_T>
 class WorkerThread {
@@ -145,6 +146,9 @@ class PredictWorker : public WorkerThread<PredictJob> {
   Predictor  * predictor;
   CacheMngr  * cache;
   ModuleMeta * metas;
+
+  PrecisionProfiler * precision_profiler;
+
   sem_t prefetch_layer_budget, prefetch_layer_progress;
   friend class PrefetchMngr;
  public:

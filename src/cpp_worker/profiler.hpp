@@ -339,3 +339,46 @@ class TimerGuard {
     if (initialized) release();
   }
 };
+
+class PrecisionProfiler {
+ public:
+  class LayerInfo {
+   public:
+    int layer_id;
+    std::vector<int64_t> experts;
+    LayerInfo() {}
+    LayerInfo(int layer_id) : layer_id(layer_id) {}
+    LayerInfo(int layer_id, const int64_t* experts, size_t num_experts) : layer_id(layer_id), experts(experts, experts + num_experts) {}
+    void add(int64_t e) { experts.push_back(e); }
+    int intersect(const LayerInfo & other) {
+      std::unordered_set<int64_t> s(experts.begin(), experts.end());
+      int cnt = 0;
+      for (auto e : other.experts) {
+        if (s.count(e)) {
+          cnt++;
+        }
+      }
+      return cnt;
+    }
+  };
+  int previous_layer_id = -1;
+  std::vector<LayerInfo> predicted_experts;
+  std::vector<LayerInfo> activated_experts;
+  void record_predicted_experts(int layer_id, const int64_t* experts, size_t num_experts) {
+    predicted_experts.push_back(LayerInfo(layer_id, experts, num_experts));
+  }
+  void record_activated_experts(int layer_id, const int64_t* experts, size_t num_experts) {
+    activated_experts.push_back(LayerInfo(layer_id, experts, num_experts));
+  }
+  void record_activated_experts_by_append(int layer_id, int64_t expert) {
+    if (layer_id != previous_layer_id) {
+      activated_experts.push_back(LayerInfo(layer_id));
+      previous_layer_id = layer_id;
+    }
+    activated_experts.back().add(expert);
+  }
+  void report();
+  ~PrecisionProfiler() {
+    report();
+  }
+};

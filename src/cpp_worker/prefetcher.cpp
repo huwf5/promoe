@@ -182,6 +182,7 @@ void PrefetchMngr::report_one_layer(int layer_id, int64_t* experts, int64_t num_
   predict_thread->consume_prefetch_layer_progress();
   preempt_and_launch_one_layer(layer_id, experts, num_expert); // handle reorder, launch precise task, clear prefetch queue
   profiler->add(TimeProfiler::kCntActivatedExpert, num_expert);
+  precision_profiler->record_activated_experts(layer_id, experts, num_expert);
   record_then_predict_and_prefetch(layer_id, experts, num_expert);
 }
 void PrefetchMngr::one_moe_layer_done(int layer_id) {
@@ -333,7 +334,9 @@ PrefetchMngr::PrefetchMngr(std::shared_ptr<ModuleMeta> metas,
       std::cout << "prefill_stage_forward_time:" << time.mean(torch::kFloat32).item() << std::endl;
     }
   });
+  precision_profiler = std::make_shared<PrecisionProfiler>();
   predict_thread->init(fetch_schedule_thread.get(), predictor.get(), cache.get(), metas.get());
+  predict_thread->precision_profiler = precision_profiler.get();
   fetch_thread->init(metas.get(), fetch_schedule_thread.get(), model_loader->mem_mngr_ctx.get(), (cudaStream_t)copy_stream);
   fetch_schedule_thread->init(metas.get(), model_loader.get(), this->cache.get(), fetch_thread.get(), predict_thread.get(), cache_stats.get(), profiler.get());
 

@@ -38,6 +38,10 @@ void PredictWorker::do_one_task_impl(PredictJob job) {
     size_t per_layer_num_expert = predicted_expert.size(1);
     for (int l_in_slice = 0; l_in_slice < num_predicted_layers; l_in_slice++) {
       int layer_idx = p_m_metas.output_layer(l_in_slice);
+      precision_profiler->record_predicted_experts(layer_idx, predicted_expert[l_in_slice].data_ptr<int64_t>(), per_layer_num_expert);
+    }
+    for (int l_in_slice = 0; l_in_slice < num_predicted_layers; l_in_slice++) {
+      int layer_idx = p_m_metas.output_layer(l_in_slice);
       {
         LOG(DEBUG) << "predict worker: add layer task " << layer_idx << ", wait for budget";
         TRACE_EVENT_GURAD(kPredictor, "wait for budget " + std::to_string(layer_idx));

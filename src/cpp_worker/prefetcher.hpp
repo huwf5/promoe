@@ -159,6 +159,8 @@ public:
   std::shared_ptr<TimeProfiler>    profiler;
   std::shared_ptr<CacheMngr>       cache;
 
+  std::shared_ptr<PrecisionProfiler> precision_profiler;
+
   int64_t compute_stream = 0, copy_stream = 0;
   // cudaStream_t compute_stream = nullptr, copy_stream = nullptr;
   // at::cuda::CUDAStream compute_stream, copy_stream;

@@ -15,3 +15,30 @@ void TraceEventCollector::add_meta_event() {
   { TRACE_EVENT_GURAD_WITH_ARGS(kPredictor,      "thread_name", 'M', arg_var, { arg_var["name"] = "kPredictor";      }); }
   { TRACE_EVENT_GURAD_WITH_ARGS(kGPU,            "thread_name", 'M', arg_var, { arg_var["name"] = "kGPU";            }); }
 }
+void PrecisionProfiler::report() {
+  std::map<int, std::vector<double>> per_layer_rates;
+  for (int i = 0; i < activated_experts.size(); i++) {
+    auto &a = activated_experts[i], &p = predicted_experts[i];
+    if (a.layer_id != p.layer_id) {
+      std::cerr << "layer id mismatch " << a.layer_id << " " << p.layer_id << "\n";
+      break;
+    }
+    // std::cerr << "layer " << a.layer_id << " "
+    //           << "intersect " << a.intersect(p) << " / " << a.experts.size()
+    //           << " / " << p.experts.size() << ", rate "
+    //           << (float)a.intersect(p) / p.experts.size() << "\n";
+    if (per_layer_rates.count(a.layer_id) == 0) {
+      per_layer_rates[a.layer_id] = std::vector<double>();
+    }
+    if (a.experts.size() == p.experts.size() && a.experts.size() != 0) {
+      per_layer_rates[a.layer_id].push_back((float)a.intersect(p) / p.experts.size());
+    }
+  }
+  for (auto &[layer_id, rates] : per_layer_rates) {
+    double sum = 0;
+    for (auto r : rates) {
+      sum += r;
+    }
+    std::cerr << "layer " << layer_id << " average rate " << sum / rates.size() << "\n";
+  }
+}
