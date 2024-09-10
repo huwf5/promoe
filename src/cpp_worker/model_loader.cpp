@@ -20,9 +20,9 @@ ModelLoader::ModelLoader(std::shared_ptr<ModuleMeta> metas) : metas(metas) {
 }
 
 void ModelLoader::add_one_expert_param(torch::Tensor param, int layer_id,
-                                       int expert_id, int param_id) {
+                                       int expert_id, int param_id, size_t alloc_nbytes) {
   auto & expert_handler = source_list[metas->squeeze_expert_idx(layer_id, expert_id)];
-  expert_handler->host_data->set(param_id, param);
+  expert_handler->host_data->set(param_id, param, alloc_nbytes);
 
   // this does not trigger actual memory allocaiton
   // auto options = torch::TensorOptions().device("cuda").dtype(param.dtype());

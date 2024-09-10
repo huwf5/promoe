@@ -35,14 +35,18 @@ class MemMngrCtx {
 
 class HostMemWrapper {
  public:
-  torch::Tensor data;
+  torch::Tensor data_;
+  size_t alloc_nbytes_ = 0;
   HostMemWrapper() {}
-  HostMemWrapper(torch::Tensor t) : data(t) {}
-  void*     ptr() { return data.data_ptr();}
-  size_t nbytes() { return data.nbytes();}
-  auto    dtype() { return data.dtype(); }
+  HostMemWrapper(torch::Tensor t) : data_(t) {
+    alloc_nbytes_ = t.nbytes();
+  }
+  void*     ptr() { return data_.data_ptr();}
+  size_t nbytes() { return data_.nbytes();}
+  auto    dtype() { return data_.dtype(); }
+  size_t alloc_nbytes() { return alloc_nbytes_; }
   void pin_memory() {
-    data = data.pin_memory();
+    data_ = data_.pin_memory();
   }
 };
 
@@ -62,11 +66,16 @@ class HostExpertMemHanlderBase {
     return total;
   }
   auto    dtype(int idx) { return mem_buffers[idx].dtype(); }
-  void set(int idx, torch::Tensor &param) {
+  void set(int idx, torch::Tensor &param, size_t alloc_nbytes = 0) {
     this->mem_buffers.at(idx) = HostMemWrapper(param);
+    if (alloc_nbytes == 0) {
+      alloc_nbytes = param.nbytes();
+    }
+    this->mem_buffers.at(idx).alloc_nbytes_ = alloc_nbytes;
   }
   size_t num_chunk() { return mem_buffers.size(); }
-  torch::Tensor get_tensor(int idx) { return mem_buffers[idx].data; }
+  torch::Tensor get_tensor(int idx) { return mem_buffers[idx].data_; }
+  size_t alloc_nbytes(int idx) { return mem_buffers[idx].alloc_nbytes(); }
 };
 
 class HostExpertMemHanlder : public HostExpertMemHanlderBase {
@@ -86,11 +95,21 @@ class ExpertMemHanlderBase {
 
 class ExpertMemHanlderTensor : public ExpertMemHanlderBase {
  public:
+  std::vector<torch::Tensor> storages;
   void allocate_like(HostExpertMemHanlderBase* other, MemMngrCtx* ctx) override {
     prebuilt_tensors.resize(other->num_chunk());
+    storages.resize(other->num_chunk());
     for (int i = 0; i < other->num_chunk(); i++) {
-      torch::TensorOptions options = torch::TensorOptions().device(torch::kCUDA, ctx->device_id).dtype(other->dtype(i));
-      prebuilt_tensors[i] = torch::zeros_like(other->get_tensor(i), options);
+      {
+        // storage
+        torch::TensorOptions options = torch::TensorOptions().device(torch::kCUDA, ctx->device_id).dtype(torch::kUInt8);
+        storages[i] = torch::empty({static_cast<long>(other->alloc_nbytes(i))}, options);
+      }
+      {
+        // tensors
+        torch::TensorOptions options = torch::TensorOptions().device(torch::kCUDA, ctx->device_id).dtype(other->dtype(i));
+        prebuilt_tensors[i] = torch::from_blob(storages[i].data_ptr(), other->get_tensor(i).sizes(), options);
+      }
     }
   }
 };
@@ -289,10 +308,10 @@ class ModelLoader {
  public:
   std::shared_ptr<MemMngrCtx> mem_mngr_ctx;
   ModelLoader(std::shared_ptr<ModuleMeta> metas);
-  void add_one_expert_param(torch::Tensor param, int layer_id, int expert_id, std::string param_name) {
-    return add_one_expert_param(param, layer_id, expert_id, metas->param_name_to_id[param_name]);
+  void add_one_expert_param(torch::Tensor param, int layer_id, int expert_id, std::string param_name, size_t alloc_nbytes = 0) {
+    return add_one_expert_param(param, layer_id, expert_id, metas->param_name_to_id[param_name], alloc_nbytes);
   }
-  void add_one_expert_param(torch::Tensor param, int layer_id, int expert_id, int param_id);
+  void add_one_expert_param(torch::Tensor param, int layer_id, int expert_id, int param_id, size_t alloc_nbytes = 0);
   void build_logical_expert_param() {
     // size_t required_dummy_nbytes = 1024;
     // if (metas->logical_mem_impl == "cudriver_unified") {
