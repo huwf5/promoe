@@ -250,7 +250,7 @@ class CacheStatistics {
   }
 };
 
-class TimeProfiler {
+class TimeProfiler : public std::enable_shared_from_this<TimeProfiler> {
   struct MetricMeta {
     bool is_cum = true;
     bool should_drop_last = false;

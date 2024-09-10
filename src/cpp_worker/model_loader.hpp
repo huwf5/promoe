@@ -90,7 +90,7 @@ class ExpertMemHanlderTensor : public ExpertMemHanlderBase {
     prebuilt_tensors.resize(other->num_chunk());
     for (int i = 0; i < other->num_chunk(); i++) {
       torch::TensorOptions options = torch::TensorOptions().device(torch::kCUDA, ctx->device_id).dtype(other->dtype(i));
-      prebuilt_tensors[i] = torch::empty_like(other->get_tensor(i), options);
+      prebuilt_tensors[i] = torch::zeros_like(other->get_tensor(i), options);
     }
   }
 };

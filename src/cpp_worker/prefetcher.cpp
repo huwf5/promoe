@@ -258,23 +258,14 @@ PrefetchMngr::PrefetchMngr(std::shared_ptr<ModuleMeta> metas,
                            std::shared_ptr<ModelLoader> model_loader,
                            std::shared_ptr<Predictor> predictor,
                            int64_t compute_stream_param,
-                           bool create_compute_stream)
+                           bool create_compute_stream,
+                           TimeProfiler* profiler_ptr)
     : metas(metas), model_loader(model_loader), predictor(predictor) {
   this->cache = std::make_shared<CacheMngr>(metas, model_loader);
   predict_thread = std::make_shared<PredictWorker>();
   expert_unlocker_thread = std::make_shared<ExpertUnlockWorker>();
   fetch_thread = std::make_shared<FetchWorker>();
   // cudaStream_t stream;
-  compute_stream = compute_stream_param;
-  if (compute_stream == 0 && create_compute_stream) {
-    CUDA_CALL(cudaStreamCreateWithFlags((cudaStream_t*)(&compute_stream), cudaStreamNonBlocking));
-    at::cuda::setCurrentCUDAStream(at::cuda::getStreamFromExternal((cudaStream_t)compute_stream, model_loader->mem_mngr_ctx->device_id));
-    {
-      auto blas_handle = at::cuda::getCurrentCUDABlasHandle();
-      cublasStatus_t ret = cublasSetStream(blas_handle, at::cuda::getCurrentCUDAStream());
-      CHECK(ret == CUBLAS_STATUS_SUCCESS);
-    }
-  }
   CUDA_CALL(cudaStreamCreateWithFlags((cudaStream_t*)(&copy_stream),    cudaStreamNonBlocking));
   fetch_schedule_thread = std::make_shared<FetchScheduleWorker>();
   cache_stats = std::make_shared<CacheStatistics>();
@@ -300,7 +291,12 @@ PrefetchMngr::PrefetchMngr(std::shared_ptr<ModuleMeta> metas,
     std::cout << "legacy_prefill_stage_miss_cnt:" << tensor[1].item<float>() << std::endl;
     std::cout << "legacy_prefill_stage_hit_rate:" << tensor[0].item<float>() / (tensor[0].item<float>() + tensor[1].item<float>()) << std::endl;
   });
-  profiler = std::make_shared<TimeProfiler>();
+  if (profiler_ptr == nullptr) {
+    profiler = std::make_shared<TimeProfiler>();
+  } else {
+    profiler = profiler_ptr->shared_from_this();
+  }
+  // profiler = std::make_shared<TimeProfiler>();
   profiler->add_reporter([this, metas = this->metas](TimeProfiler *p){
     auto num_used_expert_tensor = p->to_tensor(TimeProfiler::kCntActivatedExpert);
     // auto idx_is_prefill = num_used_expert_tensor >  (metas->num_expert_per_token * metas->num_layer);
@@ -341,7 +337,24 @@ PrefetchMngr::PrefetchMngr(std::shared_ptr<ModuleMeta> metas,
   fetch_thread->init(metas.get(), fetch_schedule_thread.get(), model_loader->mem_mngr_ctx.get(), (cudaStream_t)copy_stream);
   fetch_schedule_thread->init(metas.get(), model_loader.get(), this->cache.get(), fetch_thread.get(), predict_thread.get(), cache_stats.get(), profiler.get());
 
-  predictor->compute_stream = (cudaStream_t)compute_stream;
+  if (create_compute_stream) {
+    CUDA_CALL(cudaStreamCreateWithFlags((cudaStream_t*)(&compute_stream), cudaStreamNonBlocking));
+    {
+      // set torch compute stream
+      at::cuda::setCurrentCUDAStream(at::cuda::getStreamFromExternal((cudaStream_t)compute_stream, model_loader->mem_mngr_ctx->device_id));
+      auto blas_handle = at::cuda::getCurrentCUDABlasHandle();
+      cublasStatus_t ret = cublasSetStream(blas_handle, at::cuda::getCurrentCUDAStream());
+      CHECK(ret == CUBLAS_STATUS_SUCCESS);
+    }
+    this->set_compute_stream(compute_stream);
+  } else {
+    this->set_compute_stream(compute_stream_param);
+  }
+}
+
+void PrefetchMngr::set_compute_stream(int64_t stream) {
+  compute_stream = stream;
+  predictor->compute_stream = (cudaStream_t)stream;
 }
 
 void PrefetchMngr::report_moe_attn_logits(int layer_id, torch::Tensor attn_logits) {

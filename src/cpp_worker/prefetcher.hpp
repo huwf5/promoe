@@ -167,7 +167,8 @@ public:
                std::shared_ptr<ModelLoader> model_loader,
                std::shared_ptr<Predictor> predictor,
                int64_t compute_stream = 0,
-               bool create_compute_stream = true);
+               bool create_compute_stream = true,
+               TimeProfiler* profiler = nullptr);
   ~PrefetchMngr();
   void init_gpu_mem_buffer(size_t num_buffers);
 
@@ -185,6 +186,8 @@ public:
   void launch_thread();
   TimerGuard build_timer() { return TimerGuard(this->profiler.get()); }
   void reload_env();
+
+  void set_compute_stream(int64_t stream);
 
   void temp_move_expert_to_gpu(int layer_id, int expert_id);
   void temp_move_expert_back_to_host(int layer_id, int expert_id);
