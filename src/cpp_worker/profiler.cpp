@@ -1,4 +1,5 @@
 #include "profiler.hpp"
+#include "logging.hpp"
 
 bool TraceEventCollector::globally_enabled = false;
 TraceEventCollector::TraceEventCollector() {
@@ -41,4 +42,7 @@ void PrecisionProfiler::report() {
     }
     std::cerr << "layer " << layer_id << " average rate " << sum / rates.size() << "\n";
   }
+}
+void PrecisionProfiler::record_activated_experts(int layer_id, const int64_t *experts, size_t num_experts) {
+  activated_experts.push_back(LayerInfo(layer_id, experts, num_experts));
 }

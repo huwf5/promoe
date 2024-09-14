@@ -367,9 +367,7 @@ class PrecisionProfiler {
   void record_predicted_experts(int layer_id, const int64_t* experts, size_t num_experts) {
     predicted_experts.push_back(LayerInfo(layer_id, experts, num_experts));
   }
-  void record_activated_experts(int layer_id, const int64_t* experts, size_t num_experts) {
-    activated_experts.push_back(LayerInfo(layer_id, experts, num_experts));
-  }
+  void record_activated_experts(int layer_id, const int64_t *experts, size_t num_experts);
   void record_activated_experts_by_append(int layer_id, int64_t expert) {
     if (layer_id != previous_layer_id) {
       activated_experts.push_back(LayerInfo(layer_id));

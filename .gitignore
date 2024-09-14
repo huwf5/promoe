@@ -4,3 +4,4 @@
 **/*.clangd
 
 run-logs*
+.cache/clangd
