@@ -182,7 +182,7 @@ void Predictor::load_model(std::string model_path) {
     CHECK(dir != nullptr) << "Failed to open directory: " << model_path;
     struct dirent *entry;
     while ((entry = readdir(dir)) != nullptr) {
-      if (entry->d_name == std::string(".") || entry->d_name == std::string("..")) {
+      if (entry->d_name == std::string(".") || entry->d_name == std::string("..") || entry->d_name == std::string("train_log")) {
         continue;
       }
       std::string name(entry->d_name);

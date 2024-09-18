@@ -1,0 +1,14 @@
+# These requirements include all dependencies for all top-level python scripts
+# for llama.cpp. Avoid adding packages here directly.
+#
+# Package versions must stay compatible across all top-level python scripts.
+#
+
+numpy~=1.26.4
+sentencepiece~=0.2.0
+transformers>=4.40.1,<5.0.0
+gguf>=0.1.0
+protobuf>=4.21.0,<5.0.0
+
+--extra-index-url https://download.pytorch.org/whl/cu124
+torch~=2.4.0
