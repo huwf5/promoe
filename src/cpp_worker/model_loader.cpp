@@ -139,3 +139,48 @@ torch::Tensor to_um(torch::Tensor t) {
   CUDA_CALL(cudaStreamSynchronize(0));
   return torch::from_blob(ptr, t.sizes(), t.options().device(torch::kCUDA, 0));
 }
+void ExpertMemHanlderTensor::allocate_like(HostExpertMemHanlderBase *other, MemMngrCtx *ctx) {
+  prebuilt_tensors.resize(other->num_chunk());
+  storages.resize(other->num_chunk());
+  for (int i = 0; i < other->num_chunk(); i++) {
+    {
+      // storage
+      torch::TensorOptions options = torch::TensorOptions().device(torch::kCUDA, ctx->device_id).dtype(torch::kUInt8);
+      void *cuda_ptr;
+      CUDA_CALL(cudaMalloc(&cuda_ptr, other->alloc_nbytes(i)));
+      storages[i] = torch::from_blob(cuda_ptr, {static_cast<long>(other->alloc_nbytes(i))}, options);
+    }
+    {
+      // tensors
+      torch::TensorOptions options = torch::TensorOptions().device(torch::kCUDA, ctx->device_id).dtype(other->dtype(i));
+      prebuilt_tensors[i] = torch::from_blob(storages[i].data_ptr(), other->get_tensor(i).sizes(), options);
+    }
+  }
+}
+void ExpertMemHanlderTensorUnified::allocate_like(HostExpertMemHanlderBase *other, MemMngrCtx *ctx) {
+  prebuilt_tensors.resize(other->num_chunk());
+  offsets_of_each_param.resize(other->num_chunk());
+
+  size_t total_nbytes = 0;
+  for (int i = 0; i < other->num_chunk(); i++) {
+    offsets_of_each_param[i] = total_nbytes;
+    total_nbytes += other->alloc_nbytes(i);
+  }
+
+  {
+    // storage
+    torch::TensorOptions options = torch::TensorOptions().device(torch::kCUDA, ctx->device_id).dtype(torch::kUInt8);
+    void *cuda_ptr;
+    CUDA_CALL(cudaMalloc(&cuda_ptr, total_nbytes));
+    CUDA_CALL(cudaMemset(cuda_ptr, 0, total_nbytes));
+    storage = torch::from_blob(cuda_ptr, {static_cast<long>(total_nbytes)}, options);
+  }
+
+  for (int i = 0; i < other->num_chunk(); i++) {
+    {
+      // tensors
+      torch::TensorOptions options = torch::TensorOptions().device(torch::kCUDA, ctx->device_id).dtype(other->dtype(i));
+      prebuilt_tensors[i] = torch::from_blob(storage.data_ptr<uint8_t>() + offsets_of_each_param[i], other->get_tensor(i).sizes(), options);
+    }
+  }
+}

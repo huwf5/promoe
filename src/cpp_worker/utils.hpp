@@ -139,7 +139,7 @@ class ModuleMeta {
   int layer_predict_max_window = -1; // the max distance of layer prediction, n: 0 -> [0,...,n-1]
   bool layer_predict_replace_first_input_with_last_output = false;
 
-  std::string physical_mem_impl = "tensor";
+  std::string physical_mem_impl = "tensor_unified";
   std::string logical_mem_impl = "tensor";
 
   ModuleMeta(int num_layer, int num_expert) : num_layer(num_layer), num_expert(num_expert) {}

@@ -11,14 +11,18 @@ void CacheMngr::init_gpu_mem_buffer(size_t num_buffers) {
 
   auto &mem_example = model_loader->get_source(0, 0)->host_data;
 
+  size_t total_nbytes = 0;
+
   for (auto & cache_slot : cache_slots->slots) {
     cache_slot.full_len = per_layer_cache_len;
     cache_slot.unused_mems.resize(per_layer_cache_len, nullptr);
     for (auto & cache_line : cache_slot.unused_mems) {
       cache_line = ExpertMemParamFactory::get().create_physical(metas->physical_mem_impl);
       cache_line->allocate_like(mem_example.get(), model_loader->mem_mngr_ctx.get());
+      total_nbytes += cache_line->get_allocation_nbytes();
     }
   }
+  LOG(ERROR) << "cache allocated " << total_nbytes / 1024.0 / 1024.0 << " MiB";
 }
 CacheMngr::~CacheMngr() {
   size_t used_mem_cnt = prefetched_experts.size();

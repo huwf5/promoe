@@ -91,27 +91,20 @@ class ExpertMemHanlderBase {
   torch::Tensor & get_prebuilt_tensor(int idx) { return prebuilt_tensors[idx]; }
   virtual void* ptr(int idx) { return prebuilt_tensors[idx].data_ptr(); }
   virtual ~ExpertMemHanlderBase() {}
+  virtual size_t get_allocation_nbytes() { return 0; }
 };
 
 class ExpertMemHanlderTensor : public ExpertMemHanlderBase {
  public:
   std::vector<torch::Tensor> storages;
-  void allocate_like(HostExpertMemHanlderBase* other, MemMngrCtx* ctx) override {
-    prebuilt_tensors.resize(other->num_chunk());
-    storages.resize(other->num_chunk());
-    for (int i = 0; i < other->num_chunk(); i++) {
-      {
-        // storage
-        torch::TensorOptions options = torch::TensorOptions().device(torch::kCUDA, ctx->device_id).dtype(torch::kUInt8);
-        storages[i] = torch::empty({static_cast<long>(other->alloc_nbytes(i))}, options);
-      }
-      {
-        // tensors
-        torch::TensorOptions options = torch::TensorOptions().device(torch::kCUDA, ctx->device_id).dtype(other->dtype(i));
-        prebuilt_tensors[i] = torch::from_blob(storages[i].data_ptr(), other->get_tensor(i).sizes(), options);
-      }
-    }
-  }
+  void allocate_like(HostExpertMemHanlderBase *other, MemMngrCtx *ctx) override;
+};
+class ExpertMemHanlderTensorUnified : public ExpertMemHanlderBase {
+ public:
+  torch::Tensor storage;
+  std::vector<size_t> offsets_of_each_param;
+  void allocate_like(HostExpertMemHanlderBase *other, MemMngrCtx *ctx) override;
+  size_t get_allocation_nbytes() override { return storage.nbytes(); }
 };
 
 class ExpertMemHanlderCUDriver : public ExpertMemHanlderBase {
@@ -261,6 +254,7 @@ class ExpertMemParamFactory {
   std::map<std::string, std::function<ExpertParamWrapperBase*()>> logical_registry;
   ExpertMemParamFactory() {
     physical_registry["tensor"]           = []() { return new ExpertMemHanlderTensor() ;};
+    physical_registry["tensor_unified"]   = []() { return new ExpertMemHanlderTensorUnified() ;};
     physical_registry["cudriver"]         = []() { return new ExpertMemHanlderCUDriver() ;};
     physical_registry["cudriver_unified"] = []() { return new ExpertMemHanlderCUDriverUnified() ;};
 
