@@ -23,6 +23,10 @@ class MemMngrCtx {
   CUmemAccessDesc accessDesc = {};
   int device_id = 0;
   MemMngrCtx();
+
+  uint8_t * global_unified_mem = nullptr;
+  size_t global_unified_mem_size = 0;
+  size_t global_unified_mem_offset = 0;
   // void build_dummy(size_t dummy_size);
   // void destroy_dummy();
 
@@ -76,6 +80,11 @@ class HostExpertMemHanlderBase {
   size_t num_chunk() { return mem_buffers.size(); }
   torch::Tensor get_tensor(int idx) { return mem_buffers[idx].data_; }
   size_t alloc_nbytes(int idx) { return mem_buffers[idx].alloc_nbytes(); }
+  size_t total_alloc_nbytes() {
+    size_t total = 0;
+    for (auto & m : mem_buffers) { total += m.alloc_nbytes(); }
+    return total;
+  }
 };
 
 class HostExpertMemHanlder : public HostExpertMemHanlderBase {
@@ -86,12 +95,13 @@ class HostExpertMemHanlder : public HostExpertMemHanlderBase {
 class ExpertMemHanlderBase {
  protected:
   std::vector<torch::Tensor> prebuilt_tensors;
+  size_t total_allocation_nbytes = 0;
  public:
   virtual void allocate_like(HostExpertMemHanlderBase* other, MemMngrCtx* ctx) = 0;
   torch::Tensor & get_prebuilt_tensor(int idx) { return prebuilt_tensors[idx]; }
   virtual void* ptr(int idx) { return prebuilt_tensors[idx].data_ptr(); }
   virtual ~ExpertMemHanlderBase() {}
-  virtual size_t get_allocation_nbytes() { return 0; }
+  virtual size_t get_allocation_nbytes() { return total_allocation_nbytes; }
 };
 
 class ExpertMemHanlderTensor : public ExpertMemHanlderBase {
@@ -104,7 +114,10 @@ class ExpertMemHanlderTensorUnified : public ExpertMemHanlderBase {
   torch::Tensor storage;
   std::vector<size_t> offsets_of_each_param;
   void allocate_like(HostExpertMemHanlderBase *other, MemMngrCtx *ctx) override;
-  size_t get_allocation_nbytes() override { return storage.nbytes(); }
+};
+class ExpertMemHanlderTensorGlobalUnified : public ExpertMemHanlderBase {
+ public:
+  void allocate_like(HostExpertMemHanlderBase *other, MemMngrCtx *ctx) override;
 };
 
 class ExpertMemHanlderCUDriver : public ExpertMemHanlderBase {
@@ -112,25 +125,7 @@ class ExpertMemHanlderCUDriver : public ExpertMemHanlderBase {
   std::vector<CUdeviceptr> prebuilt_ptrs;
   friend class ExpertParamWrapperCUDriver;
  public:
-  void allocate_like(HostExpertMemHanlderBase* other, MemMngrCtx* ctx) override {
-    handles.resize(other->num_chunk());
-    prebuilt_ptrs.resize(other->num_chunk());
-    prebuilt_tensors.resize(other->num_chunk());
-
-    for (int i = 0; i < handles.size(); i++) {
-      size_t size = other->nbytes(i);
-      size = round_up(size, ctx->granularity);
-      ctx->cu_mem_create(&handles[i], size);
-
-      ctx->cu_address_reserve(&prebuilt_ptrs[i], size);
-
-      ctx->cu_map_address(prebuilt_ptrs[i], size, handles[i]);
-      ctx->cu_set_access(prebuilt_ptrs[i], size);
-
-      torch::TensorOptions options = torch::TensorOptions().device(torch::kCUDA, ctx->device_id).dtype(other->dtype(i));
-      prebuilt_tensors[i] = torch::from_blob(ptr(i), other->get_tensor(i).sizes(), options);
-    }
-  }
+  void allocate_like(HostExpertMemHanlderBase* other, MemMngrCtx* ctx) override;
   void* ptr(int idx) override { return (void*)prebuilt_ptrs[idx]; }
 };
 
@@ -140,26 +135,7 @@ class ExpertMemHanlderCUDriverUnified : public ExpertMemHanlderBase {
   std::vector<size_t> offsets_of_each_param;
   friend class ExpertParamWrapperCUDriverUnified;
  public:
-  void allocate_like(HostExpertMemHanlderBase* other, MemMngrCtx* ctx) override {
-    prebuilt_tensors.resize(other->num_chunk());
-    offsets_of_each_param = {0};
-    size_t size = 0;
-    for (int i = 0; i < other->num_chunk(); i++) {
-      size += other->nbytes(i);
-      offsets_of_each_param.push_back(size);
-    }
-    size = round_up(size, ctx->granularity);
-
-    ctx->cu_mem_create(&handle, size);
-    ctx->cu_address_reserve(&prebuilt_ptr, size);
-    ctx->cu_map_address(prebuilt_ptr, size, handle);
-    ctx->cu_set_access(prebuilt_ptr, size);
-
-    for (int i = 0; i < other->num_chunk(); i++) {
-      torch::TensorOptions options = torch::TensorOptions().device(torch::kCUDA, ctx->device_id).dtype(other->dtype(i));
-      prebuilt_tensors[i] = torch::from_blob(ptr(i), other->get_tensor(i).sizes(), options);
-    }
-  }
+  void allocate_like(HostExpertMemHanlderBase* other, MemMngrCtx* ctx) override;
   void* ptr(int idx) override {
     return (uint8_t*)prebuilt_ptr + offsets_of_each_param[idx];
   }
@@ -253,10 +229,11 @@ class ExpertMemParamFactory {
   std::map<std::string, std::function<ExpertMemHanlderBase*()>>   physical_registry;
   std::map<std::string, std::function<ExpertParamWrapperBase*()>> logical_registry;
   ExpertMemParamFactory() {
-    physical_registry["tensor"]           = []() { return new ExpertMemHanlderTensor() ;};
-    physical_registry["tensor_unified"]   = []() { return new ExpertMemHanlderTensorUnified() ;};
-    physical_registry["cudriver"]         = []() { return new ExpertMemHanlderCUDriver() ;};
-    physical_registry["cudriver_unified"] = []() { return new ExpertMemHanlderCUDriverUnified() ;};
+    physical_registry["tensor"]                = []() { return new ExpertMemHanlderTensor() ;};
+    physical_registry["tensor_unified"]        = []() { return new ExpertMemHanlderTensorUnified() ;};
+    physical_registry["tensor_global_unified"] = []() { return new ExpertMemHanlderTensorGlobalUnified() ;};
+    physical_registry["cudriver"]              = []() { return new ExpertMemHanlderCUDriver() ;};
+    physical_registry["cudriver_unified"]      = []() { return new ExpertMemHanlderCUDriverUnified() ;};
 
     logical_registry["tensor"]           = []() { return new ExpertParamWrapperTensor(); };
     logical_registry["cudriver"]         = []() { return new ExpertParamWrapperCUDriver(); };

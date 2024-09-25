@@ -142,6 +142,7 @@ torch::Tensor to_um(torch::Tensor t) {
 void ExpertMemHanlderTensor::allocate_like(HostExpertMemHanlderBase *other, MemMngrCtx *ctx) {
   prebuilt_tensors.resize(other->num_chunk());
   storages.resize(other->num_chunk());
+  total_allocation_nbytes = 0;
   for (int i = 0; i < other->num_chunk(); i++) {
     {
       // storage
@@ -149,6 +150,7 @@ void ExpertMemHanlderTensor::allocate_like(HostExpertMemHanlderBase *other, MemM
       void *cuda_ptr;
       CUDA_CALL(cudaMalloc(&cuda_ptr, other->alloc_nbytes(i)));
       storages[i] = torch::from_blob(cuda_ptr, {static_cast<long>(other->alloc_nbytes(i))}, options);
+      total_allocation_nbytes += other->alloc_nbytes(i);
     }
     {
       // tensors
@@ -161,19 +163,19 @@ void ExpertMemHanlderTensorUnified::allocate_like(HostExpertMemHanlderBase *othe
   prebuilt_tensors.resize(other->num_chunk());
   offsets_of_each_param.resize(other->num_chunk());
 
-  size_t total_nbytes = 0;
+  total_allocation_nbytes = 0;
   for (int i = 0; i < other->num_chunk(); i++) {
-    offsets_of_each_param[i] = total_nbytes;
-    total_nbytes += other->alloc_nbytes(i);
+    offsets_of_each_param[i] = total_allocation_nbytes;
+    total_allocation_nbytes += other->alloc_nbytes(i);
   }
 
   {
     // storage
     torch::TensorOptions options = torch::TensorOptions().device(torch::kCUDA, ctx->device_id).dtype(torch::kUInt8);
     void *cuda_ptr;
-    CUDA_CALL(cudaMalloc(&cuda_ptr, total_nbytes));
-    CUDA_CALL(cudaMemset(cuda_ptr, 0, total_nbytes));
-    storage = torch::from_blob(cuda_ptr, {static_cast<long>(total_nbytes)}, options);
+    CUDA_CALL(cudaMalloc(&cuda_ptr, total_allocation_nbytes));
+    CUDA_CALL(cudaMemset(cuda_ptr, 0, total_allocation_nbytes));
+    storage = torch::from_blob(cuda_ptr, {static_cast<long>(total_allocation_nbytes)}, options);
   }
 
   for (int i = 0; i < other->num_chunk(); i++) {
@@ -182,5 +184,60 @@ void ExpertMemHanlderTensorUnified::allocate_like(HostExpertMemHanlderBase *othe
       torch::TensorOptions options = torch::TensorOptions().device(torch::kCUDA, ctx->device_id).dtype(other->dtype(i));
       prebuilt_tensors[i] = torch::from_blob(storage.data_ptr<uint8_t>() + offsets_of_each_param[i], other->get_tensor(i).sizes(), options);
     }
+  }
+}
+
+void ExpertMemHanlderTensorGlobalUnified::allocate_like(HostExpertMemHanlderBase *other, MemMngrCtx *ctx) {
+  total_allocation_nbytes = 0;
+  prebuilt_tensors.resize(other->num_chunk());
+  for (int i = 0; i < other->num_chunk(); i++) {
+    // tensors
+    torch::TensorOptions options = torch::TensorOptions().device(torch::kCUDA, ctx->device_id).dtype(other->dtype(i));
+    prebuilt_tensors[i] = torch::from_blob(ctx->global_unified_mem + ctx->global_unified_mem_offset, other->get_tensor(i).sizes(), options);
+    ctx->global_unified_mem_offset += other->alloc_nbytes(i);
+    CHECK(ctx->global_unified_mem_offset <= ctx->global_unified_mem_size);
+    total_allocation_nbytes += other->alloc_nbytes(i);
+  }
+}
+void ExpertMemHanlderCUDriver::allocate_like(HostExpertMemHanlderBase *other, MemMngrCtx *ctx) {
+  total_allocation_nbytes = 0;
+  handles.resize(other->num_chunk());
+  prebuilt_ptrs.resize(other->num_chunk());
+  prebuilt_tensors.resize(other->num_chunk());
+
+  for (int i = 0; i < handles.size(); i++) {
+    size_t size = other->nbytes(i);
+    size = round_up(size, ctx->granularity);
+    total_allocation_nbytes += size;
+    ctx->cu_mem_create(&handles[i], size);
+
+    ctx->cu_address_reserve(&prebuilt_ptrs[i], size);
+
+    ctx->cu_map_address(prebuilt_ptrs[i], size, handles[i]);
+    ctx->cu_set_access(prebuilt_ptrs[i], size);
+
+    torch::TensorOptions options = torch::TensorOptions().device(torch::kCUDA, ctx->device_id).dtype(other->dtype(i));
+    prebuilt_tensors[i] = torch::from_blob(ptr(i), other->get_tensor(i).sizes(), options);
+  }
+}
+void ExpertMemHanlderCUDriverUnified::allocate_like(HostExpertMemHanlderBase *other, MemMngrCtx *ctx) {
+  total_allocation_nbytes = 0;
+  prebuilt_tensors.resize(other->num_chunk());
+  offsets_of_each_param = {0};
+  size_t size = 0;
+  for (int i = 0; i < other->num_chunk(); i++) {
+    size += other->nbytes(i);
+    offsets_of_each_param.push_back(size);
+  }
+  size = round_up(size, ctx->granularity);
+  total_allocation_nbytes = size;
+  ctx->cu_mem_create(&handle, size);
+  ctx->cu_address_reserve(&prebuilt_ptr, size);
+  ctx->cu_map_address(prebuilt_ptr, size, handle);
+  ctx->cu_set_access(prebuilt_ptr, size);
+
+  for (int i = 0; i < other->num_chunk(); i++) {
+    torch::TensorOptions options = torch::TensorOptions().device(torch::kCUDA, ctx->device_id).dtype(other->dtype(i));
+    prebuilt_tensors[i] = torch::from_blob(ptr(i), other->get_tensor(i).sizes(), options);
   }
 }

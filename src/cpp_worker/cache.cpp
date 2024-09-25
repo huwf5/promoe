@@ -9,16 +9,33 @@ void CacheMngr::init_gpu_mem_buffer(size_t num_buffers) {
   CHECK(num_buffers % num_cache_slot == 0);
   size_t per_layer_cache_len = num_buffers / num_cache_slot;
 
-  auto &mem_example = model_loader->get_source(0, 0)->host_data;
+  size_t max_per_expert_nbytes = 0;
+  auto max_expert_example = model_loader->get_source(0, 0)->host_data.get();
+  for (int l = 0; l < metas->num_layer; l++) {
+    for (int e = 0; e < metas->num_expert; e++) {
+      auto host_data = model_loader->get_source(l, e)->host_data.get();
+      if (host_data->total_alloc_nbytes() > max_per_expert_nbytes) {
+        max_per_expert_nbytes = host_data->total_alloc_nbytes();
+        max_expert_example = host_data;
+      }
+    }
+  }
 
   size_t total_nbytes = 0;
+
+  if (metas->physical_mem_impl == "tensor_global_unified") {
+    model_loader->mem_mngr_ctx->global_unified_mem_size = max_per_expert_nbytes * num_buffers;
+    model_loader->mem_mngr_ctx->global_unified_mem_offset = 0;
+    CUDA_CALL(cudaMalloc(&model_loader->mem_mngr_ctx->global_unified_mem, model_loader->mem_mngr_ctx->global_unified_mem_size));
+    CUDA_CALL(cudaMemset(model_loader->mem_mngr_ctx->global_unified_mem, 0, model_loader->mem_mngr_ctx->global_unified_mem_size));
+  }
 
   for (auto & cache_slot : cache_slots->slots) {
     cache_slot.full_len = per_layer_cache_len;
     cache_slot.unused_mems.resize(per_layer_cache_len, nullptr);
     for (auto & cache_line : cache_slot.unused_mems) {
       cache_line = ExpertMemParamFactory::get().create_physical(metas->physical_mem_impl);
-      cache_line->allocate_like(mem_example.get(), model_loader->mem_mngr_ctx.get());
+      cache_line->allocate_like(max_expert_example, model_loader->mem_mngr_ctx.get());
       total_nbytes += cache_line->get_allocation_nbytes();
     }
   }
