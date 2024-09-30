@@ -39,18 +39,18 @@ void Predictor::add_one_layer(int layer_id, int64_t *experts, size_t num_expert)
     default : { CHECK(false) << "Unknown predict input mode"; }
   }
 }
-torch::Tensor Predictor::predict(int input_layer_id) {
+PredictOutput Predictor::predict(int input_layer_id) {
   TRACE_EVENT_GURAD(kPredictor, "predict " + std::to_string(input_layer_id));
   LOG(DEBUG) << "predictor, predict " + std::to_string(input_layer_id);
   torch::Tensor input;
-  auto model = predict_model_list[0];
+  auto model = predict_models[0].model;
   {
     TRACE_EVENT_GURAD_NAME(kPredictor, "logits copy", guardguard);
     CUDA_CALL(cudaEventSynchronize(logits_record_event[input_layer_id]));
   }
   switch (metas->predict_input_mode) {
     case kNoPredict:                {
-      return torch::empty({metas->num_layer, 0}, torch::kFloat32);
+      return PredictOutput(metas->num_layer, input_layer_id, -1);
     }
     case kOneToken: { 
       CHECK(input_layer_id == 0);
@@ -85,7 +85,7 @@ torch::Tensor Predictor::predict(int input_layer_id) {
       input = this->first_moe_attn_input_logits_buffer;
       if (input.numel() == 0) {
         LOG(DEBUG) << "skip prediction due to prefill";
-        return torch::empty({metas->num_layer, 0}, torch::kFloat32);
+        return PredictOutput(metas->num_layer, input_layer_id, -1);
       } else {
         LOG_BLOCK(DEBUG, logger, {
           logger << "predictor, predict with input shape " << input.sizes() << " " << input.numel();
@@ -98,33 +98,38 @@ torch::Tensor Predictor::predict(int input_layer_id) {
       input = this->moe_attn_input_logits_buffer_list[input_layer_id];
       if (input.numel() == 0) {
         LOG(DEBUG) << "skip prediction due to prefill";
-        return torch::empty({static_cast<long>(predict_model_metas[input_layer_id].orig_num_output_layer()), 0}, torch::kFloat32);
+        return PredictOutput(predict_models[input_layer_id].orig_num_output_layer(), input_layer_id, predict_models[input_layer_id].orig_output_start_layer);
       }
-      if (predict_model_metas[input_layer_id].num_output_layer() == 0) {
+      if (predict_models[input_layer_id].num_output_layer() == 0) {
         LOG(DEBUG) << "skip prediction due to empty output layers";
-        return torch::empty({static_cast<long>(predict_model_metas[input_layer_id].orig_num_output_layer()), 0}, torch::kFloat32);
+        return PredictOutput(predict_models[input_layer_id].orig_num_output_layer(), input_layer_id, predict_models[input_layer_id].orig_output_start_layer);
       }
       LOG_BLOCK(DEBUG, logger, {
         logger << "predictor, predict with input shape " << input.sizes() << " " << input.numel();
       });
-      model = predict_model_list[input_layer_id];
+      model = predict_models[input_layer_id].model;
       input = input.clone().to(torch::kFloat32);
+      break;
     }
     case kMoeLayerLogits: {
       input = this->moe_layer_logits_buffer_list[input_layer_id];
       if (input.numel() == 0) {
         LOG(DEBUG) << "skip prediction due to prefill";
-        return torch::empty({static_cast<long>(predict_model_metas[input_layer_id].orig_num_output_layer()), 0}, torch::kFloat32);
+        return PredictOutput(predict_models[input_layer_id].orig_num_output_layer(), input_layer_id, predict_models[input_layer_id].orig_output_start_layer);
       }
-      if (predict_model_metas[input_layer_id].num_output_layer() == 0) {
+      if (predict_models[input_layer_id].num_output_layer() == 0) {
         LOG(DEBUG) << "skip prediction due to empty output layers";
-        return torch::empty({static_cast<long>(predict_model_metas[input_layer_id].orig_num_output_layer()), 0}, torch::kFloat32);
+        return PredictOutput(predict_models[input_layer_id].orig_num_output_layer(), input_layer_id, predict_models[input_layer_id].orig_output_start_layer);
       }
       LOG_BLOCK(DEBUG, logger, {
         logger << "predictor, predict with input shape " << input.sizes() << " " << input.numel();
       });
-      model = predict_model_list[input_layer_id];
+      model = predict_models[input_layer_id].model;
       input = input.clone().to(torch::kFloat32);
+      break;
+    }
+    default: {
+      CHECK(false) << "Unknown predict input mode";
     }
   }
   // if (metas->predict_input_mode == kDecodeCumsum) {
@@ -146,24 +151,24 @@ torch::Tensor Predictor::predict(int input_layer_id) {
   std::vector<torch::jit::IValue> inputs{input.flatten(1, -1)};
   // std::vector<torch::jit::IValue> inputs{input.flatten().unsqueeze(0)};
   torch::NoGradGuard no_grad;
-  auto output = model.forward(inputs).toTensor();
+  torch::Tensor output = model.forward(inputs).toTensor();
   output = output.reshape({bs, -1, metas->num_expert});
   output = output.sum({0});
-  return output;
+  return PredictOutput(output, input_layer_id, predict_models[input_layer_id].orig_output_start_layer);
   // return model.forward(inputs).toTensor().reshape({-1, metas->num_expert});
 }
 void Predictor::load_one_model(std::string model_path, int idx) {
   c10::Device cpu_device(c10::DeviceType::CPU);
-  predict_model_list[idx] = torch::jit::load(model_path, cpu_device);
-  predict_model_list[idx].eval();
+  predict_models[idx].model = torch::jit::load(model_path, cpu_device);
+  predict_models[idx].model.eval();
 }
 void Predictor::load_model(std::string model_path) {
   if (metas->predict_input_mode == kNoPredict) {
-    predict_model_metas[0] = PredictModelMeta();
-    predict_model_metas[0].orig_output_start_layer = 0;
-    predict_model_metas[0].orig_output_stop_layer = metas->num_layer;
-    predict_model_metas[0].slice_start = 0;
-    predict_model_metas[0].slice_stop = metas->num_layer;
+    predict_models[0] = PredictModel();
+    predict_models[0].orig_output_start_layer = 0;
+    predict_models[0].orig_output_stop_layer = metas->num_layer;
+    predict_models[0].slice_start = 0;
+    predict_models[0].slice_stop = metas->num_layer;
     layer_predict_enabled.resize(metas->num_layer + 1, false);
     layer_predict_enabled[0] = true;
     return;
@@ -173,10 +178,10 @@ void Predictor::load_model(std::string model_path) {
   CHECK(stat_ret == 0) << "Model file not found: " << model_path;
   if (S_ISREG(path_stat.st_mode)) {
     load_one_model(model_path, 0);
-    CHECK(predict_model_list.size() == 1);
-    predict_model_metas[0] = PredictModelMeta();
-    predict_model_metas[0].orig_output_start_layer = 0;
-    predict_model_metas[0].orig_output_stop_layer = metas->num_layer;
+    CHECK(predict_models.size() == 1);
+    predict_models[0] = PredictModel();
+    predict_models[0].orig_output_start_layer = 0;
+    predict_models[0].orig_output_stop_layer = metas->num_layer;
   } else if (S_ISDIR(path_stat.st_mode)) {
     DIR *dir = opendir(model_path.c_str());
     CHECK(dir != nullptr) << "Failed to open directory: " << model_path;
@@ -190,7 +195,11 @@ void Predictor::load_model(std::string model_path) {
       std::string file_ext = std::string(entry->d_name).substr(name.find_last_of(".") + 1);
       if (file_ext == "pt") {
         LOG(TRACE) << "Loading model: " << name << " " << file_name_without_ext;
-        load_one_model(model_path + "/" + name, std::stoi(file_name_without_ext));
+        uint64_t model_id = std::stoull(file_name_without_ext);
+        if (predict_models.find(model_id) == predict_models.end()) {
+          predict_models[model_id] = PredictModel();
+        }
+        load_one_model(model_path + "/" + name, model_id);
       } else if (file_ext == "json") {
         LOG(ERROR) << "Loading json: " << name;
         std::ifstream trace_file(model_path + "/" + name);
@@ -198,9 +207,11 @@ void Predictor::load_model(std::string model_path) {
         trace_file.close();
         for (auto &el : output_layers_list.items()) {
           uint64_t model_id = std::stoull(el.key());
-          predict_model_metas[model_id] = PredictModelMeta();
-          predict_model_metas[model_id].orig_output_start_layer = el.value()[0].get<int>();
-          predict_model_metas[model_id].orig_output_stop_layer  = el.value()[1].get<int>();
+          if (predict_models.find(model_id) == predict_models.end()) {
+            predict_models[model_id] = PredictModel();
+          }
+          predict_models[model_id].orig_output_start_layer = el.value()[0].get<int>();
+          predict_models[model_id].orig_output_stop_layer  = el.value()[1].get<int>();
         }
       }
     }
@@ -219,7 +230,7 @@ void Predictor::load_model(std::string model_path) {
 
   if (metas->layer_predict_replace_first_input_with_last_output) {
     CHECK(metas->predict_input_mode == kMoeLayerLogits);
-    CHECK(predict_model_list.find(metas->num_layer) != predict_model_list.end());
+    CHECK(predict_models.find(metas->num_layer) != predict_models.end());
     CHECK(layers_to_predict[0] == 0);
     layers_to_predict[0] = metas->num_layer;
     layer_predict_enabled[0] = false;
@@ -228,8 +239,8 @@ void Predictor::load_model(std::string model_path) {
 
   int stop_l = 0;
   for (auto l : layers_to_predict) {
-    CHECK(predict_model_metas.find(l) != predict_model_metas.end()) << "No model meta for layer " << l;
-    auto & p_m_metas = predict_model_metas[l];
+    CHECK(predict_models.find(l) != predict_models.end()) << "No model meta for layer " << l;
+    auto & p_m_metas = predict_models[l];
     CHECK(p_m_metas.orig_num_output_layer() > 0) << "No output layers for model at layer 0";
     CHECK(p_m_metas.orig_output_stop_layer <= metas->num_layer) << "Orig model predict more than num_layer";
     CHECK(p_m_metas.orig_output_start_layer <= stop_l) << "Output layers not in order";

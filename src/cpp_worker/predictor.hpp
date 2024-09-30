@@ -6,6 +6,28 @@
 #include <cuda_runtime.h>
 #include "utils.hpp"
 
+struct PredictOutput {
+  torch::Tensor prob;
+  int input_layer_id = 0;
+  int start_output_layer_id = 0;
+  PredictOutput(torch::Tensor prob, int input_layer_id, int start_output_layer_id) : prob(prob), input_layer_id(input_layer_id), start_output_layer_id(start_output_layer_id) {}
+  // PredictOutput(torch::Tensor prob) : prob(prob) {}
+  PredictOutput(long num_output_layer, int input_layer_id, int start_output_layer_id) 
+    : prob(torch::empty({num_output_layer, 0}, torch::kFloat32)),
+      input_layer_id(input_layer_id),
+      start_output_layer_id(start_output_layer_id)
+  {}
+  static PredictOutput empty(long num_output_layer, int input_layer_id, int start_output_layer_id) {
+    return PredictOutput(num_output_layer, input_layer_id, start_output_layer_id);
+  }
+};
+
+class PredictorBase {
+ public:
+  cudaStream_t compute_stream;
+  virtual PredictOutput predict(int input_layer_id) = 0;
+};
+
 class Predictor {
   std::shared_ptr<ModuleMeta> metas;
   // torch::jit::script::Module predict_model;
@@ -16,7 +38,6 @@ class Predictor {
   torch::Tensor first_moe_attn_input_logits_buffer;
   std::unordered_map<int, torch::Tensor> moe_attn_input_logits_buffer_list;
   std::unordered_map<int, torch::Tensor> moe_layer_logits_buffer_list;
-  std::unordered_map<int, torch::jit::script::Module> predict_model_list;
   std::unordered_map<int, cudaEvent_t> logits_record_event;
 
  public:
@@ -53,7 +74,8 @@ class Predictor {
   void load_one_model(std::string model_path, int idx = 0);
   friend class PredictWorker;
  public:
-  struct PredictModelMeta {
+  struct PredictModel {
+    torch::jit::script::Module model;
     int orig_output_start_layer, orig_output_stop_layer;
     int slice_start, slice_stop;
     int orig_num_output_layer() const { return orig_output_stop_layer - orig_output_start_layer; }
@@ -62,12 +84,12 @@ class Predictor {
     int output_layer(int l_in_slice) const { return orig_output_start_layer + slice_start + l_in_slice; }
     int num_output_layer() const { return slice_stop - slice_start; }
   };
-  std::unordered_map<int, PredictModelMeta> predict_model_metas;
+  std::unordered_map<int, PredictModel> predict_models;
   std::vector<bool> layer_predict_enabled;
   Predictor(std::shared_ptr<ModuleMeta> metas);
   void load_model(std::string model_path);
 
-  torch::Tensor predict(int input_layer_id);
+  PredictOutput predict(int input_layer_id);
 
   void add_one_layer(int layer_id, torch::Tensor experts);
   void add_one_layer(int layer_id, int64_t *experts, size_t num_expert);

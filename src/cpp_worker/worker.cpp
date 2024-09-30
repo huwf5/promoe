@@ -5,8 +5,9 @@
 
 void PredictWorker::do_one_task_impl(PredictJob job) {
   TRACE_EVENT_GURAD(kPredictor, "predict thread " + std::to_string(job.input_layer_id));
-  const auto & p_m_metas = predictor->predict_model_metas[job.input_layer_id];
-  auto prob = predictor->predict(job.input_layer_id);
+  const auto & p_m_metas = predictor->predict_models[job.input_layer_id];
+  auto pred_result = predictor->predict(job.input_layer_id);
+  auto prob = pred_result.prob;
   LOG_BLOCK(DEBUG, logger, {
     logger << "predict worker: predict " << job.input_layer_id << " " << prob.sizes() << ", slice it with [" << p_m_metas.slice_start << ":" << p_m_metas.slice_stop << "]";
   });
