@@ -40,6 +40,8 @@ void CacheMngr::init_gpu_mem_buffer(size_t num_buffers) {
     }
   }
   LOG(ERROR) << "cache allocated " << total_nbytes / 1024.0 / 1024.0 << " MiB";
+  LOG(ERROR) << "changing num_predict from " << metas->num_predict_expert_per_layer << " to " << query_per_layer_cache_len();
+  metas->num_predict_expert_per_layer = std::min<int>(metas->num_predict_expert_per_layer, query_per_layer_cache_len());
 }
 CacheMngr::~CacheMngr() {
   size_t used_mem_cnt = prefetched_experts.size();

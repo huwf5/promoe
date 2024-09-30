@@ -50,7 +50,7 @@ PredictOutput Predictor::predict(int input_layer_id) {
   }
   switch (metas->predict_input_mode) {
     case kNoPredict:                {
-      return PredictOutput(metas->num_layer, input_layer_id, -1);
+      return PredictOutput::empty(metas->num_layer, input_layer_id, -1);
     }
     case kOneToken: { 
       CHECK(input_layer_id == 0);
@@ -85,7 +85,7 @@ PredictOutput Predictor::predict(int input_layer_id) {
       input = this->first_moe_attn_input_logits_buffer;
       if (input.numel() == 0) {
         LOG(DEBUG) << "skip prediction due to prefill";
-        return PredictOutput(metas->num_layer, input_layer_id, -1);
+        return PredictOutput::empty(metas->num_layer, input_layer_id, -1);
       } else {
         LOG_BLOCK(DEBUG, logger, {
           logger << "predictor, predict with input shape " << input.sizes() << " " << input.numel();
@@ -98,11 +98,11 @@ PredictOutput Predictor::predict(int input_layer_id) {
       input = this->moe_attn_input_logits_buffer_list[input_layer_id];
       if (input.numel() == 0) {
         LOG(DEBUG) << "skip prediction due to prefill";
-        return PredictOutput(predict_models[input_layer_id].orig_num_output_layer(), input_layer_id, predict_models[input_layer_id].orig_output_start_layer);
+        return PredictOutput::empty(predict_models[input_layer_id].orig_num_output_layer(), input_layer_id, predict_models[input_layer_id].orig_output_start_layer);
       }
       if (predict_models[input_layer_id].num_output_layer() == 0) {
         LOG(DEBUG) << "skip prediction due to empty output layers";
-        return PredictOutput(predict_models[input_layer_id].orig_num_output_layer(), input_layer_id, predict_models[input_layer_id].orig_output_start_layer);
+        return PredictOutput::empty(predict_models[input_layer_id].orig_num_output_layer(), input_layer_id, predict_models[input_layer_id].orig_output_start_layer);
       }
       LOG_BLOCK(DEBUG, logger, {
         logger << "predictor, predict with input shape " << input.sizes() << " " << input.numel();
@@ -115,11 +115,11 @@ PredictOutput Predictor::predict(int input_layer_id) {
       input = this->moe_layer_logits_buffer_list[input_layer_id];
       if (input.numel() == 0) {
         LOG(DEBUG) << "skip prediction due to prefill";
-        return PredictOutput(predict_models[input_layer_id].orig_num_output_layer(), input_layer_id, predict_models[input_layer_id].orig_output_start_layer);
+        return PredictOutput::empty(predict_models[input_layer_id].orig_num_output_layer(), input_layer_id, predict_models[input_layer_id].orig_output_start_layer);
       }
       if (predict_models[input_layer_id].num_output_layer() == 0) {
         LOG(DEBUG) << "skip prediction due to empty output layers";
-        return PredictOutput(predict_models[input_layer_id].orig_num_output_layer(), input_layer_id, predict_models[input_layer_id].orig_output_start_layer);
+        return PredictOutput::empty(predict_models[input_layer_id].orig_num_output_layer(), input_layer_id, predict_models[input_layer_id].orig_output_start_layer);
       }
       LOG_BLOCK(DEBUG, logger, {
         logger << "predictor, predict with input shape " << input.sizes() << " " << input.numel();
@@ -399,4 +399,12 @@ Predictor::Predictor(std::shared_ptr<ModuleMeta> metas) : metas(metas) {
     logits_record_event[l] = 0;
     CUDA_CALL(cudaEventCreateWithFlags(&logits_record_event[l], cudaEventDisableTiming));
   }
+}
+void Predictor::slice_predict_output_layer(PredictOutput &output) {
+  const auto & p_m_metas = predict_models[output.input_layer_id];
+  LOG_BLOCK(DEBUG, logger, {
+    logger << "predict worker: predict " << output.input_layer_id << " " << output.prob.sizes() << ", slice it with [" << p_m_metas.slice_start << ":" << p_m_metas.slice_stop << "]";
+  });
+  output.slice_layer(p_m_metas.slice_start, p_m_metas.slice_stop);
+  CHECK(output.start_output_layer_id == p_m_metas.output_layer_start());
 }
