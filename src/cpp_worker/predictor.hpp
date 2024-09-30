@@ -44,6 +44,17 @@ class PredictorBase {
 };
 
 class Predictor {
+ private:
+  struct PredictModel {
+    torch::jit::script::Module model;
+    int orig_output_start_layer, orig_output_stop_layer;
+    int slice_start, slice_stop;
+    int orig_num_output_layer() const { return orig_output_stop_layer - orig_output_start_layer; }
+    int output_layer_start() const { return orig_output_start_layer + slice_start; }
+    int output_layer_stop() const { return orig_output_start_layer + slice_stop; }
+    int output_layer(int l_in_slice) const { return orig_output_start_layer + slice_start + l_in_slice; }
+    int num_output_layer() const { return slice_stop - slice_start; }
+  };
   std::shared_ptr<ModuleMeta> metas;
   // torch::jit::script::Module predict_model;
   // single sequence for now
@@ -54,6 +65,8 @@ class Predictor {
   std::unordered_map<int, torch::Tensor> moe_attn_input_logits_buffer_list;
   std::unordered_map<int, torch::Tensor> moe_layer_logits_buffer_list;
   std::unordered_map<int, cudaEvent_t> logits_record_event;
+  std::unordered_map<int, PredictModel> predict_models;
+  std::vector<bool> layer_predict_enabled;
 
  public:
   cudaStream_t compute_stream;
@@ -88,20 +101,7 @@ class Predictor {
 
   void load_one_model(std::string model_path, int idx = 0);
   friend class PredictWorker;
- public:
-  struct PredictModel {
-    torch::jit::script::Module model;
-    int orig_output_start_layer, orig_output_stop_layer;
-    int slice_start, slice_stop;
-    int orig_num_output_layer() const { return orig_output_stop_layer - orig_output_start_layer; }
-    int output_layer_start() const { return orig_output_start_layer + slice_start; }
-    int output_layer_stop() const { return orig_output_start_layer + slice_stop; }
-    int output_layer(int l_in_slice) const { return orig_output_start_layer + slice_start + l_in_slice; }
-    int num_output_layer() const { return slice_stop - slice_start; }
-  };
- private:
-  std::unordered_map<int, PredictModel> predict_models;
-  std::vector<bool> layer_predict_enabled;
+
  public:
   Predictor(std::shared_ptr<ModuleMeta> metas);
   void load_model(std::string model_path);
