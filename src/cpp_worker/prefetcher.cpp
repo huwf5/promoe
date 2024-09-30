@@ -335,6 +335,7 @@ PrefetchMngr::PrefetchMngr(std::shared_ptr<ModuleMeta> metas,
     }
   });
   precision_profiler = std::make_shared<PrecisionProfiler>();
+  precision_profiler->decode_expert_per_token = metas->num_expert_per_token;
   predict_thread->init(fetch_schedule_thread.get(), predictor.get(), cache.get(), metas.get());
   predict_thread->precision_profiler = precision_profiler.get();
   fetch_thread->init(metas.get(), fetch_schedule_thread.get(), model_loader->mem_mngr_ctx.get(), (cudaStream_t)copy_stream);

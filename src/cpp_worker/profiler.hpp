@@ -342,6 +342,7 @@ class TimerGuard {
 
 class PrecisionProfiler {
  public:
+  int decode_expert_per_token = 0;
   class LayerInfo {
    public:
     int layer_id;
