@@ -53,6 +53,7 @@ void PredictWorker::do_one_task_impl(PredictJob job) {
       sem_post(&prefetch_layer_progress);
     }
   }
+  // fixme: fix this condition
   if (num_predicted_layers + job.input_layer_id == metas->num_layer) {
     predictor->end_of_one_token_prediction();
   }

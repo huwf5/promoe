@@ -3,6 +3,47 @@
 #include "predictor.hpp"
 #include "logging.hpp"
 #include "profiler.hpp"
+#include "utils.hpp"
+
+std::vector<std::pair<int, int>> build_predict_layer_mapping(ModuleMeta * metas) {
+  std::vector<int> layers_to_predict;
+  for (int l = 0; l < metas->num_layer; l+= metas->layer_predict_interval) {
+    layers_to_predict.push_back(l);
+  }
+
+
+  std::vector<int> predict_layers(metas->num_layer + 1, 0);
+
+  int stop_l = 0;
+  for (auto l : layers_to_predict) {
+    predict_layers[l] = stop_l;
+    predict_layers[l + 1] = (l % metas->num_layer) + metas->layer_predict_max_window;
+    predict_layers[l + 1] = std::min(predict_layers[l + 1], metas->num_layer);
+    stop_l = predict_layers[l + 1];
+
+    LOG(ERROR) << "predict model " << l << ", "
+               << "predicts [" << predict_layers[l] << ":" << predict_layers[l + 1] << ")";
+  }
+
+  for (int l = 1; l <= metas->num_layer; l++) {
+    if (predict_layers[l] < predict_layers[l - 1]) {
+      predict_layers[l] = predict_layers[l - 1];
+    }
+  }
+
+  std::vector<std::pair<int, int>> ret(metas->num_layer + 1, {0, 0});
+  for (int l = 0; l < metas->num_layer; l++) {
+    ret[l] = {predict_layers[l], predict_layers[l + 1]};
+  }
+
+  if (metas->layer_predict_replace_first_input_with_last_output) {
+    CHECK(metas->predict_input_mode == kMoeLayerLogits);
+    ret[metas->num_layer] = ret[0];
+    ret[0] = {0, 0};
+  }
+
+  return ret;
+}
 
 void LegacyPredictor::add_one_layer(int layer_id, int64_t *experts, size_t num_expert) {
   switch (metas->predict_input_mode) {
@@ -169,8 +210,6 @@ void LegacyPredictor::load_model(std::string model_path) {
     predict_models[0].orig_output_stop_layer = metas->num_layer;
     predict_models[0].slice_start = 0;
     predict_models[0].slice_stop = metas->num_layer;
-    layer_predict_enabled_list.resize(metas->num_layer + 1, false);
-    layer_predict_enabled_list[0] = true;
     return;
   }
   struct stat path_stat;
@@ -221,46 +260,35 @@ void LegacyPredictor::load_model(std::string model_path) {
                  << model_path;
   }
 
-  layer_predict_enabled_list.resize(metas->num_layer + 1, false);
-  std::vector<int> layers_to_predict;
-  for (int l = 0; l < metas->num_layer; l+= metas->layer_predict_interval) {
-    layers_to_predict.push_back(l);
-    layer_predict_enabled_list[l] = true;
-  }
+  auto predict_layers = build_predict_layer_mapping(metas.get());
 
-  if (metas->layer_predict_replace_first_input_with_last_output) {
-    CHECK(metas->predict_input_mode == kMoeLayerLogits);
-    CHECK(predict_models.find(metas->num_layer) != predict_models.end());
-    CHECK(layers_to_predict[0] == 0);
-    layers_to_predict[0] = metas->num_layer;
-    layer_predict_enabled_list[0] = false;
-    layer_predict_enabled_list[metas->num_layer] = true;
-  }
-
-  int stop_l = 0;
-  for (auto l : layers_to_predict) {
+  for (int l = 0; l < metas->num_layer + 1; l++) {
     CHECK(predict_models.find(l) != predict_models.end()) << "No model meta for layer " << l;
-    auto & p_m_metas = predict_models[l];
-    CHECK(p_m_metas.orig_num_output_layer() > 0) << "No output layers for model at layer 0";
-    CHECK(p_m_metas.orig_output_stop_layer <= metas->num_layer) << "Orig model predict more than num_layer";
-    CHECK(p_m_metas.orig_output_start_layer <= stop_l) << "Output layers not in order";
-    p_m_metas.slice_start = stop_l - p_m_metas.orig_output_start_layer;
-
-    // orig layers: [orig_output_start_layer, orig_output_stop_layer)
-    // build a slice: orig_output[slice_start:slice_stop] -> [orig_output_start_layer + slice_start, orig_output_start_layer + slice_stop)
-    // ------
-    // orig_output_start_layer + slice_stop <= orig_output_stop_layer
-    // orig_output_start_layer + slice_stop <= l + metas->layer_predict_max_window
-
-    p_m_metas.slice_stop = std::min<int>(p_m_metas.orig_num_output_layer(), (l % metas->num_layer) + metas->layer_predict_max_window - p_m_metas.orig_output_start_layer); 
-    CHECK(p_m_metas.slice_start <= p_m_metas.slice_stop) << "No output layers for model at layer 0";
-    stop_l = p_m_metas.output_layer_stop();
+    auto &model = predict_models[l];
+    CHECK(predict_layers[l].first <= predict_layers[l].second) << "Invalid predict layer range: " << predict_layers[l].first << " " << predict_layers[l].second;
+    if (predict_layers[l].first == predict_layers[l].second) {
+      model.slice_start = 0;
+      model.slice_stop = 0;
+    } else {
+      CHECK(model.orig_output_start_layer <= predict_layers[l].first) << "Invalid predict layer range: " << predict_layers[l].first << " " << predict_layers[l].second;
+      CHECK(model.orig_output_stop_layer >= predict_layers[l].second) << "Invalid predict layer range: " << predict_layers[l].first << " " << predict_layers[l].second;
+      model.slice_start = predict_layers[l].first - model.orig_output_start_layer;
+      model.slice_stop = predict_layers[l].second - model.orig_output_start_layer;
+    }
     LOG(ERROR) << "predict model " << l << ", "
-               << "orig [" << p_m_metas.orig_output_start_layer << ":" << p_m_metas.orig_output_stop_layer << "], "
-               << "slice [" << p_m_metas.slice_start << ":" << p_m_metas.slice_stop << "], "
-               << "into [" << p_m_metas.output_layer_start() << ":" << p_m_metas.output_layer_stop() << "]";
+               << "orig [" << model.orig_output_start_layer << ":" << model.orig_output_stop_layer << "], "
+               << "slice [" << model.slice_start << ":" << model.slice_stop << "], "
+               << "into [" << model.output_layer_start() << ":" << model.output_layer_stop() << "]";
   }
 }
+
+bool LegacyPredictor::layer_predict_enabled(int layer_id) {
+  if (predict_models.find(layer_id) == predict_models.end()) {
+    return false;
+  }
+  return predict_models[layer_id].num_output_layer() > 0;
+}
+
 void LegacyPredictor::add_one_layer(int layer_id, torch::Tensor experts) {
   add_one_layer(layer_id, experts.data_ptr<int64_t>(), experts.numel());
 }

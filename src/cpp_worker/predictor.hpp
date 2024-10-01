@@ -45,11 +45,11 @@ class PredictorBase {
   cudaStream_t compute_stream;
   virtual PredictOutput predict(int input_layer_id) = 0;
   virtual void load_model(std::string model_path) = 0;
-  virtual void add_one_layer(int layer_id, torch::Tensor experts) = 0;
-  virtual void add_one_layer(int layer_id, int64_t *experts, size_t num_expert) = 0;
-  virtual void record_moe_attn_logits(int layer_id, torch::Tensor attn_logits) = 0;
-  virtual void record_moe_layer_logits(int layer_id, torch::Tensor layer_logits) = 0;
-  virtual void end_of_one_token_prediction() = 0;
+  virtual void add_one_layer(int layer_id, torch::Tensor experts) {};
+  virtual void add_one_layer(int layer_id, int64_t *experts, size_t num_expert) {};
+  virtual void record_moe_attn_logits(int layer_id, torch::Tensor attn_logits) {};
+  virtual void record_moe_layer_logits(int layer_id, torch::Tensor layer_logits) {};
+  virtual void end_of_one_token_prediction() {};
   virtual void start_of_new_sequence() = 0;
   virtual void slice_predict_output_layer(PredictOutput &output) = 0;
   virtual bool layer_predict_enabled(int layer_id) = 0;
@@ -78,7 +78,6 @@ class LegacyPredictor : public PredictorBase {
   std::unordered_map<int, torch::Tensor> moe_layer_logits_buffer_list;
   std::unordered_map<int, cudaEvent_t> logits_record_event;
   std::unordered_map<int, PredictModel> predict_models;
-  std::vector<bool> layer_predict_enabled_list;
 
  private:
   void init_expert_access_buffer() {
@@ -123,7 +122,7 @@ class LegacyPredictor : public PredictorBase {
   void record_moe_layer_logits(int layer_id, torch::Tensor layer_logits) override;
   void end_of_one_token_prediction() override;
   void start_of_new_sequence() override;
-  bool layer_predict_enabled(int layer_id) override { return layer_predict_enabled_list[layer_id]; }
+  bool layer_predict_enabled(int layer_id) override;
   void slice_predict_output_layer(PredictOutput &output) override;
 
   // void clear_access_buffer() {
