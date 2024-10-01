@@ -64,6 +64,7 @@ class LegacyPredictor : public PredictorBase {
  private:
   struct PredictModel {
     torch::jit::script::Module model;
+    // torch::ScalarType dtype = torch::ScalarType::Undefined;
     int orig_output_start_layer, orig_output_stop_layer;
     int slice_start, slice_stop;
     int orig_num_output_layer() const { return orig_output_stop_layer - orig_output_start_layer; }
@@ -140,6 +141,7 @@ class SepPredictor : public PredictorBase {
  private:
   struct PredictSepModel {
     std::unordered_map<int, torch::jit::script::Module> models;
+    // torch::ScalarType dtype = torch::ScalarType::Undefined;
     // int input_layer_id;
     std::vector<int> enabled_output_layers;
     int num_output_layer() const { return enabled_output_layers.size(); }

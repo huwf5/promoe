@@ -80,6 +80,54 @@ void LegacyPredictor::add_one_layer(int layer_id, int64_t *experts, size_t num_e
     default : { CHECK(false) << "Unknown predict input mode"; }
   }
 }
+
+/** Legacy method to convert model dtype. Turns out it's slower on cpu */
+torch::ScalarType get_jit_model_dtype(torch::jit::script::Module &model) {
+  for (auto param : model.parameters()) {
+    return param.dtype().toScalarType();
+  }
+  LOG(ERROR) << "Model has no parameters";
+  return torch::ScalarType::Undefined;
+}
+
+void recursive_convert_jit_model_dtype(torch::jit::script::Module &model, torch::ScalarType dtype) {
+  auto children = model.named_children();
+  for (auto n : children) {
+    recursive_convert_jit_model_dtype(n.value, dtype);
+  }
+  if (children.size() > 0) {
+    return;
+  }
+  auto original_dtype = get_jit_model_dtype(model);
+  std::unordered_map<std::string, torch::Tensor> params;
+  std::unordered_map<std::string, torch::Tensor> buffers;
+  for (auto param : model.named_parameters(false)) {
+    params[param.name] = param.value.to(dtype);
+  }
+  for (auto buffer : model.named_buffers(false)) {
+    buffers[buffer.name] = buffer.value.to(dtype);
+  }
+  for (auto &param : params) {
+    model.register_parameter(param.first, param.second, false);
+  }
+  for (auto &buffer : buffers) {
+    model.register_buffer(buffer.first, buffer.second);
+  }
+  auto after_dtype = get_jit_model_dtype(model);
+  LOG(ERROR) << "recursive convert model dtype from " << original_dtype << " to " << dtype << ", after dtype is " << after_dtype;
+  for (auto param : model.named_parameters()) {
+    std::cout << param.name << " " << param.value.dtype().toScalarType() << std::endl;
+  }
+
+}
+
+void convert_jit_model_dtype(torch::jit::script::Module &model, torch::ScalarType dtype) {
+  auto original_dtype = get_jit_model_dtype(model);
+  recursive_convert_jit_model_dtype(model, dtype);
+  auto after_dtype = get_jit_model_dtype(model);
+  LOG(ERROR) << "convert model dtype from " << original_dtype << " to " << dtype << ", after dtype is " << after_dtype;
+}
+
 PredictOutput LegacyPredictor::predict(int input_layer_id) {
   TRACE_EVENT_GURAD(kPredictor, "predict " + std::to_string(input_layer_id));
   LOG(DEBUG) << "predictor, predict " + std::to_string(input_layer_id);
@@ -166,7 +214,8 @@ PredictOutput LegacyPredictor::predict(int input_layer_id) {
         logger << "predictor, predict with input shape " << input.sizes() << " " << input.numel();
       });
       model = predict_models[input_layer_id].model;
-      input = input.clone().to(torch::kFloat32);
+      input = input.to(torch::kFloat32);
+      // input = input.toType(torch::kF16);
       break;
     }
     default: {
@@ -204,6 +253,11 @@ void LegacyPredictor::load_one_model(std::string model_path, int idx) {
   c10::Device cpu_device(c10::DeviceType::CPU);
   predict_models[idx].model = torch::jit::load(model_path, cpu_device);
   predict_models[idx].model.eval();
+  // convert_jit_model_dtype(predict_models[idx].model, torch::kF16);
+  // for (const auto& param : predict_models[idx].model.parameters()) {
+  //   predict_models[idx].dtype = param.dtype().toScalarType();
+  //   break;
+  // }
 }
 void LegacyPredictor::load_model(std::string model_path) {
   if (metas->predict_input_mode == kNoPredict) {
@@ -467,7 +521,8 @@ PredictOutput SepPredictor::predict(int input_layer_id) {
         logger << "predictor, predict with input shape " << input.sizes() << " " << input.numel();
       });
       model = &predict_models[input_layer_id];
-      input = input.clone().to(torch::kFloat32);
+      input = input.to(torch::kF16);
+      // input = input.to(torch::kFloat32);
       break;
     }
     default: {
@@ -518,7 +573,11 @@ void SepPredictor::load_model(std::string model_path) {
       predict_models[src_l].models[dst_l] = torch::jit::load(model_path + "/" + std::to_string(src_l) + "-" + std::to_string(dst_l) + ".pt", cpu_device);
       predict_models[src_l].models[dst_l].eval();
       predict_models[src_l].enabled_output_layers.push_back(dst_l);
+      // convert_jit_model_dtype(predict_models[src_l].models[dst_l], torch::kF16);
     }
+    // if (predict_models[src_l].enabled_output_layers.size() > 0) {
+    //   predict_models[src_l].dtype = get_jit_model_dtype(predict_models[src_l].models[predict_models[src_l].enabled_output_layers[0]]);
+    // }
   }
 }
 
