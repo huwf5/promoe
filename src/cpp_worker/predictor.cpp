@@ -521,8 +521,8 @@ PredictOutput SepPredictor::predict(int input_layer_id) {
         logger << "predictor, predict with input shape " << input.sizes() << " " << input.numel();
       });
       model = &predict_models[input_layer_id];
-      input = input.to(torch::kF16);
-      // input = input.to(torch::kFloat32);
+      // input = input.to(torch::kF16);
+      input = input.to(torch::kFloat32);
       break;
     }
     default: {
