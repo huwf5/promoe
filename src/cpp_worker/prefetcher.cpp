@@ -254,6 +254,12 @@ void PrefetchMngr::launch_thread() {
   predict_thread->launch();
   expert_unlocker_thread->launch();
   fetch_thread->launch();
+  if (string_is_on(GetEnv("SPARSE_CACHE_THREAD_TO_E_CORE"))) {
+    fetch_schedule_thread->set_cpu_affinity({30});
+    predict_thread->set_cpu_affinity({0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15});
+    expert_unlocker_thread->set_cpu_affinity({28});
+    fetch_thread->set_cpu_affinity({26});
+  }
 }
 PrefetchMngr::PrefetchMngr(std::shared_ptr<ModuleMeta> metas,
                            std::shared_ptr<ModelLoader> model_loader,

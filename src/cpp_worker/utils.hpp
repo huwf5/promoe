@@ -436,3 +436,11 @@ template<typename T>
 inline T round_up(T val, T align) {
   return ((val + align - 1) / align) * align;
 }
+
+inline std::string GetEnv(const std::string & key, const std::string & default_val = "") {
+  const char * val = getenv(key.c_str());
+  if (val == nullptr) {
+    return default_val;
+  }
+  return val;
+}

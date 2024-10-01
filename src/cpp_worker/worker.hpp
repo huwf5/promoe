@@ -1,85 +1,146 @@
 #pragma once
 #include <semaphore.h>
+#include <mutex>
+#include <condition_variable>
+#include <atomic>
+#include <thread>
 #include "cache.hpp"
 #include "utils.hpp"
 #include "model_loader.hpp"
 #include "predictor.hpp"
 #include "profiler.hpp"
+#include <pthread.h>
 
 template<typename TASK_T>
-class WorkerThread {
-  Queue<TASK_T> queue;
-  // TASK_T current_task;
-  AtomicQueueLock queue_lock;
-  std::thread worker_thread;
-  volatile bool exit_mark = false;
+class WorkerThreadBase {
  protected:
+  Queue<TASK_T> queue;
+  std::thread worker_thread;
+  std::atomic<bool> exit_mark_atomic{false};
   using progress_handler_t = int64_t;
- private:
   progress_handler_t queued = 0;
   std::atomic<progress_handler_t> progress{0};
  protected:
   bool should_exit() {
-    return exit_mark;
+    return std::atomic_load_explicit(&exit_mark_atomic, std::memory_order_relaxed);
   }
   virtual void do_one_task_impl(TASK_T task) {}
-  inline void do_one_task(TASK_T task) { 
+  inline void do_one_task(TASK_T task) {
     do_one_task_impl(task);
     progress.fetch_add(1);
   }
  public:
-  WorkerThread() : progress(0) {}
-  virtual void exit() {
-    exit_mark = true;
-    if (worker_thread.joinable()) { worker_thread.join(); }
-  }
+  WorkerThreadBase() : progress(0) {}
+  virtual void exit() = 0;
   void launch() {
     worker_thread = std::thread([this](){
       thread_func();
     });
   }
- private:
-  void thread_func() {
-    while (should_exit() == false) {
+ protected:
+  virtual void thread_func() = 0;
+ public:
+  void set_cpu_affinity(std::vector<int> cpu_ids) {
+    if (worker_thread.native_handle()) {
+      auto pthread_id = pthread_self();
+      cpu_set_t cpuset;
+      CPU_ZERO(&cpuset);
+      for (auto cpu_id : cpu_ids) {
+        CPU_SET(cpu_id, &cpuset);
+      }
+      int result = pthread_setaffinity_np(pthread_id, sizeof(cpu_set_t), &cpuset);
+      if (result != 0) {
+        std::cerr << "Error setting thread affinity: " << std::strerror(result) << std::endl;
+      }
+    }
+  }
+  virtual progress_handler_t add_one_task(TASK_T task) = 0;
+  void wait_progress(progress_handler_t handle) {
+    // todo: handle overflow
+    while(progress.load() <= handle) {};
+    // while(progress.load() <= handle) { std::this_thread::yield(); }
+  }
+  virtual ~WorkerThreadBase() {}
+};
+
+template<typename TASK_T>
+class WorkerThreadMutex : public WorkerThreadBase<TASK_T> {
+  std::mutex queue_mutex;
+  std::condition_variable cv;
+ public:
+  WorkerThreadMutex() : WorkerThreadBase<TASK_T>() {}
+  void exit() override {
+    std::atomic_store_explicit(&this->exit_mark_atomic, true, std::memory_order_relaxed);
+    cv.notify_one();
+    if (this->worker_thread.joinable()) { this->worker_thread.join(); }
+  }
+ protected:
+  void thread_func() override {
+    while (!this->should_exit()) {
+      std::unique_lock<std::mutex> lock(queue_mutex);
+      cv.wait(lock, [this]{ return !this->queue.empty() || this->should_exit(); });
+
+      if (this->should_exit()) {
+        break;
+      }
+
+      auto current_task = this->queue.front();
+      this->queue.pop();
+      lock.unlock();
+
+      this->do_one_task(current_task);
+    }
+  }
+ public:
+  using progress_handler_t = typename WorkerThreadBase<TASK_T>::progress_handler_t;
+  progress_handler_t add_one_task(TASK_T task) override {
+    std::lock_guard<std::mutex> lock(queue_mutex);
+    auto ret = this->queued++;
+    this->queue.push(task);
+    cv.notify_one();
+    return ret;
+  }
+};
+
+
+
+template<typename TASK_T>
+class WorkerThreadSpin : public WorkerThreadBase<TASK_T> {
+  AtomicQueueLock queue_lock;
+ public:
+  WorkerThreadSpin() : WorkerThreadBase<TASK_T>() {}
+  void exit() override {
+    std::atomic_store_explicit(&this->exit_mark_atomic, true, std::memory_order_relaxed);
+    if (this->worker_thread.joinable()) { this->worker_thread.join(); }
+  }
+ protected:
+  void thread_func() override {
+    while (!this->should_exit()) {
       queue_lock.lock();
-      if (queue.empty()) {
+      if (this->queue.empty()) {
         queue_lock.unlock();
         // usleep(10);
       } else {
-        auto current_task = queue.front();
-        queue.pop();
+        auto current_task = this->queue.front();
+        this->queue.pop();
         queue_lock.unlock();
-        do_one_task(current_task);
+        this->do_one_task(current_task);
       }
     }
   }
  public:
-  progress_handler_t add_one_task(TASK_T task) {
+  using progress_handler_t = typename WorkerThreadBase<TASK_T>::progress_handler_t;
+  progress_handler_t add_one_task(TASK_T task) override {
     queue_lock.lock();
-    auto ret = queued++;
-    queue.push(task);
+    auto ret = this->queued++;
+    this->queue.push(task);
     queue_lock.unlock();
     return ret;
   }
-  void wait_progress(progress_handler_t handle) {
-    // todo: handle overflow
-    while(progress.load() <= handle) {};
-  }
-  virtual ~WorkerThread() {}
 };
 
-template<>
-class WorkerThread<void> : public WorkerThread<DummyStruct> {
-  using progress_handler_t = WorkerThread<DummyStruct>::progress_handler_t;
- protected:
-  virtual void do_one_task_impl() = 0;
-  void do_one_task_impl(DummyStruct task) override {
-    do_one_task_impl();
-  }
-  progress_handler_t add_one_task() {
-    return WorkerThread<DummyStruct>::add_one_task(DummyStruct());
-  }
-};
+template<typename TASK_T>
+using WorkerThread = WorkerThreadSpin<TASK_T>;
 
 class BaseTask {
   public:
