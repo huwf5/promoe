@@ -31,13 +31,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     .def("init_param_list", &ModuleMeta::init_param_list)
   ;
 
-  py::class_<Predictor, std::shared_ptr<Predictor>>(m, "Predictor")
+  py::class_<PredictorBase, std::shared_ptr<PredictorBase>>(m, "PredictorBase")
+    // .def(py::init<std::shared_ptr<ModuleMeta>>())
+    // .def("load_model",          &PredictorBase::load_model)
+  ;
+  py::class_<LegacyPredictor, std::shared_ptr<LegacyPredictor>, PredictorBase>(m, "LegacyPredictor")
     .def(py::init<std::shared_ptr<ModuleMeta>>())
-    .def("load_model",          &Predictor::load_model)
-    .def("predict",             &Predictor::predict)
-    // .def("clear_access_buffer", &Predictor::clear_access_buffer)
-    .def("add_one_layer", static_cast<void (Predictor::*)(int, int64_t*, size_t)>(&Predictor::add_one_layer))
-    .def("add_one_layer", static_cast<void (Predictor::*)(int, torch::Tensor)>(&Predictor::add_one_layer))
+    .def("load_model",          &LegacyPredictor::load_model)
   ;
 
   py::class_<ModelLoader, std::shared_ptr<ModelLoader>>(m, "ModelLoader")
@@ -60,7 +60,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   ;
 
   py::class_<PrefetchMngr, std::shared_ptr<PrefetchMngr>>(m, "PrefetchMngr")
-    .def(py::init<std::shared_ptr<ModuleMeta>, std::shared_ptr<ModelLoader>, std::shared_ptr<Predictor>>())
+    .def(py::init<std::shared_ptr<ModuleMeta>, std::shared_ptr<ModelLoader>, std::shared_ptr<PredictorBase>>())
     .def("launch_thread",           &PrefetchMngr::launch_thread)
     .def("init_gpu_mem_buffer",     &PrefetchMngr::init_gpu_mem_buffer)
     .def("reload_env",              &PrefetchMngr::reload_env)

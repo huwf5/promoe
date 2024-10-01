@@ -257,7 +257,7 @@ void PrefetchMngr::launch_thread() {
 }
 PrefetchMngr::PrefetchMngr(std::shared_ptr<ModuleMeta> metas,
                            std::shared_ptr<ModelLoader> model_loader,
-                           std::shared_ptr<Predictor> predictor,
+                           std::shared_ptr<PredictorBase> predictor,
                            int64_t compute_stream_param,
                            bool create_compute_stream,
                            TimeProfiler* profiler_ptr)

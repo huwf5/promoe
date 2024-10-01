@@ -275,7 +275,7 @@ def inject_model(
   meta.handle_uninited_configs()
 
   model_loader  = cpp_worker.ModelLoader(meta)
-  predictor     = cpp_worker.Predictor(meta)
+  predictor     = cpp_worker.LegacyPredictor(meta)
   prefetch_mngr = cpp_worker.PrefetchMngr(meta, model_loader, predictor)
   torch.cuda.set_stream(torch.cuda.ExternalStream(prefetch_mngr.compute_stream, 0))
   print("initializing cache lib...done")

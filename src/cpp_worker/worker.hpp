@@ -143,7 +143,7 @@ struct PredictJob {
 };
 class PredictWorker : public WorkerThread<PredictJob> {
   FetchScheduleWorker* fetch_schedule_thread;
-  Predictor  * predictor;
+  PredictorBase  * predictor;
   CacheMngr  * cache;
   ModuleMeta * metas;
 
@@ -153,7 +153,7 @@ class PredictWorker : public WorkerThread<PredictJob> {
   friend class PrefetchMngr;
  public:
   PredictWorker() : WorkerThread<PredictJob>() {}
-  void init(FetchScheduleWorker* fetch_schedule_thread, Predictor* predictor, CacheMngr* cache, ModuleMeta* metas) {
+  void init(FetchScheduleWorker* fetch_schedule_thread, PredictorBase* predictor, CacheMngr* cache, ModuleMeta* metas) {
     this->fetch_schedule_thread = fetch_schedule_thread;
     this->predictor = predictor;
     this->cache = cache;

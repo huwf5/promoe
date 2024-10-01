@@ -4,7 +4,7 @@
 #include "logging.hpp"
 #include "profiler.hpp"
 
-void Predictor::add_one_layer(int layer_id, int64_t *experts, size_t num_expert) {
+void LegacyPredictor::add_one_layer(int layer_id, int64_t *experts, size_t num_expert) {
   switch (metas->predict_input_mode) {
     case kNoPredict:                { break; }
     case kOneToken:                 {
@@ -39,7 +39,7 @@ void Predictor::add_one_layer(int layer_id, int64_t *experts, size_t num_expert)
     default : { CHECK(false) << "Unknown predict input mode"; }
   }
 }
-PredictOutput Predictor::predict(int input_layer_id) {
+PredictOutput LegacyPredictor::predict(int input_layer_id) {
   TRACE_EVENT_GURAD(kPredictor, "predict " + std::to_string(input_layer_id));
   LOG(DEBUG) << "predictor, predict " + std::to_string(input_layer_id);
   torch::Tensor input;
@@ -157,20 +157,20 @@ PredictOutput Predictor::predict(int input_layer_id) {
   return PredictOutput(output, input_layer_id, predict_models[input_layer_id].orig_output_start_layer);
   // return model.forward(inputs).toTensor().reshape({-1, metas->num_expert});
 }
-void Predictor::load_one_model(std::string model_path, int idx) {
+void LegacyPredictor::load_one_model(std::string model_path, int idx) {
   c10::Device cpu_device(c10::DeviceType::CPU);
   predict_models[idx].model = torch::jit::load(model_path, cpu_device);
   predict_models[idx].model.eval();
 }
-void Predictor::load_model(std::string model_path) {
+void LegacyPredictor::load_model(std::string model_path) {
   if (metas->predict_input_mode == kNoPredict) {
     predict_models[0] = PredictModel();
     predict_models[0].orig_output_start_layer = 0;
     predict_models[0].orig_output_stop_layer = metas->num_layer;
     predict_models[0].slice_start = 0;
     predict_models[0].slice_stop = metas->num_layer;
-    layer_predict_enabled.resize(metas->num_layer + 1, false);
-    layer_predict_enabled[0] = true;
+    layer_predict_enabled_list.resize(metas->num_layer + 1, false);
+    layer_predict_enabled_list[0] = true;
     return;
   }
   struct stat path_stat;
@@ -221,11 +221,11 @@ void Predictor::load_model(std::string model_path) {
                  << model_path;
   }
 
-  layer_predict_enabled.resize(metas->num_layer + 1, false);
+  layer_predict_enabled_list.resize(metas->num_layer + 1, false);
   std::vector<int> layers_to_predict;
   for (int l = 0; l < metas->num_layer; l+= metas->layer_predict_interval) {
     layers_to_predict.push_back(l);
-    layer_predict_enabled[l] = true;
+    layer_predict_enabled_list[l] = true;
   }
 
   if (metas->layer_predict_replace_first_input_with_last_output) {
@@ -233,8 +233,8 @@ void Predictor::load_model(std::string model_path) {
     CHECK(predict_models.find(metas->num_layer) != predict_models.end());
     CHECK(layers_to_predict[0] == 0);
     layers_to_predict[0] = metas->num_layer;
-    layer_predict_enabled[0] = false;
-    layer_predict_enabled[metas->num_layer] = true;
+    layer_predict_enabled_list[0] = false;
+    layer_predict_enabled_list[metas->num_layer] = true;
   }
 
   int stop_l = 0;
@@ -261,10 +261,10 @@ void Predictor::load_model(std::string model_path) {
                << "into [" << p_m_metas.output_layer_start() << ":" << p_m_metas.output_layer_stop() << "]";
   }
 }
-void Predictor::add_one_layer(int layer_id, torch::Tensor experts) {
+void LegacyPredictor::add_one_layer(int layer_id, torch::Tensor experts) {
   add_one_layer(layer_id, experts.data_ptr<int64_t>(), experts.numel());
 }
-void Predictor::start_of_new_sequence() {
+void LegacyPredictor::start_of_new_sequence() {
   LOG(DEBUG) << "predictor, start_of_new_sequence";
   switch (metas->predict_input_mode) {
     case kNoPredict:               { break; }
@@ -280,7 +280,7 @@ void Predictor::start_of_new_sequence() {
     }
   }
 }
-void Predictor::end_of_one_token_prediction() {
+void LegacyPredictor::end_of_one_token_prediction() {
   LOG(DEBUG) << "predictor, end_of_one_token_prediction";
   switch (metas->predict_input_mode) {
     case kNoPredict:               { break; }
@@ -296,7 +296,7 @@ void Predictor::end_of_one_token_prediction() {
     }
   }
 }
-void Predictor::record_moe_attn_logits(int layer_id, torch::Tensor attn_logits) {
+void LegacyPredictor::record_moe_attn_logits(int layer_id, torch::Tensor attn_logits) {
   TRACE_EVENT_GURAD(kHook, "record_moe_attn_logits " + std::to_string(layer_id));
   LOG(DEBUG) << "predictor, record_moe_attn_logits " << layer_id;
   switch (metas->predict_input_mode) {
@@ -347,7 +347,7 @@ void Predictor::record_moe_attn_logits(int layer_id, torch::Tensor attn_logits) 
   }
 }
 
-void Predictor::record_moe_layer_logits(int layer_id, torch::Tensor layer_logits) {
+void LegacyPredictor::record_moe_layer_logits(int layer_id, torch::Tensor layer_logits) {
   TRACE_EVENT_GURAD(kHook, "record_moe_layer_logits " + std::to_string(layer_id));
   LOG(DEBUG) << "predictor, record_moe_layer_logits " << layer_id;
   switch (metas->predict_input_mode) {
@@ -393,14 +393,14 @@ void Predictor::record_moe_layer_logits(int layer_id, torch::Tensor layer_logits
     }
   }
 }
-Predictor::Predictor(std::shared_ptr<ModuleMeta> metas) : metas(metas) {
+LegacyPredictor::LegacyPredictor(std::shared_ptr<ModuleMeta> metas) : PredictorBase(metas) {
   init_expert_access_buffer();
   for (int l = 0; l <= metas->num_layer; l++) {
     logits_record_event[l] = 0;
     CUDA_CALL(cudaEventCreateWithFlags(&logits_record_event[l], cudaEventDisableTiming));
   }
 }
-void Predictor::slice_predict_output_layer(PredictOutput &output) {
+void LegacyPredictor::slice_predict_output_layer(PredictOutput &output) {
   const auto & p_m_metas = predict_models[output.input_layer_id];
   LOG_BLOCK(DEBUG, logger, {
     logger << "predict worker: predict " << output.input_layer_id << " " << output.prob.sizes() << ", slice it with [" << p_m_metas.slice_start << ":" << p_m_metas.slice_stop << "]";

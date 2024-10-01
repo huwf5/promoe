@@ -120,7 +120,7 @@ void PredictWorker::on_moe_attn_input_logits_recorded(int layer_id) {
       break;
     }
     case kMoeAttnInputLogits:      {
-      if (predictor->layer_predict_enabled[layer_id]) {
+      if (predictor->layer_predict_enabled(layer_id)) {
       // if (layer_id % metas->layer_predict_interval == 0) {
         add_one_task(PredictJob(layer_id));
       }
@@ -141,7 +141,7 @@ void PredictWorker::on_moe_layer_logits_recorded(int layer_id) {
     case kFirstMoeAttnInputLogits: { break;}
     case kMoeAttnInputLogits:      { break;}
     case kMoeLayerLogits:          {
-      if (predictor->layer_predict_enabled[layer_id]) {
+      if (predictor->layer_predict_enabled(layer_id)) {
         add_one_task(PredictJob(layer_id));
       }
       break;
