@@ -14,6 +14,8 @@ if (CMAKE_BUILD_TYPE STREQUAL "Release")
   set(COMMON_FLAGS " -O3 -g ")
 endif()
 
+set(COMMON_FLAGS " ${COMMON_FLAGS} -Wno-sign-compare -Wno-attributes ")
+
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 set(CMAKE_CXX_STANDARD 17)
