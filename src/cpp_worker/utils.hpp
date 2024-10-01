@@ -116,6 +116,11 @@ enum PredictInputMode {
   kMoeLayerLogits, // for a N moe-layer model, there will be N+1 logits
 };
 
+enum PredictorType {
+  kLegacyPredictor = 0,
+  kSepPredictor,
+};
+
 class ModuleMeta {
   // std::unordered_map<std::string, std::pair<int,int>> module_name_to_expert_idx;
   // std::vector<std::string> expert_idx_to_module_name;
@@ -133,6 +138,7 @@ class ModuleMeta {
   bool early_preempt = true;
   std::string cache_policy = "fifo";
   PredictInputMode predict_input_mode = kOneToken;
+  PredictorType predictor_type = kLegacyPredictor;
   int predict_input_reuse_distance_max = 10;
   int predict_input_decay = 2;    // decode cumsum weight decay
   int layer_predict_interval   = -1; // the frequency of layer prediction

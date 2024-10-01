@@ -35,6 +35,7 @@ def parse_args(args = None):
   # parser.add_argument("--predict_mode", type=str, choices=["entire_token", "layer_window"], default='one_token')
   # layer_predict_interval
   # layer_predict_window
+  parser.add_argument("--predictor_type", type=str, choices=["legacy", "sep"], default="legacy")
   parser.add_argument("--layer_predict_interval",   type=int, default=None)
   parser.add_argument("--layer_predict_max_window", type=int, default=None)
   parser.add_argument("--layer_predict_use_last_output", action=CustomBooleanAction, default=False, dest='layer_predict_replace_first_input_with_last_output')

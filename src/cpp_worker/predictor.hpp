@@ -4,6 +4,7 @@
 #include <unistd.h>
 #include <dirent.h>
 #include <cuda_runtime.h>
+#include "profiler.hpp"
 #include "utils.hpp"
 
 struct PredictOutput {
@@ -42,6 +43,7 @@ class PredictorBase {
   std::shared_ptr<ModuleMeta> metas;
   PredictorBase(std::shared_ptr<ModuleMeta> metas) : metas(metas) {}
  public:
+  std::shared_ptr<TimeProfiler> profiler;
   cudaStream_t compute_stream;
   virtual PredictOutput predict(int input_layer_id) = 0;
   virtual void load_model(std::string model_path) = 0;
@@ -50,10 +52,12 @@ class PredictorBase {
   virtual void record_moe_attn_logits(int layer_id, torch::Tensor attn_logits) {};
   virtual void record_moe_layer_logits(int layer_id, torch::Tensor layer_logits) {};
   virtual void end_of_one_token_prediction() {};
-  virtual void start_of_new_sequence() = 0;
+  virtual void start_of_new_sequence() {};
   virtual void slice_predict_output_layer(PredictOutput &output) = 0;
   virtual bool layer_predict_enabled(int layer_id) = 0;
   virtual ~PredictorBase() = default;
+
+  static std::shared_ptr<PredictorBase> create(std::shared_ptr<ModuleMeta> metas);
 };
 
 class LegacyPredictor : public PredictorBase {
@@ -130,4 +134,30 @@ class LegacyPredictor : public PredictorBase {
   //   last_use_distance_buffer.fill_(0);
   //   weighted_access_freq_sum_buffer.fill_(0);
   // }
+};
+
+class SepPredictor : public PredictorBase {
+ private:
+  struct PredictSepModel {
+    std::unordered_map<int, torch::jit::script::Module> models;
+    // int input_layer_id;
+    std::vector<int> enabled_output_layers;
+    int num_output_layer() const { return enabled_output_layers.size(); }
+  };
+  std::unordered_map<int, torch::Tensor> moe_layer_logits_buffer_list;
+  std::unordered_map<int, cudaEvent_t> logits_record_event;
+  std::unordered_map<int, PredictSepModel> predict_models;
+
+ private:
+  friend class PredictWorker;
+
+ public:
+  SepPredictor(std::shared_ptr<ModuleMeta> metas);
+  void load_model(std::string model_path) override;
+
+  PredictOutput predict(int input_layer_id) override;
+
+  void record_moe_layer_logits(int layer_id, torch::Tensor layer_logits) override;
+  bool layer_predict_enabled(int layer_id) override { return predict_models[layer_id].enabled_output_layers.size() > 0; }
+  void slice_predict_output_layer(PredictOutput &output) override;
 };

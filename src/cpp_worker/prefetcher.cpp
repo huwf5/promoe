@@ -333,6 +333,10 @@ PrefetchMngr::PrefetchMngr(std::shared_ptr<ModuleMeta> metas,
       auto time = p->to_tensor(TimeProfiler::kModelForward).index({idx_is_prefill}).index({torch::indexing::Slice(2)}); // skip first 2 and last 1iteration
       std::cout << "prefill_stage_forward_time:" << time.mean(torch::kFloat32).item() << std::endl;
     }
+    {
+      auto time = p->to_tensor(TimeProfiler::kPredictTime).index({torch::indexing::Slice(10)}); // skip first 10 and last 1iteration
+      std::cout << "predict_time:" << time.mean(torch::kFloat32).item() << std::endl;
+    }
   });
   precision_profiler = std::make_shared<PrecisionProfiler>();
   precision_profiler->decode_expert_per_token = metas->num_expert_per_token;
@@ -354,6 +358,7 @@ PrefetchMngr::PrefetchMngr(std::shared_ptr<ModuleMeta> metas,
   } else {
     this->set_compute_stream(compute_stream_param);
   }
+  predictor->profiler = profiler;
 }
 
 void PrefetchMngr::set_compute_stream(int64_t stream) {
@@ -400,7 +405,7 @@ void PrefetchMngr::record_then_predict_and_prefetch(int layer_id, int64_t* exper
   // }
 }
 PrefetchMngr::~PrefetchMngr() {
-  predict_thread->add_one_task(PredictJob());
+  // predict_thread->add_one_task(PredictJob());
   predict_thread->add_prefetch_layer_budget();
   fetch_thread->exit();
   predict_thread->exit();

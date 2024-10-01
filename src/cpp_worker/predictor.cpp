@@ -188,6 +188,7 @@ PredictOutput LegacyPredictor::predict(int input_layer_id) {
   // } else if (metas->predict_input_mode == kWeighedDecodeCumsum) {
   //   input = this->weighted_access_freq_sum_buffer.clone();
   // }
+  Timer t;
   auto bs = input.size(0);
   std::vector<torch::jit::IValue> inputs{input.flatten(1, -1)};
   // std::vector<torch::jit::IValue> inputs{input.flatten().unsqueeze(0)};
@@ -195,6 +196,7 @@ PredictOutput LegacyPredictor::predict(int input_layer_id) {
   torch::Tensor output = model.forward(inputs).toTensor();
   output = output.reshape({bs, -1, metas->num_expert});
   output = output.sum({0});
+  profiler->push(TimeProfiler::kPredictTime, t.dur_us());
   return PredictOutput(output, input_layer_id, predict_models[input_layer_id].orig_output_start_layer);
   // return model.forward(inputs).toTensor().reshape({-1, metas->num_expert});
 }
@@ -435,4 +437,162 @@ void LegacyPredictor::slice_predict_output_layer(PredictOutput &output) {
   });
   output.slice_layer(p_m_metas.slice_start, p_m_metas.slice_stop);
   CHECK(output.start_output_layer_id == p_m_metas.output_layer_start());
+}
+
+PredictOutput SepPredictor::predict(int input_layer_id) {
+  TRACE_EVENT_GURAD(kPredictor, "predict " + std::to_string(input_layer_id));
+  LOG(DEBUG) << "predictor, predict " + std::to_string(input_layer_id);
+  CHECK(layer_predict_enabled(input_layer_id)) << "layer " << input_layer_id << " not enabled";
+  torch::Tensor input;
+  auto * model = &predict_models[0];
+  {
+    TRACE_EVENT_GURAD_NAME(kPredictor, "logits copy", guardguard);
+    CUDA_CALL(cudaEventSynchronize(logits_record_event[input_layer_id]));
+  }
+  switch (metas->predict_input_mode) {
+    case kNoPredict:                {
+      return PredictOutput::empty(metas->num_layer, input_layer_id, -1);
+    }
+    case kMoeLayerLogits: {
+      input = this->moe_layer_logits_buffer_list[input_layer_id];
+      if (input.numel() == 0) {
+        LOG(DEBUG) << "skip prediction due to prefill";
+        return PredictOutput::empty(predict_models[input_layer_id].num_output_layer(), input_layer_id, predict_models[input_layer_id].enabled_output_layers[0]);
+      }
+      if (predict_models[input_layer_id].num_output_layer() == 0) {
+        LOG(ERROR) << "skip prediction due to empty output layers";
+        return PredictOutput::empty(predict_models[input_layer_id].num_output_layer(), input_layer_id, predict_models[input_layer_id].enabled_output_layers[0]);
+      }
+      LOG_BLOCK(DEBUG, logger, {
+        logger << "predictor, predict with input shape " << input.sizes() << " " << input.numel();
+      });
+      model = &predict_models[input_layer_id];
+      input = input.clone().to(torch::kFloat32);
+      break;
+    }
+    default: {
+      CHECK(false) << "Unknown predict input mode";
+    }
+  }
+  Timer t;
+  auto bs = input.size(0);
+  std::vector<torch::jit::IValue> inputs{input.flatten(1, -1)};
+  // std::vector<torch::jit::IValue> inputs{input.flatten().unsqueeze(0)};
+  torch::NoGradGuard no_grad;
+  std::vector<torch::Tensor> per_layer_outputs;
+  for (auto output_layer_id : model->enabled_output_layers) {
+    auto& m = model->models[output_layer_id];
+    torch::Tensor output = m.forward(inputs).toTensor().reshape({bs, -1, metas->num_expert});
+    per_layer_outputs.push_back(output);
+  }
+  torch::Tensor output;
+  if (per_layer_outputs.size() == 1) {
+    output = per_layer_outputs[0];
+  } else {
+    output = torch::cat(per_layer_outputs, 1);
+  }
+  if (output.size(0) > 1  ) {
+    output = output.sum({0});
+  } else {
+    output = output.reshape({-1, metas->num_expert});
+  }
+  profiler->push(TimeProfiler::kPredictTime, t.dur_us());
+  return PredictOutput(output, input_layer_id, predict_models[input_layer_id].enabled_output_layers[0]);
+}
+
+
+void SepPredictor::load_model(std::string model_path) {
+  struct stat path_stat;
+  auto stat_ret = stat(model_path.c_str(), &path_stat);
+  CHECK(stat_ret == 0) << "Model file not found: " << model_path;
+  CHECK(S_ISDIR(path_stat.st_mode)) << "Model file is not a directory: " << model_path;
+  // fixme: meta json?
+
+  for (int l = 0; l < metas->num_layer + 1; l++) {
+    predict_models[l] = PredictSepModel();
+  }
+  c10::Device cpu_device(c10::DeviceType::CPU);
+  auto predict_layers = build_predict_layer_mapping(metas.get());
+  for (int src_l = 0; src_l < metas->num_layer + 1; src_l++) {
+    for (int dst_l = predict_layers[src_l].first; dst_l < predict_layers[src_l].second; dst_l++) {
+      predict_models[src_l].models[dst_l] = torch::jit::load(model_path + "/" + std::to_string(src_l) + "-" + std::to_string(dst_l) + ".pt", cpu_device);
+      predict_models[src_l].models[dst_l].eval();
+      predict_models[src_l].enabled_output_layers.push_back(dst_l);
+    }
+  }
+}
+
+void SepPredictor::record_moe_layer_logits(int layer_id, torch::Tensor layer_logits) {
+  TRACE_EVENT_GURAD(kHook, "record_moe_layer_logits " + std::to_string(layer_id));
+  LOG(DEBUG) << "predictor, record_moe_layer_logits " << layer_id;
+  switch (metas->predict_input_mode) {
+    case kNoPredict:               { break; }
+    case kOneToken:                { break; }
+    case kDecodeCumsum:            { break; }
+    case kLastUseDistance:         { break; }
+    case kWeighedDecodeCumsum:     { break; }
+    case kFirstMoeAttnInputLogits: { break; }
+    case kMoeAttnInputLogits:      { break; }
+    case kMoeLayerLogits: {
+      CHECK(layer_logits.dim() == 3) << "input logits must be in shape [num_batch, seq_len, num_expert], but found " << layer_logits.sizes();
+      // CHECK(layer_logits.size(0) == 1) << "batch > 1 not supported";
+      if (layer_logits.size(1) == 0) {
+        LOG(ERROR) << "predictor, skip record due to empty";
+        moe_layer_logits_buffer_list[layer_id] = torch::empty({0});
+        break;
+      }
+      if (layer_logits.size(1) != 1) {
+        LOG(DEBUG) << "predictor, skip record due to prefill";
+        moe_layer_logits_buffer_list[layer_id] = torch::empty({0});
+        break;
+      }
+      if ((layer_id % metas->num_layer) % metas->layer_predict_interval != 0) {
+        LOG(DEBUG) << "predictor, skip record due to interval";
+        moe_layer_logits_buffer_list[layer_id] = torch::empty({0});
+        break;
+      }
+      if (metas->layer_predict_replace_first_input_with_last_output && layer_id == 0) {
+        LOG(DEBUG) << "predictor, skip record due to replace_first_input_with_last_output";
+        moe_layer_logits_buffer_list[layer_id] = torch::empty({0});
+        break;
+      }
+      LOG(DEBUG) << "predictor, record attn logits";
+      moe_layer_logits_buffer_list[layer_id] = torch::empty_like(layer_logits, layer_logits.options().device(torch::kCPU).pinned_memory(true));
+      CUDA_CALL(cudaMemcpyAsync(moe_layer_logits_buffer_list[layer_id].data_ptr(), layer_logits.data_ptr(), layer_logits.nbytes(), cudaMemcpyDeviceToHost, this->compute_stream));
+      CUDA_CALL(cudaEventRecord(logits_record_event[layer_id], this->compute_stream));
+      // moe_layer_logits_buffer_list[layer_id] = layer_logits.to("cpu");
+      break;
+    }
+    default: {
+      CHECK(false) << "Unknown predict input mode";
+    }
+  }
+}
+SepPredictor::SepPredictor(std::shared_ptr<ModuleMeta> metas) : PredictorBase(metas) {
+  for (int l = 0; l <= metas->num_layer; l++) {
+    logits_record_event[l] = 0;
+    CUDA_CALL(cudaEventCreateWithFlags(&logits_record_event[l], cudaEventDisableTiming));
+  }
+}
+void SepPredictor::slice_predict_output_layer(PredictOutput &output) {
+  // const auto & p_m_metas = predict_models[output.input_layer_id];
+  // LOG_BLOCK(DEBUG, logger, {
+  //   logger << "predict worker: predict " << output.input_layer_id << " " << output.prob.sizes() << ", slice it with [" << p_m_metas.slice_start << ":" << p_m_metas.slice_stop << "]";
+  // });
+  // output.slice_layer(p_m_metas.slice_start, p_m_metas.slice_stop);
+  // CHECK(output.start_output_layer_id == p_m_metas.output_layer_start());
+}
+
+std::shared_ptr<PredictorBase> PredictorBase::create(std::shared_ptr<ModuleMeta> metas) {
+  switch (metas->predictor_type) {
+    case kLegacyPredictor: {
+      return std::make_shared<LegacyPredictor>(metas);
+    }
+    case kSepPredictor: {
+      return std::make_shared<SepPredictor>(metas);
+    }
+    default: {
+      CHECK(false) << "Unknown predictor type";
+    }
+  }
 }

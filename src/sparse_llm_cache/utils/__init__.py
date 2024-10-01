@@ -141,6 +141,7 @@ def inject_model(
     cache_policy : str = 'lru',
     cache_device : str|int = 'cuda',
     reorder_experts : bool = True,
+    predictor_type : str = None,
     promote_hit_in_prefetch : bool = True,
     early_preempt : bool = True,
     # metadatas of model
@@ -231,6 +232,10 @@ def inject_model(
     else:
       cache_len = round(cache_rate * num_moe_layer * num_expert_per_layer)
 
+  if predictor_type is None:
+    predictor_type = 'legacy'
+    print(f'using legacy predictor')
+
   if predict_input_mode is None:
     predict_input_mode = 'one_token'
 
@@ -269,13 +274,18 @@ def inject_model(
     'moe_layer_logits': cpp_worker.kMoeLayerLogits,
   }[predict_input_mode]
 
+  meta.predictor_type = {
+    'legacy': cpp_worker.kLegacyPredictor,
+    'sep': cpp_worker.kSepPredictor,
+  }[predictor_type]
+
   meta.layer_predict_interval = layer_predict_interval
   meta.layer_predict_max_window = layer_predict_max_window
 
   meta.handle_uninited_configs()
 
   model_loader  = cpp_worker.ModelLoader(meta)
-  predictor     = cpp_worker.LegacyPredictor(meta)
+  predictor     = cpp_worker.PredictorBase.create(meta)
   prefetch_mngr = cpp_worker.PrefetchMngr(meta, model_loader, predictor)
   torch.cuda.set_stream(torch.cuda.ExternalStream(prefetch_mngr.compute_stream, 0))
   print("initializing cache lib...done")
