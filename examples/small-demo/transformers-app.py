@@ -4,6 +4,7 @@ os.environ['HF_HUB_OFFLINE'] = "1"
 os.environ['HUGGINGFACE_OFFLINE'] = "1"
 
 from transformers.utils import logging
+from transformers.generation.utils import TimeProfiler
 import torch
 torch.cuda.set_device(0)
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -36,10 +37,10 @@ model = AutoModelForCausalLM.from_pretrained(
   trust_remote_code=True,
   revision=cache_configs['model_revision'],
 )
-if 'Mixtral' in model_id:
-  import auto_gptq
-  model = auto_gptq.exllama_set_max_input_length(model, 7200)
 print("loading model...done", time.time() - load_time_start)
+
+time_profiler = TimeProfiler()
+model._time_profiler = time_profiler
 
 def gen_batch(text_list, do_print=False, max_new_tokens=100):
   inputs = tokenizer(text_list, return_tensors="pt", padding=True).to(f"cuda") # input_ids, attention_mask
@@ -75,3 +76,5 @@ for seq_id,text_list in enumerate(dl):
   start_time = time.time()
   input_len, output_len = gen_batch(text_list, max_new_tokens=128, do_print=True)
   print(input_len, output_len, time.time() - start_time, flush=True)
+
+time_profiler.log()
