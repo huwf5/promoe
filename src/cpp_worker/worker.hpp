@@ -42,13 +42,12 @@ class WorkerThreadBase {
  public:
   void set_cpu_affinity(std::vector<int> cpu_ids) {
     if (worker_thread.native_handle()) {
-      auto pthread_id = pthread_self();
       cpu_set_t cpuset;
       CPU_ZERO(&cpuset);
       for (auto cpu_id : cpu_ids) {
         CPU_SET(cpu_id, &cpuset);
       }
-      int result = pthread_setaffinity_np(pthread_id, sizeof(cpu_set_t), &cpuset);
+      int result = pthread_setaffinity_np(worker_thread.native_handle(), sizeof(cpu_set_t), &cpuset);
       if (result != 0) {
         std::cerr << "Error setting thread affinity: " << std::strerror(result) << std::endl;
       }
