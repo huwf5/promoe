@@ -24,6 +24,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     .def_readwrite("promote_hit_in_prefetch",      &ModuleMeta::promote_hit_in_prefetch)
     .def_readwrite("early_preempt",                &ModuleMeta::early_preempt)
     .def_readwrite("predict_input_mode",           &ModuleMeta::predict_input_mode)
+    .def_readwrite("predictor_type",               &ModuleMeta::predictor_type)
     .def_readwrite("layer_predict_interval",       &ModuleMeta::layer_predict_interval)
     .def_readwrite("layer_predict_max_window",     &ModuleMeta::layer_predict_max_window)
     .def_readwrite("layer_predict_replace_first_input_with_last_output",     &ModuleMeta::layer_predict_replace_first_input_with_last_output)
@@ -31,13 +32,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     .def("init_param_list", &ModuleMeta::init_param_list)
   ;
 
-  py::class_<Predictor, std::shared_ptr<Predictor>>(m, "Predictor")
+  py::class_<PredictorBase, std::shared_ptr<PredictorBase>>(m, "PredictorBase")
+    // .def(py::init<std::shared_ptr<ModuleMeta>>())
+    // .def("load_model",          &PredictorBase::load_model)
+    .def("create",              &PredictorBase::create)
+    .def("load_model",          &PredictorBase::load_model)
+  ;
+  py::class_<LegacyPredictor, std::shared_ptr<LegacyPredictor>, PredictorBase>(m, "LegacyPredictor")
     .def(py::init<std::shared_ptr<ModuleMeta>>())
-    .def("load_model",          &Predictor::load_model)
-    .def("predict",             &Predictor::predict)
-    // .def("clear_access_buffer", &Predictor::clear_access_buffer)
-    .def("add_one_layer", static_cast<void (Predictor::*)(int, int64_t*, size_t)>(&Predictor::add_one_layer))
-    .def("add_one_layer", static_cast<void (Predictor::*)(int, torch::Tensor)>(&Predictor::add_one_layer))
+    .def("load_model",          &LegacyPredictor::load_model)
   ;
 
   py::class_<ModelLoader, std::shared_ptr<ModelLoader>>(m, "ModelLoader")
@@ -60,7 +63,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   ;
 
   py::class_<PrefetchMngr, std::shared_ptr<PrefetchMngr>>(m, "PrefetchMngr")
-    .def(py::init<std::shared_ptr<ModuleMeta>, std::shared_ptr<ModelLoader>, std::shared_ptr<Predictor>>())
+    .def(py::init<std::shared_ptr<ModuleMeta>, std::shared_ptr<ModelLoader>, std::shared_ptr<PredictorBase>>())
     .def("launch_thread",           &PrefetchMngr::launch_thread)
     .def("init_gpu_mem_buffer",     &PrefetchMngr::init_gpu_mem_buffer)
     .def("reload_env",              &PrefetchMngr::reload_env)
@@ -120,6 +123,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     .value("kFirstMoeAttnInputLogits", PredictInputMode::kFirstMoeAttnInputLogits)
     .value("kMoeAttnInputLogits",      PredictInputMode::kMoeAttnInputLogits)
     .value("kMoeLayerLogits",          PredictInputMode::kMoeLayerLogits)
+    .export_values();
+
+  py::enum_<PredictorType>(m, "PredictorType")
+    .value("kLegacyPredictor", PredictorType::kLegacyPredictor)
+    .value("kSepPredictor", PredictorType::kSepPredictor)
     .export_values();
 
   py::enum_<TimeProfiler::TimeType>(m, "TimeType")

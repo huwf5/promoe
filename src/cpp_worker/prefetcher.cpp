@@ -179,7 +179,10 @@ void PrefetchMngr::report_one_layer(int layer_id, torch::Tensor experts) {
 void PrefetchMngr::report_one_layer(int layer_id, int64_t* experts, int64_t num_expert) {
   TRACE_EVENT_GURAD(kHook, "report_one_layer");
   cache_stats->forward();
-  predict_thread->consume_prefetch_layer_progress();
+  LOG(INFO) << "prefetcher: consume prefetch layer progress at layer " << layer_id;
+  int progress_idx = predict_thread->consume_prefetch_layer_progress();
+  LOG(INFO) << "prefetcher: consume prefetch layer progress at layer " << layer_id << " done " << progress_idx;
+
   preempt_and_launch_one_layer(layer_id, experts, num_expert); // handle reorder, launch precise task, clear prefetch queue
   profiler->add(TimeProfiler::kCntActivatedExpert, num_expert);
   precision_profiler->record_activated_experts(layer_id, experts, num_expert);
@@ -188,6 +191,7 @@ void PrefetchMngr::report_one_layer(int layer_id, int64_t* experts, int64_t num_
 void PrefetchMngr::one_moe_layer_done(int layer_id) {
   TRACE_EVENT_GURAD(kHook, "one_moe_layer_done");
   if (metas->early_preempt == false) {
+    LOG(INFO) << "prefetcher: one moe layer done, add prefetch layer budget : " << layer_id;
     predict_thread->add_prefetch_layer_budget();
   }
   if (layer_id == metas->num_layer - 1) {
@@ -254,10 +258,17 @@ void PrefetchMngr::launch_thread() {
   predict_thread->launch();
   expert_unlocker_thread->launch();
   fetch_thread->launch();
+  if (string_is_on(GetEnv("SPARSE_CACHE_THREAD_TO_E_CORE"))) {
+    LOG(INFO) << "set cpu affinity";
+    fetch_schedule_thread->set_cpu_affinity({30});
+    predict_thread->set_cpu_affinity({0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15});
+    expert_unlocker_thread->set_cpu_affinity({28});
+    fetch_thread->set_cpu_affinity({26});
+  }
 }
 PrefetchMngr::PrefetchMngr(std::shared_ptr<ModuleMeta> metas,
                            std::shared_ptr<ModelLoader> model_loader,
-                           std::shared_ptr<Predictor> predictor,
+                           std::shared_ptr<PredictorBase> predictor,
                            int64_t compute_stream_param,
                            bool create_compute_stream,
                            TimeProfiler* profiler_ptr)
@@ -333,8 +344,13 @@ PrefetchMngr::PrefetchMngr(std::shared_ptr<ModuleMeta> metas,
       auto time = p->to_tensor(TimeProfiler::kModelForward).index({idx_is_prefill}).index({torch::indexing::Slice(2)}); // skip first 2 and last 1iteration
       std::cout << "prefill_stage_forward_time:" << time.mean(torch::kFloat32).item() << std::endl;
     }
+    {
+      auto time = p->to_tensor(TimeProfiler::kPredictTime).index({torch::indexing::Slice(10)}); // skip first 10 and last 1iteration
+      std::cout << "predict_time:" << time.mean(torch::kFloat32).item() << std::endl;
+    }
   });
   precision_profiler = std::make_shared<PrecisionProfiler>();
+  precision_profiler->decode_expert_per_token = metas->num_expert_per_token;
   predict_thread->init(fetch_schedule_thread.get(), predictor.get(), cache.get(), metas.get());
   predict_thread->precision_profiler = precision_profiler.get();
   fetch_thread->init(metas.get(), fetch_schedule_thread.get(), model_loader->mem_mngr_ctx.get(), (cudaStream_t)copy_stream);
@@ -353,6 +369,7 @@ PrefetchMngr::PrefetchMngr(std::shared_ptr<ModuleMeta> metas,
   } else {
     this->set_compute_stream(compute_stream_param);
   }
+  predictor->profiler = profiler;
 }
 
 void PrefetchMngr::set_compute_stream(int64_t stream) {
@@ -369,7 +386,7 @@ void PrefetchMngr::report_moe_attn_logits(int layer_id, torch::Tensor attn_logit
 }
 
 void PrefetchMngr::report_moe_layer_logits(int layer_id, torch::Tensor layer_logits) {
-  LOG_BLOCK(DEBUG, logger, {
+  LOG_BLOCK(INFO, logger, {
     logger << "prefetch mngr, report_moe_layer_logits " << layer_id << ", " << layer_logits.sizes();
   });
   predictor->record_moe_layer_logits(layer_id, layer_logits);
@@ -399,7 +416,7 @@ void PrefetchMngr::record_then_predict_and_prefetch(int layer_id, int64_t* exper
   // }
 }
 PrefetchMngr::~PrefetchMngr() {
-  predict_thread->add_one_task(PredictJob());
+  // predict_thread->add_one_task(PredictJob());
   predict_thread->add_prefetch_layer_budget();
   fetch_thread->exit();
   predict_thread->exit();

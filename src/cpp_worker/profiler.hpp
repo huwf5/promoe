@@ -269,6 +269,7 @@ class TimeProfiler : public std::enable_shared_from_this<TimeProfiler> {
     kPrefetchHitCnt,  // per forward
     kPrefetchMissCnt, // per forward
     kSeqLen, // per forward
+    kPredictTime, // per predict
     kNumTimeType,
   };
   TimeProfiler() {
@@ -282,6 +283,7 @@ class TimeProfiler : public std::enable_shared_from_this<TimeProfiler> {
     metric_metas[ kPrefetchHitCnt     ].is_cum = true; metric_metas[ kPrefetchHitCnt     ].should_drop_last = true;
     metric_metas[ kPrefetchMissCnt    ].is_cum = true; metric_metas[ kPrefetchMissCnt    ].should_drop_last = true;
     metric_metas[ kSeqLen             ].is_cum = false; metric_metas[ kSeqLen             ].should_drop_last = false;
+    metric_metas[ kPredictTime        ].is_cum = false; metric_metas[ kPredictTime        ].should_drop_last = false;
     buffer.resize(kNumTimeType);
     for (int i = 0; i < kNumTimeType; i++) {
       auto &b = buffer[i];
@@ -342,6 +344,7 @@ class TimerGuard {
 
 class PrecisionProfiler {
  public:
+  int decode_expert_per_token = 0;
   class LayerInfo {
    public:
     int layer_id;

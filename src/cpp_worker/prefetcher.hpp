@@ -154,7 +154,7 @@ class PrefetchMngr {
 public:
   std::shared_ptr<ModuleMeta>      metas;
   std::shared_ptr<ModelLoader>     model_loader;
-  std::shared_ptr<Predictor>       predictor;
+  std::shared_ptr<PredictorBase>   predictor;
   std::shared_ptr<CacheStatistics> cache_stats;
   std::shared_ptr<TimeProfiler>    profiler;
   std::shared_ptr<CacheMngr>       cache;
@@ -167,7 +167,7 @@ public:
 
   PrefetchMngr(std::shared_ptr<ModuleMeta> metas,
                std::shared_ptr<ModelLoader> model_loader,
-               std::shared_ptr<Predictor> predictor,
+               std::shared_ptr<PredictorBase> predictor,
                int64_t compute_stream = 0,
                bool create_compute_stream = true,
                TimeProfiler* profiler = nullptr);

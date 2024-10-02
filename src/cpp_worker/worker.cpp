@@ -5,61 +5,60 @@
 
 void PredictWorker::do_one_task_impl(PredictJob job) {
   TRACE_EVENT_GURAD(kPredictor, "predict thread " + std::to_string(job.input_layer_id));
-  const auto & p_m_metas = predictor->predict_model_metas[job.input_layer_id];
-  auto prob = predictor->predict(job.input_layer_id);
-  LOG_BLOCK(DEBUG, logger, {
-    logger << "predict worker: predict " << job.input_layer_id << " " << prob.sizes() << ", slice it with [" << p_m_metas.slice_start << ":" << p_m_metas.slice_stop << "]";
-  });
-  prob = prob.slice(0, p_m_metas.slice_start, p_m_metas.slice_stop);
-  auto num_predicted_layers = prob.size(0);
-  CHECK(prob.size(1) == metas->num_expert || prob.size(1) == 0);
-  if (metas->cache_policy == "nn" && prob.size(1) > 0) {
-    cache->update_priority(prob, p_m_metas.output_layer_start());
+  auto pred_result = predictor->predict(job.input_layer_id);
+
+  predictor->slice_predict_output_layer(pred_result);
+
+  auto num_predicted_layers = pred_result.num_output_layer();
+  CHECK(pred_result.num_output_expert() == metas->num_expert || pred_result.num_output_expert() == 0);
+  if (metas->cache_policy == "nn" && pred_result.num_output_expert() > 0) {
+    cache->update_priority(pred_result.prob, pred_result.start_output_layer_id);
   }
-  auto sorted = prob.sort(-1, true);
-  // auto predicted_expert_prob = std::get<0>(sorted).slice(1, 0,
-  // metas->num_predict_expert_per_layer);
-  auto per_layer_predict_num_expert_in_cur_iter = std::min<size_t>(metas->num_predict_expert_per_layer, cache->query_per_layer_cache_len());
-  per_layer_predict_num_expert_in_cur_iter = std::min<size_t>(per_layer_predict_num_expert_in_cur_iter, prob.size(1));
-  auto predicted_expert = std::get<1>(sorted).slice(1, 0, per_layer_predict_num_expert_in_cur_iter);
+  pred_result.rank_experts(metas->num_predict_expert_per_layer);
 
   LOG_BLOCK(DEBUG, logger, {
-    logger << "predicted shape " << predicted_expert.sizes() << "\n";
+    logger << "predicted shape " << pred_result.experts.sizes() << "\n";
   });
   LOG_BLOCK(DEBUG, logger, {
     for (int l_in_slice = 0; l_in_slice < num_predicted_layers; l_in_slice++) {
-      int layer_idx = p_m_metas.output_layer(l_in_slice);
-      logger << "predicted expert" << layer_idx << ":" << tensor_to_str(predicted_expert[l_in_slice]) << "\n";
+      int layer_idx = pred_result.start_output_layer_id + l_in_slice;
+      logger << "predicted expert" << layer_idx << ":" << tensor_to_str(pred_result.experts[l_in_slice]) << "\n";
     }
   });
 
   {
-    TRACE_EVENT_GURAD(kPredictor, "add_multi_layer_task [" + std::to_string(job.input_layer_id) + "," + std::to_string(num_predicted_layers + job.input_layer_id) + ")");
-    size_t per_layer_num_expert = predicted_expert.size(1);
-    for (int l_in_slice = 0; l_in_slice < num_predicted_layers; l_in_slice++) {
-      int layer_idx = p_m_metas.output_layer(l_in_slice);
-      precision_profiler->record_predicted_experts(layer_idx, predicted_expert[l_in_slice].data_ptr<int64_t>(), per_layer_num_expert);
+    TRACE_EVENT_GURAD(kPredictor, "add_multi_layer_task [" + std::to_string(pred_result.inner_l_to_outer_l(0)) + "," + std::to_string(pred_result.inner_l_to_outer_l(num_predicted_layers)) + ")");
+    size_t per_layer_num_expert = pred_result.num_top_experts();
+    for (int inner_l = 0; inner_l < num_predicted_layers; inner_l++) {
+      int layer_idx = pred_result.inner_l_to_outer_l(inner_l);
+      precision_profiler->record_predicted_experts(layer_idx, pred_result.top_experts(inner_l), per_layer_num_expert);
     }
-    for (int l_in_slice = 0; l_in_slice < num_predicted_layers; l_in_slice++) {
-      int layer_idx = p_m_metas.output_layer(l_in_slice);
+    for (int inner_l = 0; inner_l < num_predicted_layers; inner_l++) {
+      int layer_idx = pred_result.inner_l_to_outer_l(inner_l);
       {
-        LOG(DEBUG) << "predict worker: add layer task " << layer_idx << ", wait for budget";
+        LOG(INFO) << "predict worker: add layer task " << layer_idx << ", wait for budget";
         TRACE_EVENT_GURAD(kPredictor, "wait for budget " + std::to_string(layer_idx));
-        while (sem_trywait(&prefetch_layer_budget) == -1) {
+        while (true) {
+          int budge_remaining = prefetch_layer_budget.try_pop(true);
+          if (budge_remaining != -1) {
+            LOG(INFO) << "predict worker: add layer task now " << layer_idx << ", wait for budget done, remaining " << budge_remaining;
+            break;
+          }
           if (should_exit()) { return; }
         }
       }
-      LOG(DEBUG) << "predict worker: add layer task now " << layer_idx;
+      LOG(INFO) << "predict worker: add layer task now " << layer_idx;
       PrefetchLayerTask task;
-      task.layer_idx = layer_idx;
-      task.expert_idxs = predicted_expert[l_in_slice].data_ptr<int64_t>();
-      task.num_expert = per_layer_num_expert;
+      task.layer_idx   = layer_idx;
+      task.expert_idxs = pred_result.top_experts(inner_l);
+      task.num_expert  = per_layer_num_expert;
       auto wait_handler = fetch_schedule_thread->add_one_task(&task);
       fetch_schedule_thread->wait_progress(wait_handler);
       // fetch_schedule_thread->add_one_layer_task(layer_idx, predicted_expert[layer_idx].data_ptr<int64_t>(), per_layer_num_expert);
-      sem_post(&prefetch_layer_progress);
+      prefetch_layer_progress.push(layer_idx);
     }
   }
+  // fixme: fix this condition
   if (num_predicted_layers + job.input_layer_id == metas->num_layer) {
     predictor->end_of_one_token_prediction();
   }
@@ -97,7 +96,7 @@ void FetchWorker::do_one_task_impl(CopyTask *task) {
 }
 void PredictWorker::add_prefetch_layer_budget() {
   LOG(DEBUG) << "predict worker: add prefetch layer budget";
-  sem_post(&prefetch_layer_budget);
+  prefetch_layer_budget.push(0);
 }
 void PredictWorker::on_one_iter_done() {
   LOG(DEBUG) << "predict workers, one iter done";
@@ -127,7 +126,7 @@ void PredictWorker::on_moe_attn_input_logits_recorded(int layer_id) {
       break;
     }
     case kMoeAttnInputLogits:      {
-      if (predictor->layer_predict_enabled[layer_id]) {
+      if (predictor->layer_predict_enabled(layer_id)) {
       // if (layer_id % metas->layer_predict_interval == 0) {
         add_one_task(PredictJob(layer_id));
       }
@@ -148,7 +147,7 @@ void PredictWorker::on_moe_layer_logits_recorded(int layer_id) {
     case kFirstMoeAttnInputLogits: { break;}
     case kMoeAttnInputLogits:      { break;}
     case kMoeLayerLogits:          {
-      if (predictor->layer_predict_enabled[layer_id]) {
+      if (predictor->layer_predict_enabled(layer_id)) {
         add_one_task(PredictJob(layer_id));
       }
       break;

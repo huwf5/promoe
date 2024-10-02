@@ -43,10 +43,12 @@ enum class LogLevel { TRACE, DEBUG, INFO, WARNING, ERROR, FATAL };
 // #define CHECK_GE(x, y) CHECK((x) >= (y))
 // #define CHECK_EQ(x, y) CHECK((x) == (y))
 // #define CHECK_NE(x, y) CHECK((x) != (y))
+/*
 // #define CHECK_NOTNULL(x)                                     \
 //   ((x) == NULL ? LogMessageFatal(__FILE__, __LINE__) \
 //                      << "Check  notnull: " #x << ' ',        \
 //    (x) : (x))  // NOLINT(*)
+*/
 
 /*!
  * \brief Protected CUDA call.

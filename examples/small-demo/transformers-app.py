@@ -22,7 +22,7 @@ load_time_start = time.time()
 logging.disable_progress_bar()
 model_id = cache_configs['model_id']
 torch_dtype = 'auto'
-if 'Mixtral' in model_id or 'GPTQ' in model_id:
+if 'GPTQ' in model_id:
   torch_dtype = None
 print("dtype is", torch_dtype)
 tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
@@ -73,9 +73,5 @@ for seq_id,text_list in enumerate(dl):
     print("max_num_batch reached")
     break
   start_time = time.time()
-  try:
-    input_len, output_len = gen_batch(text_list, max_new_tokens=128, do_print=True)
-  except Exception as e:
-    print(f"error at seq {seq_id}")
-    print(str(e))
+  input_len, output_len = gen_batch(text_list, max_new_tokens=128, do_print=True)
   print(input_len, output_len, time.time() - start_time, flush=True)
