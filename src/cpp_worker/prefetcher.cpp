@@ -179,7 +179,10 @@ void PrefetchMngr::report_one_layer(int layer_id, torch::Tensor experts) {
 void PrefetchMngr::report_one_layer(int layer_id, int64_t* experts, int64_t num_expert) {
   TRACE_EVENT_GURAD(kHook, "report_one_layer");
   cache_stats->forward();
-  predict_thread->consume_prefetch_layer_progress();
+  LOG(INFO) << "prefetcher: consume prefetch layer progress at layer " << layer_id;
+  int progress_idx = predict_thread->consume_prefetch_layer_progress();
+  LOG(INFO) << "prefetcher: consume prefetch layer progress at layer " << layer_id << " done " << progress_idx;
+
   preempt_and_launch_one_layer(layer_id, experts, num_expert); // handle reorder, launch precise task, clear prefetch queue
   profiler->add(TimeProfiler::kCntActivatedExpert, num_expert);
   precision_profiler->record_activated_experts(layer_id, experts, num_expert);
@@ -188,6 +191,7 @@ void PrefetchMngr::report_one_layer(int layer_id, int64_t* experts, int64_t num_
 void PrefetchMngr::one_moe_layer_done(int layer_id) {
   TRACE_EVENT_GURAD(kHook, "one_moe_layer_done");
   if (metas->early_preempt == false) {
+    LOG(INFO) << "prefetcher: one moe layer done, add prefetch layer budget : " << layer_id;
     predict_thread->add_prefetch_layer_budget();
   }
   if (layer_id == metas->num_layer - 1) {
@@ -255,6 +259,7 @@ void PrefetchMngr::launch_thread() {
   expert_unlocker_thread->launch();
   fetch_thread->launch();
   if (string_is_on(GetEnv("SPARSE_CACHE_THREAD_TO_E_CORE"))) {
+    LOG(INFO) << "set cpu affinity";
     fetch_schedule_thread->set_cpu_affinity({30});
     predict_thread->set_cpu_affinity({0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15});
     expert_unlocker_thread->set_cpu_affinity({28});
@@ -381,7 +386,7 @@ void PrefetchMngr::report_moe_attn_logits(int layer_id, torch::Tensor attn_logit
 }
 
 void PrefetchMngr::report_moe_layer_logits(int layer_id, torch::Tensor layer_logits) {
-  LOG_BLOCK(DEBUG, logger, {
+  LOG_BLOCK(INFO, logger, {
     logger << "prefetch mngr, report_moe_layer_logits " << layer_id << ", " << layer_logits.sizes();
   });
   predictor->record_moe_layer_logits(layer_id, layer_logits);

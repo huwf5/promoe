@@ -201,6 +201,60 @@ struct PredictJob {
   PredictJob() {}
   PredictJob(int input_layer_id) : input_layer_id(input_layer_id) {}
 };
+class AtomicQueue {
+ public:
+  std::queue<int> queue_;
+  AtomicQueueLock lock_;
+  void init(int init_val = 0) {
+    for (int i = 0; i < init_val; i++) {
+      queue_.push(i);
+    }
+  }
+  void lock() {
+    lock_.lock();
+  }
+  void unlock() {
+    lock_.unlock();
+  }
+  void push(int task) {
+    lock();
+    queue_.push(task);
+    unlock();
+  }
+  int pop(bool return_size = false) {
+    while (true) {
+      lock();
+      if (queue_.empty()) {
+        unlock();
+      } else {
+        int task = queue_.front();
+        queue_.pop();
+        int size = queue_.size();
+        unlock();
+        if (return_size) {
+          return size;
+        }
+        return task;
+      }
+    }
+  }
+  int try_pop(bool return_size = false) {
+    lock();
+    if (queue_.empty()) {
+      unlock();
+      return -1;
+    }
+    int task = queue_.front();
+    queue_.pop();
+    int size = queue_.size();
+    unlock();
+    if (return_size) {
+      return size;
+    }
+    return task;
+  }
+};
+
 class PredictWorker : public WorkerThread<PredictJob> {
   FetchScheduleWorker* fetch_schedule_thread;
   PredictorBase  * predictor;
@@ -209,7 +263,11 @@ class PredictWorker : public WorkerThread<PredictJob> {
 
   PrecisionProfiler * precision_profiler;
 
-  sem_t prefetch_layer_budget, prefetch_layer_progress;
+  // SemQueue    prefetch_layer_budget;
+  // SemQueue    prefetch_layer_progress;
+  AtomicQueue prefetch_layer_budget;
+  AtomicQueue prefetch_layer_progress;
+
   friend class PrefetchMngr;
  public:
   PredictWorker() : WorkerThread<PredictJob>() {}
@@ -218,12 +276,13 @@ class PredictWorker : public WorkerThread<PredictJob> {
     this->predictor = predictor;
     this->cache = cache;
     this->metas = metas;
-    sem_init(&prefetch_layer_budget, 0, metas->max_prefetch_layer_distance);
-    sem_init(&prefetch_layer_progress, 0, 0); 
+
+    prefetch_layer_budget.init(metas->max_prefetch_layer_distance);
+    prefetch_layer_progress.init(0); 
   }
   void add_prefetch_layer_budget();
-  void consume_prefetch_layer_progress() {
-    sem_wait(&prefetch_layer_progress);
+  int  consume_prefetch_layer_progress() {
+    return prefetch_layer_progress.pop();
   }
   void on_one_iter_done();
   void on_moe_attn_input_logits_recorded(int layer_id);

@@ -36,13 +36,18 @@ void PredictWorker::do_one_task_impl(PredictJob job) {
     for (int inner_l = 0; inner_l < num_predicted_layers; inner_l++) {
       int layer_idx = pred_result.inner_l_to_outer_l(inner_l);
       {
-        LOG(DEBUG) << "predict worker: add layer task " << layer_idx << ", wait for budget";
+        LOG(INFO) << "predict worker: add layer task " << layer_idx << ", wait for budget";
         TRACE_EVENT_GURAD(kPredictor, "wait for budget " + std::to_string(layer_idx));
-        while (sem_trywait(&prefetch_layer_budget) == -1) {
+        while (true) {
+          int budge_remaining = prefetch_layer_budget.try_pop(true);
+          if (budge_remaining != -1) {
+            LOG(INFO) << "predict worker: add layer task now " << layer_idx << ", wait for budget done, remaining " << budge_remaining;
+            break;
+          }
           if (should_exit()) { return; }
         }
       }
-      LOG(DEBUG) << "predict worker: add layer task now " << layer_idx;
+      LOG(INFO) << "predict worker: add layer task now " << layer_idx;
       PrefetchLayerTask task;
       task.layer_idx   = layer_idx;
       task.expert_idxs = pred_result.top_experts(inner_l);
@@ -50,7 +55,7 @@ void PredictWorker::do_one_task_impl(PredictJob job) {
       auto wait_handler = fetch_schedule_thread->add_one_task(&task);
       fetch_schedule_thread->wait_progress(wait_handler);
       // fetch_schedule_thread->add_one_layer_task(layer_idx, predicted_expert[layer_idx].data_ptr<int64_t>(), per_layer_num_expert);
-      sem_post(&prefetch_layer_progress);
+      prefetch_layer_progress.push(layer_idx);
     }
   }
   // fixme: fix this condition
@@ -91,7 +96,7 @@ void FetchWorker::do_one_task_impl(CopyTask *task) {
 }
 void PredictWorker::add_prefetch_layer_budget() {
   LOG(DEBUG) << "predict worker: add prefetch layer budget";
-  sem_post(&prefetch_layer_budget);
+  prefetch_layer_budget.push(0);
 }
 void PredictWorker::on_one_iter_done() {
   LOG(DEBUG) << "predict workers, one iter done";
