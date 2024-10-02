@@ -396,6 +396,38 @@ def hack_transformers(**sparse_cache_kwargs):
   #   hack_auto_gptq()
 
 
+def hack_transformers_um():
+  from sparse_llm_cache.cpp_worker import to_um
+  PreTrainedModel._old_load_pretrained_model = PreTrainedModel._load_pretrained_model
+  @classmethod
+  @functools.wraps(PreTrainedModel._load_pretrained_model)
+  def new_load_pretrained_model(cls, *args, **kwargs):
+    assert len(kwargs['device_map']) == 1 and '' in kwargs['device_map'], "only support single device"
+    orig_device_map = kwargs['device_map']
+    kwargs['device_map'] = {'' : 'cpu'}
+    ret = PreTrainedModel._old_load_pretrained_model.__func__(cls, *args, **kwargs)
+    kwargs['device_map'] = orig_device_map
+    model = ret[0]
+
+    auto_infered_model_metas = auto_infer_model_metas(model.config._name_or_path, return_dict=False)
+    add_metadata_to_submodules(model, auto_infered_model_metas.expert_meta_parser)
+
+    def replace_expert_param_reference(model, filter):
+      def f(module, name):
+        def update_child_param(child_module, child_name):
+          for n,v in child_module.named_parameters():
+            child_module._parameters[n] = to_um(v)
+          for n,v in child_module.named_buffers():
+            if n.find('qweight') == -1: continue
+            child_module._buffers[n] = to_um(v)
+        recursive_traverse_childrens_leaf_only(module, update_child_param)
+      recursive_traverse_childrens(model, f, filter)
+
+    replace_expert_param_reference(model, auto_infered_model_metas.expert_name_filter)
+    return ret
+  PreTrainedModel._load_pretrained_model = new_load_pretrained_model
+
+
 '''
 Legacy
 '''
