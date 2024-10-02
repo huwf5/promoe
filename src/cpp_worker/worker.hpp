@@ -255,6 +255,34 @@ class AtomicQueue {
   }
 };
 
+class SemQueue {
+ public:
+  sem_t sem_;
+  SemQueue() {}
+  void init(int init_val = 0) {
+    sem_init(&sem_, 0, init_val);
+  }
+  ~SemQueue() {
+    sem_destroy(&sem_);
+  }
+
+  void push(int task) {
+    sem_post(&sem_);
+  }
+  int pop(bool return_size = false) {
+    sem_wait(&sem_);
+    return 0;
+  }
+  int try_pop(bool return_size = false) {
+    if (sem_trywait(&sem_) == 0) {
+      // success
+      return 0;
+    }
+    // failed
+    return -1;
+  }
+};
+
 class PredictWorker : public WorkerThread<PredictJob> {
   FetchScheduleWorker* fetch_schedule_thread;
   PredictorBase  * predictor;
@@ -263,10 +291,10 @@ class PredictWorker : public WorkerThread<PredictJob> {
 
   PrecisionProfiler * precision_profiler;
 
-  // SemQueue    prefetch_layer_budget;
-  // SemQueue    prefetch_layer_progress;
-  AtomicQueue prefetch_layer_budget;
-  AtomicQueue prefetch_layer_progress;
+  SemQueue    prefetch_layer_budget;
+  SemQueue    prefetch_layer_progress;
+  // AtomicQueue prefetch_layer_budget;
+  // AtomicQueue prefetch_layer_progress;
 
   friend class PrefetchMngr;
  public:
