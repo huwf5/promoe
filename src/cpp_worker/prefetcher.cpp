@@ -202,6 +202,7 @@ void PrefetchMngr::one_moe_layer_done(int layer_id) {
     profiler->push(TimeProfiler::kUnreadyCnt, 0);
     profiler->push(TimeProfiler::kPrefetchHitCnt, 0);
     profiler->push(TimeProfiler::kPrefetchMissCnt, 0);
+    profiler->push(TimeProfiler::kWaitTime, 0);
   }
   if (layer_id == metas->num_layer - 1) {
     predict_thread->on_one_iter_done();
@@ -235,10 +236,13 @@ void PrefetchMngr::wait_expert(int layer_id, int expert_id) {
     cache_stats->hit();
     profiler->add(TimeProfiler::kReadyCnt, 1);
   } else {
+    Timer timer;
     cache_stats->miss();
     profiler->add(TimeProfiler::kUnreadyCnt, 1);
     // todo: add timing of waiting expert ready
     expert->expert_status.wait(kLaunching);
+    auto dur = timer.dur_us();
+    profiler->add(TimeProfiler::kWaitTime, dur);
   }
   LOG(TRACE) << "waiting expert " << expert->toString() << " success";
 }
@@ -336,6 +340,14 @@ PrefetchMngr::PrefetchMngr(std::shared_ptr<ModuleMeta> metas,
     lambda_report_one_pair(TimeProfiler::kPrefetchHitCnt, TimeProfiler::kPrefetchMissCnt, 10, idx_is_decode,   "decode_stage_prefetch_hit_cnt",  "decode_stage_prefetch_miss_cnt",  "decode_stage_prefetch_hit_rate");
     lambda_report_one_pair(TimeProfiler::kPrefetchHitCnt, TimeProfiler::kPrefetchMissCnt,  2, idx_is_prefill, "prefill_stage_prefetch_hit_cnt", "prefill_stage_prefetch_miss_cnt", "prefill_stage_prefetch_hit_rate");
 
+    {
+      auto time = p->to_tensor(TimeProfiler::kWaitTime).index({idx_is_decode}).index({torch::indexing::Slice(10)}); // skip first 10 and last 1iteration
+      std::cout << "decode_stage_wait_time:" << time.mean(torch::kFloat32).item() << std::endl;
+    }
+    {
+      auto time = p->to_tensor(TimeProfiler::kWaitTime).index({idx_is_prefill}).index({torch::indexing::Slice(2)}); // skip first 2 and last 1iteration
+      std::cout << "prefill_stage_wait_time:" << time.mean(torch::kFloat32).item() << std::endl;
+    }
     {
       auto time = p->to_tensor(TimeProfiler::kModelForward).index({idx_is_decode}).index({torch::indexing::Slice(10)}); // skip first 10 and last 1iteration
       std::cout << "decode_stage_forward_time:" << time.mean(torch::kFloat32).item() << std::endl;

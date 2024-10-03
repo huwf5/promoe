@@ -4,7 +4,7 @@ os.environ['HF_HUB_OFFLINE'] = "1"
 os.environ['HUGGINGFACE_OFFLINE'] = "1"
 
 from transformers.utils import logging
-from transformers.generation.utils import TimeProfiler
+from transformers.generation.utils import TimeProfiler, recursive_attach
 import torch
 torch.cuda.set_device(0)
 from transformers import AutoModelForCausalLM, AutoTokenizer
