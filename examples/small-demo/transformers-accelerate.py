@@ -38,7 +38,7 @@ model = AutoModelForCausalLM.from_pretrained(
 print("loading model...done", time.time() - load_time_start)
 
 time_profiler = TimeProfiler()
-model._time_profiler = time_profiler
+recursive_attach(model, time_profiler, '_time_profiler')
 
 def gen_batch(text_list, do_print=False, max_new_tokens=100):
   inputs = tokenizer(text_list, return_tensors="pt", padding=True).to(f"cuda") # input_ids, attention_mask
