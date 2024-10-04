@@ -255,6 +255,7 @@ void PrefetchMngr::mark_expert_using(int layer_id, int expert_id) {
 }
 
 void PrefetchMngr::launch_thread() {
+  this->reload_env();
   predict_thread->on_one_iter_done();
   predict_thread->on_moe_layer_logits_recorded(metas->num_layer);
 
