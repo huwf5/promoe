@@ -6,6 +6,7 @@ setup(
     ext_modules=[
         CUDAExtension('sparse_llm_cache.cpp_worker', 
             [
+                'src/cpp_worker/adapter-llama.cpp',
                 'src/cpp_worker/adapter.cpp',
                 'src/cpp_worker/logging.cc',
                 'src/cpp_worker/model_loader.cpp',
