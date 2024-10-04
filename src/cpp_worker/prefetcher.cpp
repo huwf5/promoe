@@ -559,7 +559,11 @@ void FetchScheduleWorker::do_one_task_impl(PrefetchLayerTask *task) {
     //   LOG(TRACE) << "skip add prefetch task " << expert->toString();
     //   continue;
     // }
-    add_separate_tasks_for_one_expert(task->layer_idx, task->expert_idxs[i], &per_layer_job_queues[task->layer_idx], 0, metas->num_per_expert_param, false);
+    if (metas->chunk_prefetch) {
+      add_separate_tasks_for_one_expert(task->layer_idx, task->expert_idxs[i], &per_layer_job_queues[task->layer_idx], 0, metas->num_per_expert_param, false);
+    } else {
+      add_single_tasks_for_one_expert(task->layer_idx, task->expert_idxs[i], &per_layer_job_queues[task->layer_idx], 0, metas->num_per_expert_param, false);
+    }
   }
 }
 

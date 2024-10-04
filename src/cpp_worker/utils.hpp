@@ -138,6 +138,7 @@ class ModuleMeta {
   bool reorder_experts = true;
   bool promote_hit_in_prefetch = true;
   bool early_preempt = true;
+  bool chunk_prefetch = true;
   std::string cache_policy = "fifo";
   PredictInputMode predict_input_mode = kOneToken;
   PredictorType predictor_type = kLegacyPredictor;

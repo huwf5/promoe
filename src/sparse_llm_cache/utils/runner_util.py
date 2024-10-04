@@ -28,6 +28,7 @@ def parse_args(args = None):
   parser.add_argument("--max_prefetch_layer_distance", type=int, default=-1)
   parser.add_argument("--promote_hit_in_prefetch", action=CustomBooleanAction, default=True)
   parser.add_argument("--early_preempt", action=CustomBooleanAction, default=True)
+  parser.add_argument("--chunk_prefetch", action=CustomBooleanAction, default=True)
   parser.add_argument("--cache_policy", type=str, choices=["lru", "fifo", "nn", "min"], default="lru")
   parser.add_argument("--cache_trace_path", type=str, default=None)
   parser.add_argument("--predictor_model_path", type=str, default=None)

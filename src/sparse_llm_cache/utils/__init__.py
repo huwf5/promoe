@@ -144,6 +144,7 @@ def inject_model(
     predictor_type : str = None,
     promote_hit_in_prefetch : bool = True,
     early_preempt : bool = True,
+    chunk_prefetch : bool = True,
     # metadatas of model
     num_moe_layer : int = None,
     num_expert_per_layer : int = None,
@@ -268,6 +269,7 @@ def inject_model(
   meta.reorder_experts = reorder_experts
   meta.promote_hit_in_prefetch = promote_hit_in_prefetch
   meta.early_preempt = early_preempt
+  meta.chunk_prefetch = chunk_prefetch
   meta.layer_predict_replace_first_input_with_last_output = layer_predict_replace_first_input_with_last_output
   meta.predict_input_mode = {
     'no_predict': cpp_worker.kNoPredict,
