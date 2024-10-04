@@ -10,6 +10,8 @@ FROM ${BASE_CUDA_DEV_CONTAINER} AS build
 
 # Unless otherwise specified, we make a fat build.
 # ARG CUDA_DOCKER_ARCH=89
+ENV LANG=en_US.UTF-8
+ENV LC_ALL=C.UTF-8
 
 RUN apt-get update && \
     apt-get install -y build-essential python3 python3-pip git libcurl4-openssl-dev libgomp1 zsh curl wget vim ccache
@@ -18,7 +20,7 @@ COPY requirements.txt   requirements.txt
 
 RUN pip install --upgrade pip setuptools wheel pandas \
     && pip install -r requirements.txt \
-    && pip install flash_attn optimum
+    && pip install flash_attn optimum ninja
 
 WORKDIR /code
 
