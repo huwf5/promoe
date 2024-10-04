@@ -161,6 +161,8 @@ def inject_model(
     predict_input_mode = None,
     layer_predict_interval   = -1,
     layer_predict_max_window = -1,
+    limit_layer_0_window = -1,
+    limit_layer_0_num_predict = -1,
     model_id = None,
     model_revision = None,
     layer_predict_replace_first_input_with_last_output = False,
@@ -284,6 +286,8 @@ def inject_model(
 
   meta.layer_predict_interval = layer_predict_interval
   meta.layer_predict_max_window = layer_predict_max_window
+  meta.limit_layer_0_window = limit_layer_0_window
+  meta.limit_layer_0_num_predict = limit_layer_0_num_predict
 
   meta.handle_uninited_configs()
 

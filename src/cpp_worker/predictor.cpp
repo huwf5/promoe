@@ -11,13 +11,16 @@ std::vector<std::pair<int, int>> build_predict_layer_mapping(ModuleMeta * metas)
     layers_to_predict.push_back(l);
   }
 
-
   std::vector<int> predict_layers(metas->num_layer + 1, 0);
 
   int stop_l = 0;
   for (auto l : layers_to_predict) {
+    auto window = metas->layer_predict_max_window;
+    if (l == 0 && metas->limit_layer_0_window != -1) {
+      window = metas->limit_layer_0_window;
+    }
     predict_layers[l] = stop_l;
-    predict_layers[l + 1] = (l % metas->num_layer) + metas->layer_predict_max_window;
+    predict_layers[l + 1] = (l % metas->num_layer) + window;
     predict_layers[l + 1] = std::min(predict_layers[l + 1], metas->num_layer);
     stop_l = predict_layers[l + 1];
 
@@ -624,6 +627,9 @@ void SepPredictor::load_model(std::string model_path) {
       predict_models[src_l].enabled_output_layers.push_back(dst_l);
       // convert_jit_model_dtype(predict_models[src_l].models[dst_l], torch::kF16);
     }
+
+    LOG(ERROR) << "predict model " << src_l << ", "
+               << " predicts [" << predict_layers[src_l].first << ":" << predict_layers[src_l].second << ")";
     // if (predict_models[src_l].enabled_output_layers.size() > 0) {
     //   predict_models[src_l].dtype = get_jit_model_dtype(predict_models[src_l].models[predict_models[src_l].enabled_output_layers[0]]);
     // }

@@ -56,7 +56,11 @@ void PredictWorker::do_one_task_impl(PredictJob job) {
         PrefetchLayerTask task;
         task.layer_idx   = layer_idx;
         task.expert_idxs = pred_result.top_experts(inner_l);
-        task.num_expert  = per_layer_num_expert;
+        if (layer_idx == 0 && metas->limit_layer_0_num_predict != -1) {
+          task.num_expert = std::min<int>(per_layer_num_expert, metas->limit_layer_0_num_predict);
+        } else {
+          task.num_expert  = per_layer_num_expert;
+        }
         auto wait_handler = fetch_schedule_thread->add_one_task(&task);
         fetch_schedule_thread->wait_progress(wait_handler);
         // fetch_schedule_thread->add_one_layer_task(layer_idx, predicted_expert[layer_idx].data_ptr<int64_t>(), per_layer_num_expert);

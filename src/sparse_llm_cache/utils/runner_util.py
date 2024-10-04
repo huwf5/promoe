@@ -40,6 +40,9 @@ def parse_args(args = None):
   parser.add_argument("--layer_predict_max_window", type=int, default=None)
   parser.add_argument("--layer_predict_use_last_output", action=CustomBooleanAction, default=False, dest='layer_predict_replace_first_input_with_last_output')
 
+  parser.add_argument("--limit_layer_0_num_predict", type=int, default=-1)
+  parser.add_argument("--limit_layer_0_window",      type=int, default=-1)
+
   parser.add_argument(        "--per_layer_cache", action=CustomBooleanAction, default=True)
   parser.add_argument( "--enable_per_layer_cache", action="store_true",  dest="per_layer_cache", default=True)
   parser.add_argument("--disable_per_layer_cache", action="store_false", dest="per_layer_cache", default=True)
