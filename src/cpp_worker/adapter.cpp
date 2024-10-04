@@ -29,6 +29,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     .def_readwrite("layer_predict_interval",       &ModuleMeta::layer_predict_interval)
     .def_readwrite("layer_predict_max_window",     &ModuleMeta::layer_predict_max_window)
     .def_readwrite("layer_predict_replace_first_input_with_last_output",     &ModuleMeta::layer_predict_replace_first_input_with_last_output)
+    .def_readwrite("cache_only",                   &ModuleMeta::cache_only)
     .def("handle_uninited_configs", &ModuleMeta::handle_uninited_configs)
     .def("init_param_list", &ModuleMeta::init_param_list)
   ;

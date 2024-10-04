@@ -281,8 +281,6 @@ PrefetchMngr::PrefetchMngr(std::shared_ptr<ModuleMeta> metas,
   predict_thread = std::make_shared<PredictWorker>();
   expert_unlocker_thread = std::make_shared<ExpertUnlockWorker>();
   fetch_thread = std::make_shared<FetchWorker>();
-  // cudaStream_t stream;
-  CUDA_CALL(cudaStreamCreateWithFlags((cudaStream_t*)(&copy_stream),    cudaStreamNonBlocking));
   fetch_schedule_thread = std::make_shared<FetchScheduleWorker>();
   cache_stats = std::make_shared<CacheStatistics>();
   cache_stats->add_reporter([this, metas = this->metas](CacheStatistics* stats){
@@ -363,10 +361,6 @@ PrefetchMngr::PrefetchMngr(std::shared_ptr<ModuleMeta> metas,
   });
   precision_profiler = std::make_shared<PrecisionProfiler>();
   precision_profiler->decode_expert_per_token = metas->num_expert_per_token;
-  predict_thread->init(fetch_schedule_thread.get(), predictor.get(), cache.get(), metas.get());
-  predict_thread->precision_profiler = precision_profiler.get();
-  fetch_thread->init(metas.get(), fetch_schedule_thread.get(), model_loader->mem_mngr_ctx.get(), (cudaStream_t)copy_stream);
-  fetch_schedule_thread->init(metas.get(), model_loader.get(), this->cache.get(), fetch_thread.get(), predict_thread.get(), cache_stats.get(), profiler.get());
 
   if (create_compute_stream) {
     CUDA_CALL(cudaStreamCreateWithFlags((cudaStream_t*)(&compute_stream), cudaStreamNonBlocking));
@@ -381,6 +375,18 @@ PrefetchMngr::PrefetchMngr(std::shared_ptr<ModuleMeta> metas,
   } else {
     this->set_compute_stream(compute_stream_param);
   }
+
+  if (metas->cache_only) {
+    copy_stream = compute_stream;
+  } else {
+    CUDA_CALL(cudaStreamCreateWithFlags((cudaStream_t*)(&copy_stream),    cudaStreamNonBlocking));
+  }
+
+  predict_thread->init(fetch_schedule_thread.get(), predictor.get(), cache.get(), metas.get());
+  predict_thread->precision_profiler = precision_profiler.get();
+  fetch_thread->init(metas.get(), fetch_schedule_thread.get(), model_loader->mem_mngr_ctx.get(), (cudaStream_t)copy_stream);
+  fetch_schedule_thread->init(metas.get(), model_loader.get(), this->cache.get(), fetch_thread.get(), predict_thread.get(), cache_stats.get(), profiler.get());
+
   predictor->profiler = profiler;
 }
 

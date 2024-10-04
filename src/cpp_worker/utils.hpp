@@ -132,6 +132,7 @@ class ModuleMeta {
   int num_predict_expert_per_layer;
   int num_expert_per_token;
   int max_prefetch_layer_distance = 1;
+  bool cache_only = false;
   bool per_layer_cache = true;
   bool reorder_experts = true;
   bool promote_hit_in_prefetch = true;

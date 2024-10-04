@@ -165,6 +165,8 @@ def inject_model(
     model_revision = None,
     layer_predict_replace_first_input_with_last_output = False,
     launch_now = True,
+    # deprecated
+    cache_only = False,
     **kwargs
   ):
   """
@@ -259,6 +261,7 @@ def inject_model(
   meta.num_expert_per_token = num_expert_per_token
   meta.per_layer_cache = per_layer_cache
   meta.cache_policy = cache_policy
+  meta.cache_only = cache_only
   meta.reorder_experts = reorder_experts
   meta.promote_hit_in_prefetch = promote_hit_in_prefetch
   meta.early_preempt = early_preempt

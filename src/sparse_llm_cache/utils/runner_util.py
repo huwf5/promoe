@@ -55,6 +55,10 @@ def parse_args(args = None):
   parser.add_argument(        "--module_trace_event", action=CustomBooleanAction, default=False)
   parser.add_argument( "--enable_module_trace_event", action="store_true",   dest="module_trace_event", default=False)
   parser.add_argument("--disable_module_trace_event", action="store_false",  dest="module_trace_event", default=False)
+
+  # deprecated
+  parser.add_argument("--cache_only", action=CustomBooleanAction, default=False)
+
   args = parser.parse_args(args)
 
   return vars(args)
