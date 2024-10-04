@@ -2,6 +2,7 @@
 #include "model_loader.hpp"
 #include "prefetcher.hpp"
 #include "profiler.hpp"
+#include "adapter-llama.hpp"
 
 std::string dump_trace_event_collector_singleton() {
   return TraceEventCollector::singleton().dump_json_to_string();
@@ -106,6 +107,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
   m.def("dump_trace_event_collector_singleton", &dump_trace_event_collector_singleton);
   m.def("to_um", &to_um);
+  m.def("log_gpu_mem_info", &log_gpu_mem_info);
 
   py::enum_<ThreadType>(m, "ThreadType")
     .value("kPythonMain",     ThreadType::kPythonMain)

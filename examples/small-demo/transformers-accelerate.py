@@ -76,3 +76,4 @@ for seq_id,text_list in enumerate(dl):
   print(input_len, output_len, time.time() - start_time, flush=True)
 
 time_profiler.log()
+sparse_llm_cache.cpp_worker.log_gpu_mem_info()
