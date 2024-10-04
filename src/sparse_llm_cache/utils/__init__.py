@@ -349,7 +349,7 @@ def inject_model(
 def launch(model : torch.nn.Module):
   prefetch_mngr = model._prefetch_mngr
   prefetch_mngr.launch_thread()
-  torch.set_num_threads(16)
+  torch.set_num_threads(8)
   return prefetch_mngr
 
 
