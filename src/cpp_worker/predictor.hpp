@@ -57,6 +57,9 @@ class PredictorBase {
   virtual bool layer_predict_enabled(int layer_id) = 0;
   virtual ~PredictorBase() = default;
 
+  virtual int  query_predict_jobs(int layer_id) { return 1; }
+  virtual PredictOutput predict_one_job(int layer_id, int job_idx) { return this->predict(layer_id); }
+
   static std::shared_ptr<PredictorBase> create(std::shared_ptr<ModuleMeta> metas);
 };
 
@@ -162,4 +165,7 @@ class SepPredictor : public PredictorBase {
   void record_moe_layer_logits(int layer_id, torch::Tensor layer_logits) override;
   bool layer_predict_enabled(int layer_id) override { return predict_models[layer_id].enabled_output_layers.size() > 0; }
   void slice_predict_output_layer(PredictOutput &output) override;
+
+  int  query_predict_jobs(int layer_id) override { return predict_models[layer_id].enabled_output_layers.size(); }
+  PredictOutput predict_one_job(int layer_id, int job_idx) override;
 };

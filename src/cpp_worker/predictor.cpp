@@ -555,6 +555,55 @@ PredictOutput SepPredictor::predict(int input_layer_id) {
   return PredictOutput(output, input_layer_id, predict_models[input_layer_id].enabled_output_layers[0]);
 }
 
+PredictOutput SepPredictor::predict_one_job(int input_layer_id, int job_idx) {
+  TRACE_EVENT_GURAD(kPredictor, "predict_one_job " + std::to_string(input_layer_id));
+  LOG(DEBUG) << "predictor, predict_one_job " + std::to_string(input_layer_id);
+  CHECK(layer_predict_enabled(input_layer_id)) << "layer " << input_layer_id << " not enabled";
+  torch::Tensor input;
+  auto * model = &predict_models[0];
+  if (job_idx == 0) {
+    TRACE_EVENT_GURAD_NAME(kPredictor, "logits copy", guardguard);
+    CUDA_CALL(cudaEventSynchronize(logits_record_event[input_layer_id]));
+  }
+  switch (metas->predict_input_mode) {
+    case kNoPredict:                {
+      return PredictOutput::empty(1, input_layer_id, -1);
+    }
+    case kMoeLayerLogits: {
+      input = this->moe_layer_logits_buffer_list[input_layer_id];
+      if (input.numel() == 0) {
+        LOG(DEBUG) << "skip prediction due to prefill";
+        return PredictOutput::empty(1, input_layer_id, predict_models[input_layer_id].enabled_output_layers[job_idx]);
+      }
+      CHECK(predict_models[input_layer_id].num_output_layer() > 0);
+      LOG_BLOCK(DEBUG, logger, {
+        logger << "predictor, predict with input shape " << input.sizes() << " " << input.numel();
+      });
+      model = &predict_models[input_layer_id];
+      CHECK(input.dtype() == torch::kFloat32);
+      // input = input.to(torch::kFloat32);
+      break;
+    }
+    default: {
+      CHECK(false) << "Unknown predict input mode";
+    }
+  }
+  Timer t;
+  auto bs = input.size(0);
+  std::vector<torch::jit::IValue> inputs{input.flatten(1, -1)};
+  torch::NoGradGuard no_grad;
+  auto output_layer_id = model->enabled_output_layers[job_idx];
+  auto& m = model->models[output_layer_id];
+  torch::Tensor output = m.forward(inputs).toTensor().reshape({bs, -1, metas->num_expert});
+  if (output.size(0) > 1  ) {
+    output = output.sum({0});
+  } else {
+    output = output.reshape({-1, metas->num_expert});
+  }
+  profiler->push(TimeProfiler::kPredictTime, t.dur_us());
+  return PredictOutput(output, input_layer_id, predict_models[input_layer_id].enabled_output_layers[job_idx]);
+}
+
 
 void SepPredictor::load_model(std::string model_path) {
   struct stat path_stat;

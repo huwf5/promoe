@@ -5,62 +5,67 @@
 
 void PredictWorker::do_one_task_impl(PredictJob job) {
   TRACE_EVENT_GURAD(kPredictor, "predict thread " + std::to_string(job.input_layer_id));
-  auto pred_result = predictor->predict(job.input_layer_id);
 
-  predictor->slice_predict_output_layer(pred_result);
+  int num_predict_jobs = predictor->query_predict_jobs(job.input_layer_id);
 
-  auto num_predicted_layers = pred_result.num_output_layer();
-  CHECK(pred_result.num_output_expert() == metas->num_expert || pred_result.num_output_expert() == 0);
-  if (metas->cache_policy == "nn" && pred_result.num_output_expert() > 0) {
-    cache->update_priority(pred_result.prob, pred_result.start_output_layer_id);
-  }
-  pred_result.rank_experts(metas->num_predict_expert_per_layer);
+  // auto pred_result = predictor->predict(job.input_layer_id);
+  for (int job_idx = 0; job_idx < num_predict_jobs; job_idx++) {
+    auto pred_result = predictor->predict_one_job(job.input_layer_id, job_idx);
 
-  LOG_BLOCK(DEBUG, logger, {
-    logger << "predicted shape " << pred_result.experts.sizes() << "\n";
-  });
-  LOG_BLOCK(DEBUG, logger, {
-    for (int l_in_slice = 0; l_in_slice < num_predicted_layers; l_in_slice++) {
-      int layer_idx = pred_result.start_output_layer_id + l_in_slice;
-      logger << "predicted expert" << layer_idx << ":" << tensor_to_str(pred_result.experts[l_in_slice]) << "\n";
+    predictor->slice_predict_output_layer(pred_result);
+
+    auto num_predicted_layers = pred_result.num_output_layer();
+    CHECK(pred_result.num_output_expert() == metas->num_expert || pred_result.num_output_expert() == 0);
+    if (metas->cache_policy == "nn" && pred_result.num_output_expert() > 0) {
+      cache->update_priority(pred_result.prob, pred_result.start_output_layer_id);
     }
-  });
+    pred_result.rank_experts(metas->num_predict_expert_per_layer);
 
-  {
-    TRACE_EVENT_GURAD(kPredictor, "add_multi_layer_task [" + std::to_string(pred_result.inner_l_to_outer_l(0)) + "," + std::to_string(pred_result.inner_l_to_outer_l(num_predicted_layers)) + ")");
-    size_t per_layer_num_expert = pred_result.num_top_experts();
-    for (int inner_l = 0; inner_l < num_predicted_layers; inner_l++) {
-      int layer_idx = pred_result.inner_l_to_outer_l(inner_l);
-      precision_profiler->record_predicted_experts(layer_idx, pred_result.top_experts(inner_l), per_layer_num_expert);
-    }
-    for (int inner_l = 0; inner_l < num_predicted_layers; inner_l++) {
-      int layer_idx = pred_result.inner_l_to_outer_l(inner_l);
-      {
-        LOG(INFO) << "predict worker: add layer task " << layer_idx << ", wait for budget";
-        TRACE_EVENT_GURAD(kPredictor, "wait for budget " + std::to_string(layer_idx));
-        while (true) {
-          int budge_remaining = prefetch_layer_budget.try_pop(true);
-          if (budge_remaining != -1) {
-            LOG(INFO) << "predict worker: add layer task now " << layer_idx << ", wait for budget done, remaining " << budge_remaining;
-            break;
-          }
-          if (should_exit()) { return; }
-        }
+    LOG_BLOCK(DEBUG, logger, {
+      logger << "predicted shape " << pred_result.experts.sizes() << "\n";
+    });
+    LOG_BLOCK(DEBUG, logger, {
+      for (int l_in_slice = 0; l_in_slice < num_predicted_layers; l_in_slice++) {
+        int layer_idx = pred_result.start_output_layer_id + l_in_slice;
+        logger << "predicted expert" << layer_idx << ":" << tensor_to_str(pred_result.experts[l_in_slice]) << "\n";
       }
-      LOG(INFO) << "predict worker: add layer task now " << layer_idx;
-      PrefetchLayerTask task;
-      task.layer_idx   = layer_idx;
-      task.expert_idxs = pred_result.top_experts(inner_l);
-      task.num_expert  = per_layer_num_expert;
-      auto wait_handler = fetch_schedule_thread->add_one_task(&task);
-      fetch_schedule_thread->wait_progress(wait_handler);
-      // fetch_schedule_thread->add_one_layer_task(layer_idx, predicted_expert[layer_idx].data_ptr<int64_t>(), per_layer_num_expert);
-      prefetch_layer_progress.push(layer_idx);
+    });
+
+    {
+      TRACE_EVENT_GURAD(kPredictor, "add_multi_layer_task [" + std::to_string(pred_result.inner_l_to_outer_l(0)) + "," + std::to_string(pred_result.inner_l_to_outer_l(num_predicted_layers)) + ")");
+      size_t per_layer_num_expert = pred_result.num_top_experts();
+      for (int inner_l = 0; inner_l < num_predicted_layers; inner_l++) {
+        int layer_idx = pred_result.inner_l_to_outer_l(inner_l);
+        precision_profiler->record_predicted_experts(layer_idx, pred_result.top_experts(inner_l), per_layer_num_expert);
+      }
+      for (int inner_l = 0; inner_l < num_predicted_layers; inner_l++) {
+        int layer_idx = pred_result.inner_l_to_outer_l(inner_l);
+        {
+          LOG(INFO) << "predict worker: add layer task " << layer_idx << ", wait for budget";
+          TRACE_EVENT_GURAD(kPredictor, "wait for budget " + std::to_string(layer_idx));
+          while (true) {
+            int budge_remaining = prefetch_layer_budget.try_pop(true);
+            if (budge_remaining != -1) {
+              LOG(INFO) << "predict worker: add layer task now " << layer_idx << ", wait for budget done, remaining " << budge_remaining;
+              break;
+            }
+            if (should_exit()) { return; }
+          }
+        }
+        LOG(INFO) << "predict worker: add layer task now " << layer_idx;
+        PrefetchLayerTask task;
+        task.layer_idx   = layer_idx;
+        task.expert_idxs = pred_result.top_experts(inner_l);
+        task.num_expert  = per_layer_num_expert;
+        auto wait_handler = fetch_schedule_thread->add_one_task(&task);
+        fetch_schedule_thread->wait_progress(wait_handler);
+        // fetch_schedule_thread->add_one_layer_task(layer_idx, predicted_expert[layer_idx].data_ptr<int64_t>(), per_layer_num_expert);
+        prefetch_layer_progress.push(layer_idx);
+      }
     }
-  }
-  // fixme: fix this condition
-  if (num_predicted_layers + job.input_layer_id == metas->num_layer) {
-    predictor->end_of_one_token_prediction();
+    if (pred_result.inner_l_to_outer_l(num_predicted_layers) == metas->num_layer) {
+      predictor->end_of_one_token_prediction();
+    }
   }
   // if (metas->predict_input_mode == kOneToken) {
   //   predictor->clear_access_buffer();
