@@ -573,6 +573,9 @@ PredictOutput SepPredictor::predict_one_job(int input_layer_id, int job_idx) {
       return PredictOutput::empty(1, input_layer_id, -1);
     }
     case kMoeLayerLogits: {
+      if (this->moe_layer_logits_buffer_list[input_layer_id].dtype() != torch::kFloat32) {
+        this->moe_layer_logits_buffer_list[input_layer_id] = this->moe_layer_logits_buffer_list[input_layer_id].to(torch::kFloat32);
+      }
       input = this->moe_layer_logits_buffer_list[input_layer_id];
       if (input.numel() == 0) {
         LOG(DEBUG) << "skip prediction due to prefill";
@@ -583,7 +586,6 @@ PredictOutput SepPredictor::predict_one_job(int input_layer_id, int job_idx) {
         logger << "predictor, predict with input shape " << input.sizes() << " " << input.numel();
       });
       model = &predict_models[input_layer_id];
-      CHECK(input.dtype() == torch::kFloat32);
       // input = input.to(torch::kFloat32);
       break;
     }

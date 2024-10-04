@@ -258,6 +258,7 @@ def inject_model(
   print(param_key_list)
   meta.init_param_list(param_key_list)
 
+  meta.model_arch_string = model_id
   meta.num_predict_expert_per_layer = num_predict_expert_per_layer
   meta.max_prefetch_layer_distance = max_prefetch_layer_distance
   meta.num_expert_per_token = num_expert_per_token

@@ -125,6 +125,7 @@ class ModuleMeta {
   // std::unordered_map<std::string, std::pair<int,int>> module_name_to_expert_idx;
   // std::vector<std::string> expert_idx_to_module_name;
  public:
+  std::string model_arch_string = "";
   int num_layer, num_expert;
   int num_per_expert_param;
   std::vector<std::string> param_name_list;
@@ -183,6 +184,21 @@ class ModuleMeta {
     }
     if (getenv("SPARSE_CACHE_LOGICAL_MEM_IMPL") != nullptr) {
       logical_mem_impl = getenv("SPARSE_CACHE_LOGICAL_MEM_IMPL");
+    }
+    std::transform(model_arch_string.begin(), model_arch_string.end(), model_arch_string.begin(), ::tolower);
+    // if (limit_layer_0_num_predict == -1) {
+    //   if (model_arch_string.find("deepseek") != std::string::npos) {
+    //     limit_layer_0_num_predict = num_predict_expert_per_layer;
+    //   } else {
+    //     limit_layer_0_num_predict = num_predict_expert_per_layer / 2;
+    //   }
+    // }
+    if (limit_layer_0_window == -1) {
+      if (model_arch_string.find("deepseek") != std::string::npos) {
+        limit_layer_0_window = layer_predict_max_window;
+      } else {
+        limit_layer_0_window = 1;
+      }
     }
   }
 };

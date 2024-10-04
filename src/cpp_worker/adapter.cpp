@@ -13,6 +13,7 @@ torch::Tensor to_um(torch::Tensor t);
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   py::class_<ModuleMeta, std::shared_ptr<ModuleMeta>>(m, "ModuleMeta")
     .def(py::init<int,int>())
+    .def_readwrite("model_arch_string",            &ModuleMeta::model_arch_string)
     .def_readwrite("num_layer",                    &ModuleMeta::num_layer)
     .def_readwrite("num_expert",                   &ModuleMeta::num_expert)
     .def_readwrite("num_per_expert_param",         &ModuleMeta::num_per_expert_param)
