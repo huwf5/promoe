@@ -160,6 +160,11 @@ void FetchScheduleWorker::pop_next_task(CopyTask &task, bool &found) {
   }
 }
 void PrefetchMngr::init_gpu_mem_buffer(size_t num_buffers) {
+  // hack: append a dummy chunk to each host experts
+  if (metas->expert_mem_scale != 1.0) {
+    model_loader->add_all_dummy_expert_params();
+  }
+
   cache->init_gpu_mem_buffer(num_buffers);
   model_loader->mem_mngr_ctx->dummy_physical = cache->cache_slots->slots.front().unused_mems.front();
 }

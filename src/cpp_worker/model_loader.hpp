@@ -286,6 +286,7 @@ class ModelLoader {
     return add_one_expert_param(param, layer_id, expert_id, metas->param_name_to_id[param_name], alloc_nbytes);
   }
   void add_one_expert_param(torch::Tensor param, int layer_id, int expert_id, int param_id, size_t alloc_nbytes);
+  void add_all_dummy_expert_params();
   void build_logical_expert_param() {
     // size_t required_dummy_nbytes = 1024;
     // if (metas->logical_mem_impl == "cudriver_unified") {

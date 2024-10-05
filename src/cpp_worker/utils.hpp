@@ -150,6 +150,8 @@ class ModuleMeta {
   int layer_predict_max_window = -1; // the max distance of layer prediction, n: 0 -> [0,...,n-1]
   bool layer_predict_replace_first_input_with_last_output = false;
   uint sleep_on_report_logits_us = 0;
+  float expert_mem_scale = 1.0;
+  int  num_dummy_params = 0;
 
   int limit_layer_0_window = -1;
   int limit_layer_0_num_predict = -1;
@@ -159,13 +161,7 @@ class ModuleMeta {
 
   ModuleMeta(int num_layer, int num_expert) : num_layer(num_layer), num_expert(num_expert) {}
 
-  void init_param_list(std::vector<std::string> params) {
-    param_name_list = params;
-    num_per_expert_param = params.size();
-    for (int i = 0; i < num_per_expert_param; i++) {
-      param_name_to_id[param_name_list[i]] = i;
-    }
-  }
+  void init_param_list(std::vector<std::string> params);
 
   inline int squeeze_expert_idx(int layer_id, int expert_id) {
     return layer_id * num_expert + expert_id;
@@ -174,40 +170,7 @@ class ModuleMeta {
     return std::make_pair(flatten_expert_id / num_expert, flatten_expert_id % num_expert);
   }
 
-  void handle_uninited_configs() {
-    if (layer_predict_interval == -1) {
-      layer_predict_interval = num_layer;
-      layer_predict_max_window = num_layer;
-    }
-    if (max_prefetch_layer_distance == -1) {
-      max_prefetch_layer_distance = num_layer - 1;
-    }
-
-    if (getenv("SPARSE_CACHE_PHYSICAL_MEM_IMPL") != nullptr) {
-      physical_mem_impl = getenv("SPARSE_CACHE_PHYSICAL_MEM_IMPL");
-    }
-    if (getenv("SPARSE_CACHE_LOGICAL_MEM_IMPL") != nullptr) {
-      logical_mem_impl = getenv("SPARSE_CACHE_LOGICAL_MEM_IMPL");
-    }
-    if (getenv("SPARSE_CACHE_SLEEP_ON_REPORT_LOGITS_US") != nullptr) {
-      sleep_on_report_logits_us = std::stoul(getenv("SPARSE_CACHE_SLEEP_ON_REPORT_LOGITS_US"));
-    }
-    std::transform(model_arch_string.begin(), model_arch_string.end(), model_arch_string.begin(), ::tolower);
-    // if (limit_layer_0_num_predict == -1) {
-    //   if (model_arch_string.find("deepseek") != std::string::npos) {
-    //     limit_layer_0_num_predict = num_predict_expert_per_layer;
-    //   } else {
-    //     limit_layer_0_num_predict = num_predict_expert_per_layer / 2;
-    //   }
-    // }
-    if (limit_layer_0_window == -1) {
-      if (model_arch_string.find("deepseek") != std::string::npos) {
-        limit_layer_0_window = layer_predict_max_window;
-      } else {
-        limit_layer_0_window = 1;
-      }
-    }
-  }
+  void handle_uninited_configs();
 };
 
 std::string tensor_to_str(torch::Tensor t);
