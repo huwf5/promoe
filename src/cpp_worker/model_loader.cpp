@@ -31,18 +31,29 @@ void ModelLoader::add_one_expert_param(torch::Tensor param, int layer_id,
 }
 
 void ModelLoader::add_all_dummy_expert_params() {
+  // create only one dummy param to speed up memory allocation
+  auto & expert_example = source_list[0];
+  size_t current_nbytes = 0;
+  for (int i = 0; i < metas->num_per_expert_param - metas->num_dummy_params; i++) {
+    current_nbytes += expert_example->host_data->nbytes(i);
+  }
+  long dummy_nbytes = current_nbytes * (metas->expert_mem_scale - 1);
+  long per_dummy_nbytes = dummy_nbytes / metas->num_dummy_params;
+  per_dummy_nbytes = round_up<long>(per_dummy_nbytes, 16);
+  auto dummy_tensor = torch::zeros({per_dummy_nbytes}, torch::TensorOptions().device("cpu").pinned_memory(true).dtype(torch::kUInt8));
+
   for (int layer_id = 0; layer_id < metas->num_layer; layer_id++) {
     for (int expert_id = 0; expert_id < metas->num_expert; expert_id++) {
       auto & expert_handler = source_list[metas->squeeze_expert_idx(layer_id, expert_id)];
-      size_t current_nbytes = 0;
-      for (int i = 0; i < metas->num_per_expert_param - metas->num_dummy_params; i++) {
-        current_nbytes += expert_handler->host_data->nbytes(i);
-      }
-      long dummy_nbytes = current_nbytes * (metas->expert_mem_scale - 1);
-      long per_dummy_nbytes = dummy_nbytes / metas->num_dummy_params;
-      per_dummy_nbytes = round_up<long>(per_dummy_nbytes, 16);
+      // size_t current_nbytes = 0;
+      // for (int i = 0; i < metas->num_per_expert_param - metas->num_dummy_params; i++) {
+      //   current_nbytes += expert_handler->host_data->nbytes(i);
+      // }
+      // long dummy_nbytes = current_nbytes * (metas->expert_mem_scale - 1);
+      // long per_dummy_nbytes = dummy_nbytes / metas->num_dummy_params;
+      // per_dummy_nbytes = round_up<long>(per_dummy_nbytes, 16);
       for (int i = metas->num_per_expert_param - metas->num_dummy_params; i < metas->num_per_expert_param; i++) {
-        auto dummy_tensor = torch::zeros({per_dummy_nbytes}, torch::TensorOptions().device("cpu").pinned_memory(true).dtype(torch::kUInt8));
+        // auto dummy_tensor = torch::zeros({per_dummy_nbytes}, torch::TensorOptions().device("cpu").pinned_memory(true).dtype(torch::kUInt8));
         expert_handler->host_data->set(i, dummy_tensor, per_dummy_nbytes);
       }
     }

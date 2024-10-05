@@ -324,7 +324,7 @@ def inject_model(
     prefetch_mngr.cache.cache_oracle.load_from_tensor(entry_to_metas, prefill_expert_len, prefill_expert_selection, decode_expert_selection)
 
   add_hook_to_experts(model, prefetch_mngr, expert_name_filter)
-  add_hook_to_moe_attns(model, prefetch_mngr, moe_attn_name_filter)
+  # add_hook_to_moe_attns(model, prefetch_mngr, moe_attn_name_filter)
   add_hook_to_moe_layers(model, prefetch_mngr, moe_layer_name_filter)
   add_hook_to_quant_expert_post_init(model, prefetch_mngr, expert_name_filter)
   attach_prefetch_mngr_to_all_module(model, prefetch_mngr)
