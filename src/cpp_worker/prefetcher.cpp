@@ -414,6 +414,9 @@ void PrefetchMngr::report_moe_layer_logits(int layer_id, torch::Tensor layer_log
     auto seq_len = layer_logits.size(1);
     profiler->push(TimeProfiler::kSeqLen, seq_len);
   }
+  if (metas->sleep_on_report_logits_us) {
+    cuda_sleep(metas->sleep_on_report_logits_us, compute_stream);
+  }
 }
 
 void PrefetchMngr::record_then_predict_and_prefetch(int layer_id, int64_t* experts, int64_t num_expert) {

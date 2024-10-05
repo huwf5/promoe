@@ -1,12 +1,14 @@
 #pragma once
 #include <atomic>
 #include <cassert>
+#include <cstdint>
 #include <pthread.h>
 #include <string>
 #include <unordered_map>
 #include <vector>
 #include <torch/extension.h>
 
+void cuda_sleep(uint ns, int64_t stream);
 class SpinLock {
     pthread_spinlock_t _spinlock;
   public:
@@ -147,6 +149,7 @@ class ModuleMeta {
   int layer_predict_interval   = -1; // the frequency of layer prediction
   int layer_predict_max_window = -1; // the max distance of layer prediction, n: 0 -> [0,...,n-1]
   bool layer_predict_replace_first_input_with_last_output = false;
+  uint sleep_on_report_logits_us = 0;
 
   int limit_layer_0_window = -1;
   int limit_layer_0_num_predict = -1;
@@ -185,6 +188,9 @@ class ModuleMeta {
     }
     if (getenv("SPARSE_CACHE_LOGICAL_MEM_IMPL") != nullptr) {
       logical_mem_impl = getenv("SPARSE_CACHE_LOGICAL_MEM_IMPL");
+    }
+    if (getenv("SPARSE_CACHE_SLEEP_ON_REPORT_LOGITS_US") != nullptr) {
+      sleep_on_report_logits_us = std::stoul(getenv("SPARSE_CACHE_SLEEP_ON_REPORT_LOGITS_US"));
     }
     std::transform(model_arch_string.begin(), model_arch_string.end(), model_arch_string.begin(), ::tolower);
     // if (limit_layer_0_num_predict == -1) {

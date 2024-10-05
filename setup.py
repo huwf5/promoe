@@ -16,8 +16,9 @@ setup(
                 'src/cpp_worker/profiler.cpp',
                 'src/cpp_worker/cache.cpp',
                 'src/cpp_worker/worker.cpp',
+                'src/cpp_worker/cuda_helper_func.cu',
             ],
-            extra_compile_args={'cxx': ['-g', '-fopenmp'], 'nvcc': ['-g', '-fopenmp']},
+            extra_compile_args={'cxx': ['-g', '-fopenmp', '-Wno-sign-compare', '-Wno-attributes'], 'nvcc': ['-g']},
             libraries = ['cuda']
         ),
     ],
