@@ -133,7 +133,7 @@ class ModuleMeta {
   int num_expert_per_token;
 
   float cache_rate = 0.5;
-  int   num_predict_expert_per_layer; // default value auto-infer from num_expert_per_token
+  int   num_predict_expert_per_layer = -1; // default value auto-infer from num_expert_per_token
   bool  reorder_experts;              // default value auto-infer from num_predict_expert_per_layer
   bool  early_preempt;                // default value auto-infer from num_predict_expert_per_layer
   bool  chunk_prefetch;               // default value auto-infer from num_predict_expert_per_layer

@@ -91,7 +91,10 @@ void ModuleMeta::init_from_map(std::unordered_map<std::string, std::string> conf
   num_expert_per_token = required_int("num_expert_per_token");
 
   cache_rate  = optional_float("cache_rate", cache_rate);
-  num_predict_expert_per_layer = optional_int("num_predict_expert_per_layer", num_expert_per_token);
+  num_predict_expert_per_layer = optional_int("num_predict_expert_per_layer", num_predict_expert_per_layer);
+  if (num_predict_expert_per_layer == -1) {
+    num_predict_expert_per_layer = num_expert_per_token;
+  }
   reorder_experts = optional_bool("reorder_experts", num_predict_expert_per_layer > 0);
   early_preempt   = optional_bool("early_preempt",   num_predict_expert_per_layer > 0);
   chunk_prefetch  = optional_bool("chunk_prefetch",  num_predict_expert_per_layer > 0);
