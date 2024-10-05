@@ -127,37 +127,50 @@ class ModuleMeta {
   // std::unordered_map<std::string, std::pair<int,int>> module_name_to_expert_idx;
   // std::vector<std::string> expert_idx_to_module_name;
  public:
+  // configs
   std::string model_arch_string = "";
   int num_layer, num_expert;
-  int num_per_expert_param;
-  std::vector<std::string> param_name_list;
-  std::unordered_map<std::string, int> param_name_to_id;
-  int num_predict_expert_per_layer;
   int num_expert_per_token;
-  int max_prefetch_layer_distance = 1;
-  bool cache_only = false;
-  bool per_layer_cache = true;
-  bool reorder_experts = true;
-  bool promote_hit_in_prefetch = true;
-  bool early_preempt = true;
-  bool chunk_prefetch = true;
-  std::string cache_policy = "fifo";
-  PredictInputMode predict_input_mode = kOneToken;
-  PredictorType predictor_type = kLegacyPredictor;
-  int predict_input_reuse_distance_max = 10;
-  int predict_input_decay = 2;    // decode cumsum weight decay
-  int layer_predict_interval   = -1; // the frequency of layer prediction
-  int layer_predict_max_window = -1; // the max distance of layer prediction, n: 0 -> [0,...,n-1]
+
+  float cache_rate = 0.5;
+  int   num_predict_expert_per_layer; // default value auto-infer from num_expert_per_token
+  bool  reorder_experts;              // default value auto-infer from num_predict_expert_per_layer
+  bool  early_preempt;                // default value auto-infer from num_predict_expert_per_layer
+  bool  chunk_prefetch;               // default value auto-infer from num_predict_expert_per_layer
+
+  std::string      predict_input_mode_str = "moe_layer_logits";
+  PredictInputMode predict_input_mode     = kMoeLayerLogits;
+  std::string      predictor_type_str     = "sep";
+  PredictorType    predictor_type         = kSepPredictor;
+
+  std::string predictor_model_path = "";
+  int  layer_predict_interval   = 1; // the frequency of layer prediction
+  int  layer_predict_max_window = 3; // the max distance of layer prediction, n: 0 -> [0,...,n-1]
   bool layer_predict_replace_first_input_with_last_output = false;
-  uint sleep_on_report_logits_us = 0;
-  float expert_mem_scale = 1.0;
-  int  num_dummy_params = 0;
 
   int limit_layer_0_window = -1;
   int limit_layer_0_num_predict = -1;
 
+  // deprecated
+  int         max_prefetch_layer_distance = -1;
+  bool        cache_only = false;
+  bool        per_layer_cache = true;
+  bool        promote_hit_in_prefetch = true;
+  std::string cache_policy = "lru";
+  int         predict_input_reuse_distance_max = 10;
+  int         predict_input_decay = 2;    // decode cumsum weight decay
+
+  // non-config
+  int num_per_expert_param;
+  std::vector<std::string> param_name_list;
+  std::unordered_map<std::string, int> param_name_to_id;
+
+  // envs
+  uint  sleep_on_report_logits_us = 0;
+  float expert_mem_scale = 1.0;
+  int   num_dummy_params = 0;
   std::string physical_mem_impl = "tensor_global_unified";
-  std::string logical_mem_impl = "tensor";
+  std::string logical_mem_impl  = "tensor";
 
   ModuleMeta(int num_layer, int num_expert) : num_layer(num_layer), num_expert(num_expert) {}
 
@@ -169,6 +182,10 @@ class ModuleMeta {
   inline std::pair<int,int> unsqueeze_expert_idx(int flatten_expert_id) {
     return std::make_pair(flatten_expert_id / num_expert, flatten_expert_id % num_expert);
   }
+
+  void init_from_map(std::unordered_map<std::string, std::string> config_map);
+  void translate_dialect(std::unordered_map<std::string, std::string> & config_map);
+  void log_configs();
 
   void handle_uninited_configs();
 };

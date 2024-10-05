@@ -34,6 +34,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     .def_readwrite("limit_layer_0_window",         &ModuleMeta::limit_layer_0_window)
     .def_readwrite("limit_layer_0_num_predict",    &ModuleMeta::limit_layer_0_num_predict)
     .def_readwrite("cache_only",                   &ModuleMeta::cache_only)
+    .def("init_from_map", &ModuleMeta::init_from_map)
     .def("handle_uninited_configs", &ModuleMeta::handle_uninited_configs)
     .def("init_param_list", &ModuleMeta::init_param_list)
   ;

@@ -132,44 +132,43 @@ def repo_folder_name(repo_id: str, repo_type: str = 'model') -> str:
 
 def inject_model(
     model : torch.nn.Module,
-    # cache configs
-    cache_rate : float,
-    num_predict_expert_per_layer : int,
-    cache_len : int = None,
-    max_prefetch_layer_distance = -1,
-    per_layer_cache : bool = True,
-    cache_policy : str = 'lru',
-    cache_device : str|int = 'cuda',
-    reorder_experts : bool = True,
-    predictor_type : str = None,
-    promote_hit_in_prefetch : bool = True,
-    early_preempt : bool = True,
-    chunk_prefetch : bool = True,
+    model_id = None,
     # metadatas of model
     num_moe_layer : int = None,
     num_expert_per_layer : int = None,
     num_expert_per_token : int = None,
-    expert_meta_parser = None,
-    expert_name_filter = None,
-    moe_mlp_name_filter = None,
-    moe_layer_name_filter = None,
+    # cache configs
+    cache_rate : float = None,
+    num_predict_expert_per_layer : int = None,
+    reorder_experts : bool = None,
+    early_preempt   : bool = None,
+    chunk_prefetch  : bool = None,
+
+    predict_input_mode = None,
+    predictor_type : str = None,
+
+    predictor_model_path : str = None,
+    layer_predict_interval     = None,
+    layer_predict_max_window   = None,
+    layer_predict_replace_first_input_with_last_output = False,
+
+    limit_layer_0_window      = None,
+    limit_layer_0_num_predict = None,
+
+    # deprecated
+    max_prefetch_layer_distance = None,
+    cache_only = False,
+    per_layer_cache : bool = None,
+    promote_hit_in_prefetch : bool = None,
+    cache_policy : str = None,
+
+    cache_device : str|int = 'cuda',
     pin_memory : bool  = True,
     module_trace_event : bool = False,
     enable_model_timer : bool = False,
     trace_event : bool = False,
     cache_trace_path : str = None,
-    predictor_model_path : str = None,
-    predict_input_mode = None,
-    layer_predict_interval   = -1,
-    layer_predict_max_window = -1,
-    limit_layer_0_window = -1,
-    limit_layer_0_num_predict = -1,
-    model_id = None,
-    model_revision = None,
-    layer_predict_replace_first_input_with_last_output = False,
     launch_now = True,
-    # deprecated
-    cache_only = False,
     **kwargs
   ):
   """
@@ -217,8 +216,7 @@ def inject_model(
   print("initializing cache lib...")
   if len(kwargs) > 0:
     print("warning, unused kwargs", kwargs)
-  if model_id is None:
-    model_id = model.config._name_or_path
+  model_id = model.config._name_or_path if model_id is None else model_id
 
   if num_moe_layer is None:
     auto_infered_model_metas = auto_infer_model_metas(model_id, return_dict=False)
@@ -231,20 +229,9 @@ def inject_model(
     moe_layer_name_filter = auto_infered_model_metas.moe_layer_name_filter
     moe_attn_name_filter  = auto_infered_model_metas.moe_attn_name_filter
 
-  if cache_len is None:
-    if per_layer_cache:
-      cache_len = round(cache_rate * num_expert_per_layer) * num_moe_layer
-    else:
-      cache_len = round(cache_rate * num_moe_layer * num_expert_per_layer)
-
-  if predictor_type is None:
-    predictor_type = 'legacy'
-    print(f'using legacy predictor')
-
-  if predict_input_mode is None:
-    predict_input_mode = 'one_token'
-
   meta = cpp_worker.ModuleMeta(num_moe_layer, num_expert_per_layer)
+  meta.model_arch_string = model_id
+  meta.num_expert_per_token = num_expert_per_token
 
   def find_first_expert(model, filter):
     first_expert_module = [None]
@@ -259,38 +246,30 @@ def inject_model(
   print(param_key_list)
   meta.init_param_list(param_key_list)
 
-  meta.model_arch_string = model_id
-  meta.num_predict_expert_per_layer = num_predict_expert_per_layer
-  meta.max_prefetch_layer_distance = max_prefetch_layer_distance
-  meta.num_expert_per_token = num_expert_per_token
-  meta.per_layer_cache = per_layer_cache
-  meta.cache_policy = cache_policy
-  meta.cache_only = cache_only
-  meta.reorder_experts = reorder_experts
-  meta.promote_hit_in_prefetch = promote_hit_in_prefetch
-  meta.early_preempt = early_preempt
-  meta.chunk_prefetch = chunk_prefetch
-  meta.layer_predict_replace_first_input_with_last_output = layer_predict_replace_first_input_with_last_output
-  meta.predict_input_mode = {
-    'no_predict': cpp_worker.kNoPredict,
-    'one_token': cpp_worker.kOneToken,
-    'decode_cumsum': cpp_worker.kDecodeCumsum,
-    'last_use_distance': cpp_worker.kLastUseDistance,
-    'weighted_decode_cumsum': cpp_worker.kWeighedDecodeCumsum,
-    'first_moe_attn_input_logits': cpp_worker.kFirstMoeAttnInputLogits,
-    'moe_attn_input_logits': cpp_worker.kMoeAttnInputLogits,
-    'moe_layer_logits': cpp_worker.kMoeLayerLogits,
-  }[predict_input_mode]
+  param_dict = {
+    'model_arch_string'            : str(model_id),
+    'num_expert_per_token'         : str(num_expert_per_token),
+    'cache_rate'                   : str(cache_rate),
+    'num_predict_expert_per_layer' : str(num_predict_expert_per_layer),
+    'reorder_experts'              : str(reorder_experts),
+    'early_preempt'                : str(early_preempt),
+    'chunk_prefetch'               : str(chunk_prefetch),
+    'predict_input_mode'           : str(predict_input_mode),
+    'predictor_type'               : str(predictor_type),
+    'predictor_model_path'         : str(predictor_model_path),
+    'layer_predict_interval'       : str(layer_predict_interval),
+    'layer_predict_max_window'     : str(layer_predict_max_window),
+    'cross_token_pred'             : str(layer_predict_replace_first_input_with_last_output),
+    'limit_layer_0_window'         : str(limit_layer_0_window),
+    'limit_layer_0_num_predict'    : str(limit_layer_0_num_predict),
+    'max_prefetch_layer_distance'  : str(max_prefetch_layer_distance),
+    'cache_only'                   : str(cache_only),
+    'per_layer_cache'              : str(per_layer_cache),
+    'promote_hit_in_prefetch'      : str(promote_hit_in_prefetch),
+    'cache_policy'                 : str(cache_policy),
+  }
 
-  meta.predictor_type = {
-    'legacy': cpp_worker.kLegacyPredictor,
-    'sep': cpp_worker.kSepPredictor,
-  }[predictor_type]
-
-  meta.layer_predict_interval = layer_predict_interval
-  meta.layer_predict_max_window = layer_predict_max_window
-  meta.limit_layer_0_window = limit_layer_0_window
-  meta.limit_layer_0_num_predict = limit_layer_0_num_predict
+  meta.init_from_map(param_dict)
 
   meta.handle_uninited_configs()
 
@@ -304,16 +283,12 @@ def inject_model(
 
   print("injecting model...")
   register_expert_params(model, model_loader, expert_name_filter)
-  prefetch_mngr.init_gpu_mem_buffer(cache_len)
+  prefetch_mngr.init_gpu_mem_buffer()
   replace_expert_param_reference(model, model_loader, expert_name_filter)
   replace_mlp_report_experts(model, prefetch_mngr, predictor, num_moe_layer, num_expert_per_layer, num_predict_expert_per_layer, moe_mlp_name_filter)
 
   # fixme: a general model path
-  if predictor_model_path == None:
-    print("skip loading predict model path")
-    pass
-  if predictor_model_path != None:
-    predictor.load_model(predictor_model_path)
+  predictor.load_model()
 
   if meta.cache_policy == 'min':
     # prefetch_mngr.cache.cache_oracle.load_from_file(cache_trace_path)

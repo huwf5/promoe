@@ -46,7 +46,8 @@ class PredictorBase {
   std::shared_ptr<TimeProfiler> profiler;
   cudaStream_t compute_stream;
   virtual PredictOutput predict(int input_layer_id) = 0;
-  virtual void load_model(std::string model_path) = 0;
+  virtual void load_model() { this->load_model_from(metas->predictor_model_path); };
+  virtual void load_model_from(std::string model_path) = 0;
   virtual void add_one_layer(int layer_id, torch::Tensor experts) {};
   virtual void add_one_layer(int layer_id, int64_t *experts, size_t num_expert) {};
   virtual void record_moe_attn_logits(int layer_id, torch::Tensor attn_logits) {};
@@ -120,7 +121,7 @@ class LegacyPredictor : public PredictorBase {
 
  public:
   LegacyPredictor(std::shared_ptr<ModuleMeta> metas);
-  void load_model(std::string model_path) override;
+  void load_model_from(std::string model_path) override;
 
   PredictOutput predict(int input_layer_id) override;
 
@@ -158,7 +159,7 @@ class SepPredictor : public PredictorBase {
 
  public:
   SepPredictor(std::shared_ptr<ModuleMeta> metas);
-  void load_model(std::string model_path) override;
+  void load_model_from(std::string model_path) override;
 
   PredictOutput predict(int input_layer_id) override;
 

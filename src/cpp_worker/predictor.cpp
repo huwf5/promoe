@@ -23,9 +23,6 @@ std::vector<std::pair<int, int>> build_predict_layer_mapping(ModuleMeta * metas)
     predict_layers[l + 1] = (l % metas->num_layer) + window;
     predict_layers[l + 1] = std::min(predict_layers[l + 1], metas->num_layer);
     stop_l = predict_layers[l + 1];
-
-    LOG(ERROR) << "predict model " << l << ", "
-               << "predicts [" << predict_layers[l] << ":" << predict_layers[l + 1] << ")";
   }
 
   for (int l = 1; l <= metas->num_layer; l++) {
@@ -262,7 +259,7 @@ void LegacyPredictor::load_one_model(std::string model_path, int idx) {
   //   break;
   // }
 }
-void LegacyPredictor::load_model(std::string model_path) {
+void LegacyPredictor::load_model_from(std::string model_path) {
   if (metas->predict_input_mode == kNoPredict) {
     predict_models[0] = PredictModel();
     predict_models[0].orig_output_start_layer = 0;
@@ -610,7 +607,7 @@ PredictOutput SepPredictor::predict_one_job(int input_layer_id, int job_idx) {
 }
 
 
-void SepPredictor::load_model(std::string model_path) {
+void SepPredictor::load_model_from(std::string model_path) {
   struct stat path_stat;
   auto stat_ret = stat(model_path.c_str(), &path_stat);
   CHECK(stat_ret == 0) << "Model file not found: " << model_path;

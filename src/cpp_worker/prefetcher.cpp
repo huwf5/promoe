@@ -159,13 +159,19 @@ void FetchScheduleWorker::pop_next_task(CopyTask &task, bool &found) {
     }
   }
 }
-void PrefetchMngr::init_gpu_mem_buffer(size_t num_buffers) {
+void PrefetchMngr::init_gpu_mem_buffer() {
   // hack: append a dummy chunk to each host experts
   if (metas->expert_mem_scale != 1.0) {
     model_loader->add_all_dummy_expert_params();
   }
 
-  cache->init_gpu_mem_buffer(num_buffers);
+  uint64_t cache_len = 0;
+  if (metas->per_layer_cache) {
+    cache_len = round(metas->cache_rate * metas->num_expert) * metas->num_layer;
+  } else {
+    cache_len = round(metas->cache_rate * metas->num_layer * metas->num_expert);
+  }
+  cache->init_gpu_mem_buffer(cache_len);
   model_loader->mem_mngr_ctx->dummy_physical = cache->cache_slots->slots.front().unused_mems.front();
 }
 void PrefetchMngr::preempt_and_launch_one_layer(int layer_idx, int64_t* experts, int64_t num_expert) {

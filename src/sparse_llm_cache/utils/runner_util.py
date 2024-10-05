@@ -17,51 +17,41 @@ class CustomBooleanAction(argparse.Action):
 
 def parse_args(args = None):
   parser = argparse.ArgumentParser()
-  parser.add_argument("--model_id", type=str, default=None)
-  parser.add_argument("--model_revision", type=str, default=None)
-  parser.add_argument("--dataset", type=str, default='chatgpt-prompts-small')
-  parser.add_argument("--max_num_batch", type=int, default=20)
-  parser.add_argument("--batch_size", type=int, default=1)
+  parser.add_argument("--model_id",                     type=str)
+  parser.add_argument("--model_revision",               type=str)
+
+  parser.add_argument("--cache_rate",                   type=float)
+  # parser.add_argument("--cache_len",                    type=int, default=None)
   parser.add_argument("--num_predict_expert_per_layer", type=int)
-  parser.add_argument("--cache_rate", type=float)
-  parser.add_argument("--cache_len", type=int, default=None)
-  parser.add_argument("--max_prefetch_layer_distance", type=int, default=-1)
-  parser.add_argument("--promote_hit_in_prefetch", action=CustomBooleanAction, default=True)
-  parser.add_argument("--early_preempt", action=CustomBooleanAction, default=True)
-  parser.add_argument("--chunk_prefetch", action=CustomBooleanAction, default=True)
-  parser.add_argument("--cache_policy", type=str, choices=["lru", "fifo", "nn", "min"], default="lru")
-  parser.add_argument("--cache_trace_path", type=str, default=None)
-  parser.add_argument("--predictor_model_path", type=str, default=None)
-  parser.add_argument("--predict_input_mode", type=str, choices=["one_token", "decode_cumsum", "last_use_distance", "weighted_decode_cumsum", "first_moe_attn_input_logits", "moe_attn_input_logits", "moe_layer_logits"], default='moe_layer_logits')
-  # parser.add_argument("--predict_mode", type=str, choices=["entire_token", "layer_window"], default='one_token')
-  # layer_predict_interval
-  # layer_predict_window
-  parser.add_argument("--predictor_type", type=str, choices=["legacy", "sep"], default="sep")
-  parser.add_argument("--layer_predict_interval",   type=int, default=None)
-  parser.add_argument("--layer_predict_max_window", type=int, default=None)
-  parser.add_argument("--layer_predict_use_last_output", action=CustomBooleanAction, default=False, dest='layer_predict_replace_first_input_with_last_output')
+  parser.add_argument("--early_preempt",   action=CustomBooleanAction)
+  parser.add_argument("--chunk_prefetch",  action=CustomBooleanAction)
+  parser.add_argument("--reorder_experts", action=CustomBooleanAction)
 
-  parser.add_argument("--limit_layer_0_num_predict", type=int, default=-1)
-  parser.add_argument("--limit_layer_0_window",      type=int, default=-1)
+  parser.add_argument("--predict_input_mode",      type=str, choices=["one_token", "decode_cumsum", "last_use_distance", "weighted_decode_cumsum", "first_moe_attn_input_logits", "moe_attn_input_logits", "moe_layer_logits"])
+  parser.add_argument("--predictor_type",          type=str, choices=["legacy", "sep"])
 
-  parser.add_argument(        "--per_layer_cache", action=CustomBooleanAction, default=True)
-  parser.add_argument( "--enable_per_layer_cache", action="store_true",  dest="per_layer_cache", default=True)
-  parser.add_argument("--disable_per_layer_cache", action="store_false", dest="per_layer_cache", default=True)
+  parser.add_argument("--predictor_model_path",         type=str)
+  parser.add_argument("--layer_predict_interval",       type=int)
+  parser.add_argument("--layer_predict_max_window",     type=int)
+  parser.add_argument("--layer_predict_use_last_output", action=CustomBooleanAction, dest='layer_predict_replace_first_input_with_last_output')
 
-  parser.add_argument(        "--reorder_experts", action=CustomBooleanAction, default=True)
-  parser.add_argument( "--enable_reorder_experts", action="store_true",   dest="reorder_experts", default=True)
-  parser.add_argument("--disable_reorder_experts", action="store_false",  dest="reorder_experts", default=True)
+  parser.add_argument("--limit_layer_0_window",      type=int)
+  parser.add_argument("--limit_layer_0_num_predict", type=int)
 
-  parser.add_argument(        "--trace_event", action=CustomBooleanAction, default=False)
-  parser.add_argument( "--enable_trace_event", action="store_true",   dest="trace_event", default=False)
-  parser.add_argument("--disable_trace_event", action="store_false",  dest="trace_event", default=False)
+  parser.add_argument("--max_prefetch_layer_distance",  type=int)
+  parser.add_argument("--cache_only",              action=CustomBooleanAction)
+  parser.add_argument("--per_layer_cache",         action=CustomBooleanAction)
+  parser.add_argument("--promote_hit_in_prefetch", action=CustomBooleanAction)
+  parser.add_argument("--cache_policy",            type=str, choices=["lru", "fifo", "nn", "min"])
 
-  parser.add_argument(        "--module_trace_event", action=CustomBooleanAction, default=False)
-  parser.add_argument( "--enable_module_trace_event", action="store_true",   dest="module_trace_event", default=False)
-  parser.add_argument("--disable_module_trace_event", action="store_false",  dest="module_trace_event", default=False)
+  parser.add_argument("--trace_event",        action=CustomBooleanAction)
+  parser.add_argument("--module_trace_event", action=CustomBooleanAction)
+  parser.add_argument("--cache_trace_path",   type=str)
 
+  parser.add_argument("--max_num_batch",                type=int, default=20)
+  parser.add_argument("--batch_size",                   type=int, default=1)
+  parser.add_argument("--dataset",                      type=str, default='chatgpt-prompts-small')
   # deprecated
-  parser.add_argument("--cache_only", action=CustomBooleanAction, default=False)
 
   args = parser.parse_args(args)
 

@@ -172,7 +172,7 @@ public:
                bool create_compute_stream = true,
                TimeProfiler* profiler = nullptr);
   ~PrefetchMngr();
-  void init_gpu_mem_buffer(size_t num_buffers);
+  void init_gpu_mem_buffer();
 
   void report_one_layer(int layer_id, torch::Tensor experts);
   void report_one_layer(int layer_id, int64_t* experts, int64_t num_expert);
