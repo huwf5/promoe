@@ -89,13 +89,7 @@ void ModuleMeta::handle_uninited_configs() {
   }
 
   if (expert_mem_scale != 1.0) {
-    LOG(ERROR) << "expert memory scale is set to " << expert_mem_scale << ", this is experimental feature.";
-    LOG_BLOCK(ERROR, logger, {
-      logger << "before scale, num_per_expert_param: " << num_per_expert_param << "\n";
-      for (int i = 0; i < num_per_expert_param; i++) {
-        logger << "param_name_list[" << i << "]: " << param_name_list[i] << ", mapped " << param_name_to_id[param_name_list[i]] << "\n";
-      }
-    });
+    LOG(ERROR) << "expert memory scale is set to " << expert_mem_scale;
     CHECK(expert_mem_scale > 1.0);
     num_dummy_params = std::ceil(num_per_expert_param * (expert_mem_scale - 1));
     for (int i = 0; i < num_dummy_params; i++) {
@@ -106,11 +100,5 @@ void ModuleMeta::handle_uninited_configs() {
       param_name_to_id[dummy_name] = dummy_id;
     }
     num_per_expert_param += num_dummy_params;
-    LOG_BLOCK(ERROR, logger, {
-      logger << "after scale, num_per_expert_param: " << num_per_expert_param << "\n";
-      for (int i = 0; i < num_per_expert_param; i++) {
-        logger << "param_name_list[" << i << "]: " << param_name_list[i] << ", mapped " << param_name_to_id[param_name_list[i]] << "\n";
-      }
-    });
   }
 }
