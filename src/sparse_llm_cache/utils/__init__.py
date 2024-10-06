@@ -394,6 +394,27 @@ def hack_transformers(**sparse_cache_kwargs):
   # if importlib.util.find_spec('auto_gptq') is not None:
   #   hack_auto_gptq()
 
+def inject_model_um(
+    model,
+    model_id = None,
+  ):
+  from sparse_llm_cache.cpp_worker import to_um
+  if model_id is None:
+    model_id = model.config._name_or_path
+  auto_infered_model_metas = auto_infer_model_metas(model_id, return_dict=False)
+  add_metadata_to_submodules(model, auto_infered_model_metas.expert_meta_parser)
+  def replace_expert_param_reference(model, filter):
+    def f(module, name):
+      def update_child_param(child_module, child_name):
+        for n,v in child_module.named_parameters():
+          child_module._parameters[n] = to_um(v)
+        for n,v in child_module.named_buffers():
+          if not param_buffer_name_to_prefetch(n): continue
+          child_module._buffers[n] = to_um(v)
+      recursive_traverse_childrens_leaf_only(module, update_child_param)
+    recursive_traverse_childrens(model, f, filter)
+
+  replace_expert_param_reference(model, auto_infered_model_metas.expert_name_filter)
 
 def hack_transformers_um():
   from sparse_llm_cache.cpp_worker import to_um

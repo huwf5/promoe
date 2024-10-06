@@ -15,8 +15,9 @@ class CustomBooleanAction(argparse.Action):
     else:
       raise ValueError("invalid boolean value {}".format(self.values))
 
-def parse_args(args = None):
-  parser = argparse.ArgumentParser()
+def prepare_argparser(parser = None):
+  if parser is None:
+    parser = argparse.ArgumentParser()
   parser.add_argument("--model_id",                     type=str)
   parser.add_argument("--model_revision",               type=str)
 
@@ -51,8 +52,11 @@ def parse_args(args = None):
   parser.add_argument("--max_num_batch",                type=int, default=20)
   parser.add_argument("--batch_size",                   type=int, default=1)
   parser.add_argument("--dataset",                      type=str, default='chatgpt-prompts-small')
-  # deprecated
+  return parser
 
+def parse_args(args = None, parser = None):
+  if parser is None:
+    parser = prepare_argparser()
   args = parser.parse_args(args)
 
   return vars(args)
