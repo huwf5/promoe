@@ -31,13 +31,27 @@ def add_metadata_to_submodules(model, parse_expert_meta_from_name):
       pass
   recursive_traverse_childrens(model, f)
 
+def add_prefix_to_submodules(model):
+  def f(module, name):
+    module._prefix = name
+  recursive_traverse_childrens(model, f)
+
+def param_buffer_name_to_prefetch(name):
+  if name.find('qweight') != -1:
+    return True
+  if name.find('zero') != -1:
+    return True
+  if name.find('scale') != -1:
+    return True
+  return False
+
 def register_expert_params(model, model_loader, filter=RegexFilter(r'.*layers\.(\d+)\.mlp\.experts\.(\d+)$')):
   def f(module, name):
     # print(f'registering expert {name}')
     for k,v in module.named_parameters():
       model_loader.add_one_expert_param(v, module._layer_id, module._expert_id, k)
     for k,v in module.named_buffers():
-      if k.find('qweight') == -1: continue
+      if not param_buffer_name_to_prefetch(k): continue
       model_loader.add_one_expert_param(v, module._layer_id, module._expert_id, k)
   recursive_traverse_childrens(model, f, filter)
 
@@ -48,7 +62,7 @@ def replace_expert_param_reference(model, model_loader, filter=RegexFilter(r'.*l
       for n,_ in child_module.named_parameters():
         child_module._parameters[n] = model_loader.ref_one_expert_param(module._layer_id, module._expert_id, child_name + '.' + n)
       for n,_ in child_module.named_buffers():
-        if n.find('qweight') == -1: continue
+        if not param_buffer_name_to_prefetch(n): continue
         child_module._buffers[n] = model_loader.ref_one_expert_param(module._layer_id, module._expert_id, child_name + '.' + n)
     recursive_traverse_childrens_leaf_only(module, update_child_param)
 
@@ -165,7 +179,7 @@ def inject_model(
     cache_device : str|int = 'cuda',
     pin_memory : bool  = True,
     module_trace_event : bool = False,
-    enable_model_timer : bool = False,
+    enable_model_timer : bool = True,
     trace_event : bool = False,
     cache_trace_path : str = None,
     launch_now = True,
@@ -242,7 +256,7 @@ def inject_model(
     return first_expert_module[0]
   first_expert = find_first_expert(model, expert_name_filter)
   param_key_list = [k for k,_ in first_expert.named_parameters()]
-  param_key_list += [k for k,_ in first_expert.named_buffers() if k.find('qweight') != -1]
+  param_key_list += [k for k,_ in first_expert.named_buffers() if param_buffer_name_to_prefetch(k)]
   print(param_key_list)
   meta.init_param_list(param_key_list)
 
