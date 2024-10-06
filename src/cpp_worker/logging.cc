@@ -60,6 +60,7 @@ void LogMessage::GenerateLogMessage(bool log_time) {
        << line_ << "] " << osstream.str() << std::endl;
   }
   os << ss.str();
+  os.flush();
 }
 
 LogMessage::~LogMessage() {
