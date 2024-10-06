@@ -2,6 +2,7 @@ import os
 
 os.environ['HF_HUB_OFFLINE'] = "1"
 os.environ['HUGGINGFACE_OFFLINE'] = "1"
+os.environ['PYTORCH_CUDA_ALLOC_CONF'] = "expandable_segments:True"
 
 from transformers.utils import logging
 from transformers.generation.utils import TimeProfiler, recursive_attach

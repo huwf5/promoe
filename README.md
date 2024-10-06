@@ -12,6 +12,9 @@ huggingface-cli download deepseek-ai/deepseek-moe-16b-chat
 huggingface-cli download Qwen/Qwen1.5-MoE-A2.7B-Chat
 # Patch model implementation to use our cache
 cp -r /code/sparse-llm-cache-scripts/huggingface-modules/modules /root/.cache/huggingface/
+# optionally download tokenizers for two large model
+huggingface-cli download Qwen/Qwen2-57B-A14B-Instruct tokenizer.json tokenizer_config.json vocab.json special_tokens_map.json
+huggingface-cli download mistralai/Mixtral-8x7B-Instruct-v0.1 special_tokens_map.json tokenizer.json tokenizer.model tokenizer_config.json
 ```
 
 ## Prepare the model (llama.cpp)
