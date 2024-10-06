@@ -435,8 +435,14 @@ class Queue {
   }
 };
 
+inline std::string string_to_lower(const std::string s) {
+  std::string lower_s = s;
+  std::transform(lower_s.begin(), lower_s.end(), lower_s.begin(), ::tolower);
+  return lower_s;
+}
 inline bool string_is_on(const std::string s) {
-  return s == "on" || s == "true" || s == "1" || s == "ON" || s == "TRUE";
+  auto lower_s = string_to_lower(s);
+  return s == "on" || s == "true" || s == "1";
 }
 
 template<typename T>
