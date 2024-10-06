@@ -359,23 +359,23 @@ PrefetchMngr::PrefetchMngr(std::shared_ptr<ModuleMeta> metas,
 
     {
       auto time = smart_slice(p->to_tensor(TimeProfiler::kWaitTime).index({idx_is_decode}), 10); // skip first 10 and last 1iteration
-      std::cout << "decode_stage_wait_time:" << time.mean(torch::kFloat32).item() << std::endl;
+      std::cout << "decode_stage_wait_time:" << time.mean(torch::kFloat32).item().to<double>() / 1000.0 << std::endl;
     }
     {
       auto time = smart_slice(p->to_tensor(TimeProfiler::kWaitTime).index({idx_is_prefill}), 2); // skip first 2 and last 1iteration
-      std::cout << "prefill_stage_wait_time:" << time.mean(torch::kFloat32).item() << std::endl;
+      std::cout << "prefill_stage_wait_time:" << time.mean(torch::kFloat32).item().to<double>() / 1000.0 << std::endl;
     }
     {
       auto time = smart_slice(p->to_tensor(TimeProfiler::kModelForward).index({idx_is_decode}), 10); // skip first 10 and last 1iteration
-      std::cout << "decode_stage_forward_time:" << time.mean(torch::kFloat32).item() << std::endl;
+      std::cout << "decode_stage_forward_time:" << time.mean(torch::kFloat32).item().to<double>() / 1000.0 << std::endl;
     }
     {
       auto time = smart_slice(p->to_tensor(TimeProfiler::kModelForward).index({idx_is_prefill}), 2); // skip first 2 and last 1iteration
-      std::cout << "prefill_stage_forward_time:" << time.mean(torch::kFloat32).item() << std::endl;
+      std::cout << "prefill_stage_forward_time:" << time.mean(torch::kFloat32).item().to<double>() / 1000.0 << std::endl;
     }
     {
       auto time = smart_slice(p->to_tensor(TimeProfiler::kPredictTime), 10); // skip first 10 and last 1iteration
-      std::cout << "predict_time:" << time.mean(torch::kFloat32).item() << std::endl;
+      std::cout << "predict_time:" << time.mean(torch::kFloat32).item().to<double>() / 1000.0 << std::endl;
     }
   });
   precision_profiler = std::make_shared<PrecisionProfiler>();
