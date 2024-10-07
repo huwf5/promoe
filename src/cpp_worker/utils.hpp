@@ -442,7 +442,7 @@ inline std::string string_to_lower(const std::string s) {
 }
 inline bool string_is_on(const std::string s) {
   auto lower_s = string_to_lower(s);
-  return s == "on" || s == "true" || s == "1";
+  return lower_s == "on" || lower_s == "true" || lower_s == "1";
 }
 
 template<typename T>
