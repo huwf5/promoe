@@ -114,6 +114,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("dump_trace_event_collector_singleton", &dump_trace_event_collector_singleton);
   m.def("to_um", &to_um);
   m.def("log_gpu_mem_info", &log_gpu_mem_info);
+  m.def("eat_cuda_memory", &eat_cuda_memory);
+  m.def("auto_eat_cuda_memory", &auto_eat_cuda_memory);
 
   py::enum_<ThreadType>(m, "ThreadType")
     .value("kPythonMain",     ThreadType::kPythonMain)

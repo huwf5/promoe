@@ -10,6 +10,7 @@ torch.cuda.set_device(0)
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 import sparse_llm_cache
+sparse_llm_cache.cpp_worker.auto_eat_cuda_memory()
 import time
 
 from sparse_llm_cache.utils.runner_util import parse_args
