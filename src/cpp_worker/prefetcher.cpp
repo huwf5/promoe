@@ -167,7 +167,8 @@ void PrefetchMngr::init_gpu_mem_buffer() {
 
   uint64_t cache_len = 0;
   if (metas->per_layer_cache) {
-    cache_len = round(metas->cache_rate * metas->num_expert) * metas->num_layer;
+    // cache_len = round(metas->cache_rate * metas->num_expert) * metas->num_layer;
+    cache_len = round(metas->cache_rate * metas->num_layer * metas->num_expert);
   } else {
     cache_len = round(metas->cache_rate * metas->num_layer * metas->num_expert);
   }

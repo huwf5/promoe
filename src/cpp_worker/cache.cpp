@@ -6,11 +6,32 @@
 
 void CacheMngr::init_gpu_mem_buffer(size_t num_buffers) {
   size_t num_cache_slot = cache_slots->slots.size();
-  CHECK(num_buffers % num_cache_slot == 0);
-  size_t per_layer_cache_len = num_buffers / num_cache_slot;
+  // CHECK(num_buffers % num_cache_slot == 0);
+  // size_t per_layer_cache_len = num_buffers / num_cache_slot;
+  std::vector<size_t> per_slot_cache_len(num_cache_slot, 0);
+  {
+    // Distribute num_buffers across num_cache_slot as evenly as possible
+    size_t base_size = num_buffers / num_cache_slot;
+    size_t remainder = num_buffers % num_cache_slot;
+
+    LOG(ERROR) << "for layer <  " << remainder << ", cache " << base_size+1 << "/" << metas->num_expert << " experts";
+    LOG(ERROR) << "for layer >= " << remainder << ", cache " << base_size   << "/" << metas->num_expert << " experts";
+
+    for (size_t i = 0; i < num_cache_slot; ++i) {
+      per_slot_cache_len[i] = base_size + (i < remainder ? 1 : 0);
+    }
+
+    // Verify that max difference is <= 1
+    size_t min_size = *std::min_element(per_slot_cache_len.begin(), per_slot_cache_len.end());
+    size_t max_size = *std::max_element(per_slot_cache_len.begin(), per_slot_cache_len.end());
+    CHECK(max_size - min_size <= 1);
+
+    LOG(INFO) << "Cache slots distribution: " << nlohmann::json(per_slot_cache_len).dump();
+  }
 
   size_t max_per_expert_nbytes = 0;
   auto max_expert_example = model_loader->get_source(0, 0)->host_data.get();
+  // find the expert with the max memory usage
   for (int l = 0; l < metas->num_layer; l++) {
     for (int e = 0; e < metas->num_expert; e++) {
       auto host_data = model_loader->get_source(l, e)->host_data.get();
@@ -30,7 +51,9 @@ void CacheMngr::init_gpu_mem_buffer(size_t num_buffers) {
     CUDA_CALL(cudaMemset(model_loader->mem_mngr_ctx->global_unified_mem, 0, model_loader->mem_mngr_ctx->global_unified_mem_size));
   }
 
-  for (auto & cache_slot : cache_slots->slots) {
+  for (int i = 0; i < num_cache_slot; i++) {
+    auto & cache_slot = cache_slots->slots[i];
+    auto per_layer_cache_len = per_slot_cache_len[i];
     cache_slot.full_len = per_layer_cache_len;
     cache_slot.unused_mems.resize(per_layer_cache_len, nullptr);
     for (auto & cache_line : cache_slot.unused_mems) {
