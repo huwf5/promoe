@@ -38,7 +38,8 @@ model = AutoModelForCausalLM.from_pretrained(
   trust_remote_code=True,
   revision=cache_configs['model_revision'],
 )
-print("loading model...done", time.time() - load_time_start)
+load_model_time = time.time() - load_time_start
+print("loading model...done", load_model_time)
 
 time_profiler = TimeProfiler()
 recursive_attach(model, time_profiler, '_time_profiler')
@@ -70,12 +71,16 @@ class StringListDataset(Dataset):
 ds = StringListDataset(prompts)
 dl = torch.utils.data.DataLoader(ds, batch_size=cache_configs['batch_size'], shuffle=False)
 
+eval_time_start = time.time()
 for seq_id,text_list in enumerate(dl):
   if seq_id >= cache_configs['max_num_batch']:
     print("max_num_batch reached")
     break
   print(f'Seq {seq_id}/{cache_configs["max_num_batch"]}, decoding...', flush=True)
   input_len, output_len = gen_batch(text_list, max_new_tokens=128, do_print=True)
+eval_time = time.time() - eval_time_start
 
 time_profiler.log()
 sparse_llm_cache.cpp_worker.log_gpu_mem_info()
+print("load_model_time:", load_model_time)
+print("eval_time:", eval_time)

@@ -44,7 +44,6 @@ def load_model(cache_configs):
   #   HQQLinear.set_backend(HQQBackend.ATEN)
   HQQLinear.set_backend(HQQBackend.ATEN)
 
-  load_time_start = time.time()
   tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
   tokenizer.pad_token = tokenizer.eos_token
 
@@ -54,7 +53,6 @@ def load_model(cache_configs):
 
   print(f"Loading model {model_id} with dtype {dtype} and backend aten")
   model = AutoHQQHFModel.from_quantized(save_dir, trust_remote_code=True, device='cpu', compute_dtype=dtype)
-  print("Loading model...done", time.time() - load_time_start)
 
   # device_map = infer_auto_device_map(model, max_memory={0: "6GiB", 'cpu': "120GiB"})
   max_memory = get_max_memory()
@@ -100,18 +98,26 @@ def load_prompt_list(cache_configs):
   return dl
 
 def main(cache_configs):
+  load_time_start = time.time()
   model, tokenizer, time_profiler = load_model(cache_configs)
+  load_model_time = time.time() - load_time_start
+  print("Loading model...done", load_model_time)
+
   dl = load_prompt_list(cache_configs)
 
+  eval_time_start = time.time()
   for seq_id,text_list in enumerate(dl):
     if seq_id >= cache_configs['max_num_batch']:
       print("max_num_batch reached")
       break
     print(f'Seq {seq_id}/{cache_configs["max_num_batch"]}, decoding...', flush=True)
     input_len, output_len = gen_batch(model, tokenizer, text_list, max_new_tokens=128, do_print=True)
+  eval_time = time.time() - eval_time_start
 
   time_profiler.log()
   sparse_llm_cache.cpp_worker.log_gpu_mem_info()
+  print("load_model_time:", load_model_time)
+  print("eval_time:", eval_time)
 
 if __name__ == "__main__":
   cache_configs = prepare_args()
