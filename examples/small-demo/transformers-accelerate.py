@@ -70,12 +70,11 @@ ds = StringListDataset(prompts)
 dl = torch.utils.data.DataLoader(ds, batch_size=cache_configs['batch_size'], shuffle=False)
 
 for seq_id,text_list in enumerate(dl):
-  if seq_id > cache_configs['max_num_batch']:
+  if seq_id >= cache_configs['max_num_batch']:
     print("max_num_batch reached")
     break
-  start_time = time.time()
+  print(f'Seq {seq_id}/{cache_configs["max_num_batch"]}, decoding...', flush=True)
   input_len, output_len = gen_batch(text_list, max_new_tokens=128, do_print=True)
-  print(input_len, output_len, time.time() - start_time, flush=True)
 
 time_profiler.log()
 sparse_llm_cache.cpp_worker.log_gpu_mem_info()

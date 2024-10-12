@@ -330,6 +330,23 @@ PrefetchMngr::PrefetchMngr(std::shared_ptr<ModuleMeta> metas,
     // auto idx_is_decode  = num_used_expert_tensor <= (metas->num_expert_per_token * metas->num_layer);
     auto idx_is_prefill = p->to_tensor(TimeProfiler::kSeqLen) > 1;
     auto idx_is_decode  = p->to_tensor(TimeProfiler::kSeqLen) <= 1;
+    auto prefill_idxs = torch::nonzero(idx_is_prefill).squeeze();
+    int num_first_prompts_to_skip = 0;
+    if ((prefill_idxs[1].item<int>() == 1) && (prefill_idxs[2].item<int>() == 2)) {
+      // we are in llama.cpp, where it includes a system prompt, warm with <bos><eos>, and 3 warm requests
+      num_first_prompts_to_skip = 5;
+    } else {
+      // we are in transformers, it has 4 warm up requests
+      num_first_prompts_to_skip = 4;
+    }
+    int starting_point = 0;
+    if (prefill_idxs.size(0) <= num_first_prompts_to_skip) {
+      starting_point = idx_is_prefill.size(0);
+    } else {
+      starting_point = prefill_idxs[num_first_prompts_to_skip].item<int>();
+    }
+    idx_is_prefill.index_put_({torch::indexing::Slice(0, starting_point)}, false);
+    idx_is_decode.index_put_({torch::indexing::Slice(0, starting_point)}, false);
     auto smart_slice = [](torch::Tensor tensor, int skip_first) {
       if (skip_first > tensor.size(0)) {
         return tensor.index({torch::indexing::Slice(tensor.size(0))});
@@ -337,42 +354,46 @@ PrefetchMngr::PrefetchMngr(std::shared_ptr<ModuleMeta> metas,
         return tensor.index({torch::indexing::Slice(skip_first)});
       }
     };
-    auto lambda_report_one_pair([this, p, smart_slice](
+    auto lambda_report_one_pair([this, p](
         TimeProfiler::TimeType on,
         TimeProfiler::TimeType off,
-        int skip_first, torch::Tensor idx,
+        torch::Tensor idx,
         std::string on_name,
         std::string off_name,
         std::string rate_name) {
-      auto on_val  = smart_slice(p->to_tensor(on  ).index({idx}), skip_first).mean(torch::kFloat32).item<float>();
-      auto off_val = smart_slice(p->to_tensor(off ).index({idx}), skip_first).mean(torch::kFloat32).item<float>();
+      auto on_val  = p->to_tensor(on  ).index({idx}).mean(torch::kFloat32).item<float>();
+      auto off_val = p->to_tensor(off ).index({idx}).mean(torch::kFloat32).item<float>();
       std::cout << on_name   << ":" << on_val  << std::endl;
       std::cout << off_name  << ":" << off_val << std::endl;
       std::cout << rate_name << ":" << on_val / (on_val + off_val) << std::endl;
     });
 
-    lambda_report_one_pair(TimeProfiler::kReadyCnt, TimeProfiler::kUnreadyCnt, 10, idx_is_decode,   "decode_stage_ready_cnt",  "decode_stage_unready_cnt",  "decode_stage_ready_rate");
-    lambda_report_one_pair(TimeProfiler::kReadyCnt, TimeProfiler::kUnreadyCnt,  2, idx_is_prefill, "prefill_stage_ready_cnt", "prefill_stage_unready_cnt", "prefill_stage_ready_rate");
-    lambda_report_one_pair(TimeProfiler::kHitCnt, TimeProfiler::kMissCnt, 10, idx_is_decode,   "decode_stage_hit_cnt",  "decode_stage_miss_cnt",  "decode_stage_hit_rate");
-    lambda_report_one_pair(TimeProfiler::kHitCnt, TimeProfiler::kMissCnt,  2, idx_is_prefill, "prefill_stage_hit_cnt", "prefill_stage_miss_cnt", "prefill_stage_hit_rate");
-    lambda_report_one_pair(TimeProfiler::kPrefetchHitCnt, TimeProfiler::kPrefetchMissCnt, 10, idx_is_decode,   "decode_stage_prefetch_hit_cnt",  "decode_stage_prefetch_miss_cnt",  "decode_stage_prefetch_hit_rate");
-    lambda_report_one_pair(TimeProfiler::kPrefetchHitCnt, TimeProfiler::kPrefetchMissCnt,  2, idx_is_prefill, "prefill_stage_prefetch_hit_cnt", "prefill_stage_prefetch_miss_cnt", "prefill_stage_prefetch_hit_rate");
+    lambda_report_one_pair(TimeProfiler::kReadyCnt, TimeProfiler::kUnreadyCnt, idx_is_decode,   "decode_stage_ready_cnt",  "decode_stage_unready_cnt",  "decode_stage_ready_rate");
+    lambda_report_one_pair(TimeProfiler::kReadyCnt, TimeProfiler::kUnreadyCnt, idx_is_prefill, "prefill_stage_ready_cnt", "prefill_stage_unready_cnt", "prefill_stage_ready_rate");
+    lambda_report_one_pair(TimeProfiler::kHitCnt, TimeProfiler::kMissCnt, idx_is_decode,   "decode_stage_hit_cnt",  "decode_stage_miss_cnt",  "decode_stage_hit_rate");
+    lambda_report_one_pair(TimeProfiler::kHitCnt, TimeProfiler::kMissCnt, idx_is_prefill, "prefill_stage_hit_cnt", "prefill_stage_miss_cnt", "prefill_stage_hit_rate");
+    lambda_report_one_pair(TimeProfiler::kPrefetchHitCnt, TimeProfiler::kPrefetchMissCnt, idx_is_decode,   "decode_stage_prefetch_hit_cnt",  "decode_stage_prefetch_miss_cnt",  "decode_stage_prefetch_hit_rate");
+    lambda_report_one_pair(TimeProfiler::kPrefetchHitCnt, TimeProfiler::kPrefetchMissCnt, idx_is_prefill, "prefill_stage_prefetch_hit_cnt", "prefill_stage_prefetch_miss_cnt", "prefill_stage_prefetch_hit_rate");
 
     {
-      auto time = smart_slice(p->to_tensor(TimeProfiler::kWaitTime).index({idx_is_decode}), 10); // skip first 10 and last 1iteration
+      auto time = p->to_tensor(TimeProfiler::kWaitTime).index({idx_is_decode});
       std::cout << "decode_stage_wait_time:" << time.mean(torch::kFloat32).item().to<double>() / 1000.0 << std::endl;
     }
     {
-      auto time = smart_slice(p->to_tensor(TimeProfiler::kWaitTime).index({idx_is_prefill}), 2); // skip first 2 and last 1iteration
+      auto time = p->to_tensor(TimeProfiler::kWaitTime).index({idx_is_prefill});
       std::cout << "prefill_stage_wait_time:" << time.mean(torch::kFloat32).item().to<double>() / 1000.0 << std::endl;
     }
     {
-      auto time = smart_slice(p->to_tensor(TimeProfiler::kModelForward).index({idx_is_decode}), 10); // skip first 10 and last 1iteration
+      auto time = p->to_tensor(TimeProfiler::kModelForward).index({idx_is_decode});
       std::cout << "decode_stage_forward_time:" << time.mean(torch::kFloat32).item().to<double>() / 1000.0 << std::endl;
     }
     {
-      auto time = smart_slice(p->to_tensor(TimeProfiler::kModelForward).index({idx_is_prefill}), 2); // skip first 2 and last 1iteration
+      auto time = p->to_tensor(TimeProfiler::kModelForward).index({idx_is_prefill});
       std::cout << "prefill_stage_forward_time:" << time.mean(torch::kFloat32).item().to<double>() / 1000.0 << std::endl;
+    }
+    {
+      std::cout << "num_prefill_iter:" << torch::nonzero(idx_is_prefill).squeeze().numel() << std::endl;
+      std::cout << "num_decode_iter:" << torch::nonzero(idx_is_decode).squeeze().numel() << std::endl;
     }
     {
       auto time = smart_slice(p->to_tensor(TimeProfiler::kPredictTime), 10); // skip first 10 and last 1iteration
