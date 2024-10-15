@@ -54,6 +54,29 @@ class CachePolicyLRU : public CachePolicy {
   void access_on_hit(ExpertHandler *e) override;
   void access_on_miss(ExpertHandler *e) override;
 };
+class CachePolicyStatic : public CachePolicy {
+  using LL = DoubleLinkedList<ExpertHandler*>;
+  std::vector<LL::Node*> linked_list_node_free_buffer;
+  LL linked_list;
+  std::unordered_map<ExpertHandler*, LL::Node*> map;
+  std::unordered_set<ExpertHandler*> persisted_experts;
+  int max_alternative_buffer_len = 2;
+ public:
+  using CachePolicy::CachePolicy;
+  CachePolicyStatic(CacheMngr* cache, int max_alternative_buffer_len = 2) : CachePolicy(cache), max_alternative_buffer_len(max_alternative_buffer_len) {}
+  ~CachePolicyStatic() {
+    while (linked_list_node_free_buffer.empty() == false) {
+      delete linked_list_node_free_buffer.back();
+      linked_list_node_free_buffer.pop_back();
+    }
+  }
+  ExpertHandler *select_for_evict(ExpertHandler *) override {
+    return linked_list.front()->data;
+  }
+  void evict(ExpertHandler *e) override;
+  void access_on_hit(ExpertHandler *e) override;
+  void access_on_miss(ExpertHandler *e) override;
+};
 
 class CachePolicyNN : public CachePolicy {
   using Heap = MinHeap<ExpertHandler*>;

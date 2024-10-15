@@ -94,6 +94,8 @@ CacheMngr::CacheMngr(std::shared_ptr<ModuleMeta> metas,
 
   policy_factory.register_policy("fifo", [this]() -> std::shared_ptr<CachePolicy>{ return std::make_shared<CachePolicyFIFO>(this); });
   policy_factory.register_policy("lru",  [this]() -> std::shared_ptr<CachePolicy>{ return std::make_shared<CachePolicyLRU>(this);  });
+  policy_factory.register_policy("static-1",  [this]() -> std::shared_ptr<CachePolicy>{ return std::make_shared<CachePolicyStatic>(this, 1);  });
+  policy_factory.register_policy("static-2",  [this]() -> std::shared_ptr<CachePolicy>{ return std::make_shared<CachePolicyStatic>(this, 2);  });
   policy_factory.register_policy("nn",   [this]() -> std::shared_ptr<CachePolicy>{ 
     auto ret = std::make_shared<CachePolicyNN>(this);
     ret->priority_fn = this->priority_get_fn;
@@ -271,6 +273,49 @@ void CachePolicyLRU::access_on_miss(ExpertHandler *e) {
   n->data = e;
   linked_list.push_back(n);
 }
+void CachePolicyStatic::access_on_hit(ExpertHandler *e) {
+  CHECK(map.find(e) != map.end());
+  // auto n = map[e];
+  // linked_list.remove(n);
+  // linked_list.push_back(n);
+}
+void CachePolicyStatic::access_on_miss(ExpertHandler *e) {
+  CHECK(map.find(e) == map.end());
+
+  if (linked_list.size() == this->max_alternative_buffer_len) {
+    // remove one from linked_list to persisted_experts
+    auto first_node = linked_list.pop_front();
+    auto expert_to_persist = first_node->data;
+    linked_list_node_free_buffer.push_back(first_node);
+    first_node = nullptr;
+    persisted_experts.insert(expert_to_persist);
+    map[expert_to_persist] = nullptr;
+  }
+
+  CHECK(linked_list.size() < this->max_alternative_buffer_len);
+
+  LL::Node *n = nullptr;
+  if (linked_list_node_free_buffer.empty()) {
+    n = new LL::Node;
+  } else {
+    n = linked_list_node_free_buffer.back();
+    linked_list_node_free_buffer.pop_back();
+  }
+
+  map[e] = n;
+  n->data = e;
+  linked_list.push_back(n);
+}
+
+void CachePolicyStatic::evict(ExpertHandler *e) {
+  CHECK(map.find(e) != map.end());
+  CHECK(map[e] != nullptr);
+  CHECK(persisted_experts.find(e) == persisted_experts.end());
+  auto n = linked_list.remove(map[e]);
+  linked_list_node_free_buffer.push_back(n);
+  map.erase(e);
+}
+
 void CachePolicyNN::access_on_hit(ExpertHandler *e) {
   CHECK(map.find(e) != map.end());
 }

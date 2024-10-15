@@ -1,6 +1,7 @@
 #pragma once
 #include <atomic>
 #include <cassert>
+#include <cstddef>
 #include <cstdint>
 #include <pthread.h>
 #include <string>
@@ -216,6 +217,8 @@ struct DoubleLinkedList {
     DATA_T data;
   };
   Node guard_head, guard_tail;
+  size_t len = 0;
+  size_t size() { return len; }
   DoubleLinkedList() {
     guard_head.next = &guard_tail;
     guard_tail.prev = &guard_head;
@@ -230,12 +233,14 @@ struct DoubleLinkedList {
     new_node->prev = after_me;
     new_node->next->prev = new_node;
     new_node->prev->next = new_node;
+    len++;
   }
   Node* remove(Node* n) {
     n->next->prev = n->prev;
     n->prev->next = n->next;
     n->next = nullptr;
     n->prev = nullptr;
+    len--;
     return n;
   }
 
