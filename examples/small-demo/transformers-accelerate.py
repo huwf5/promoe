@@ -14,9 +14,17 @@ import sparse_llm_cache
 sparse_llm_cache.cpp_worker.auto_eat_cuda_memory()
 import time
 
-from sparse_llm_cache.utils.runner_util import parse_args
-cache_configs = parse_args()
+from sparse_llm_cache.utils.runner_util import parse_args, prepare_argparser
+parser = prepare_argparser()
+parser.add_argument('--max_gpu_memory', type=float, default=None, help='Max gpu memory to use for the model')
+cache_configs = parse_args(parser=parser)
 for k, v in cache_configs.items(): print(k,v)
+
+from accelerate.utils import get_max_memory
+max_memory = None
+if cache_configs['max_gpu_memory'] is not None:
+  max_memory = get_max_memory()
+  max_memory[0] = int(max_memory[0] * cache_configs['max_gpu_memory'])
 
 print("loading model...")
 load_time_start = time.time()
@@ -34,6 +42,7 @@ model = AutoModelForCausalLM.from_pretrained(
   torch_dtype=torch_dtype,
   local_files_only=True,
   device_map='auto',
+  max_memory=max_memory,
   trust_remote_code=True,
   revision=cache_configs['model_revision'],
 )
