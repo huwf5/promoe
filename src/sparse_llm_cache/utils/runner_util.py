@@ -43,7 +43,7 @@ def prepare_argparser(parser = None):
   parser.add_argument("--cache_only",              action=CustomBooleanAction)
   parser.add_argument("--per_layer_cache",         action=CustomBooleanAction)
   parser.add_argument("--promote_hit_in_prefetch", action=CustomBooleanAction)
-  parser.add_argument("--cache_policy",            type=str, choices=["lru", "fifo", "nn", "min"])
+  parser.add_argument("--cache_policy",            type=str, choices=["lru", "fifo", "nn", "min", "static-1", "static-2"])
 
   parser.add_argument("--trace_event",        action=CustomBooleanAction)
   parser.add_argument("--module_trace_event", action=CustomBooleanAction)
