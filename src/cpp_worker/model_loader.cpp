@@ -168,6 +168,7 @@ torch::Tensor to_um(torch::Tensor t) {
   CUDA_CALL(cudaMallocManaged(&ptr, t.nbytes()));
   CUDA_CALL(cudaMemcpyAsync(ptr, t.data_ptr(), t.nbytes(), cudaMemcpyDefault, 0));
   CUDA_CALL(cudaStreamSynchronize(0));
+  CUDA_CALL(cudaMemAdvise(ptr, t.nbytes(), cudaMemAdviseSetReadMostly, 0));
   return torch::from_blob(ptr, t.sizes(), t.options().device(torch::kCUDA, 0));
 }
 void ExpertMemHanlderTensor::allocate_like(HostExpertMemHanlderBase *other, MemMngrCtx *ctx) {
