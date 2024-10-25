@@ -91,6 +91,18 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     .def_readwrite("cache",         &PrefetchMngr::cache)
     .def_readwrite("copy_stream",    &PrefetchMngr::copy_stream)
     .def_readwrite("compute_stream", &PrefetchMngr::compute_stream)
+    .def(py::pickle(
+      [](std::shared_ptr<PrefetchMngr> a) { // dump
+        // Store the address of the PrefetchMngr object as a Python bytes object
+        return py::make_tuple(
+          reinterpret_cast<uint64_t>(a.get())
+        );
+      },
+      [](py::tuple t) { // load
+        auto ptr = reinterpret_cast<PrefetchMngr*>(t[0].cast<uint64_t>());
+        return ptr->shared_from_this();
+      }
+    ))
   ;
 
   py::class_<TraceEventGuard, std::shared_ptr<TraceEventGuard>>(m, "TraceEventGuard")

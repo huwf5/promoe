@@ -131,7 +131,7 @@ protected:
   void do_one_task_impl(FetchScheduleTaskBase *task);
 };
 
-class PrefetchMngr {
+class PrefetchMngr : public std::enable_shared_from_this<PrefetchMngr> {
   friend class FetchScheduleWorker;
   friend class FetchWorker;
 
