@@ -10,10 +10,8 @@ from transformers.utils import logging
 logging.disable_progress_bar()
 from transformers.generation.utils import TimeProfiler, recursive_attach
 torch.cuda.set_device(0)
-from transformers import AutoModelForCausalLM, AutoTokenizer
-from auto_gptq import AutoGPTQForCausalLM, BaseQuantizeConfig
-from auto_gptq.modeling import Qwen2MoEGPTQForCausalLM, DeepseekV2GPTQForCausalLM
-from auto_gptq.modeling._utils import simple_dispatch_model
+from transformers import AutoTokenizer
+from auto_gptq import AutoGPTQForCausalLM
 
 import sparse_llm_cache
 from sparse_llm_cache.utils import repo_folder_name
@@ -41,12 +39,6 @@ def load_model(cache_configs):
   tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
   tokenizer.pad_token = tokenizer.eos_token
 
-  CausalLM = AutoGPTQForCausalLM
-  if 'Qwen2-57B-A14B-Instruct' in model_id:
-    CausalLM = Qwen2MoEGPTQForCausalLM
-  elif 'deepseek-moe-16b-chat' in model_id:
-    CausalLM = DeepseekV2GPTQForCausalLM
-
   use_tritonv2 = False
   disable_exllama = False
   disable_exllamav2 = False
@@ -57,7 +49,7 @@ def load_model(cache_configs):
     disable_exllama = False
     disable_exllamav2 = True
 
-  model = CausalLM.from_quantized(
+  model = AutoGPTQForCausalLM.from_quantized(
     save_dir,
     torch_dtype=torch.float16,
     local_files_only=True,
