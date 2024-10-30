@@ -4,6 +4,56 @@
 #include "logging.hpp"
 #include "profiler.hpp"
 
+namespace {
+
+void bi_traverse(int* array, int begin, int end, std::vector<int>& ret) {
+  if (begin == end) {
+    return;
+  }
+  std::queue<std::pair<int,int>> q;
+  q.push({begin, end});
+  
+  while (!q.empty()) {
+    auto [l, r] = q.front();
+    q.pop();
+    if (l == r) continue;
+
+    if (r - l == 1) {
+      if (q.empty()) {
+        ret.push_back(array[l]);
+        return;
+      } else {
+        // collect all remaining elements in queue to a new array, and call bi_traverse on it
+        std::vector<int> remaining;
+        for (int i = l; i < r; i++) {
+          remaining.push_back(array[i]);
+        }
+        while (!q.empty()) {
+          auto [l, r] = q.front();
+          q.pop();
+          for (int i = l; i < r; i++) {
+            remaining.push_back(array[i]);
+          }
+        }
+        bi_traverse(remaining.data(), 0, remaining.size(), ret);
+        return;
+      }
+    }
+    
+    int mid = (l + r) / 2;
+    ret.push_back(array[mid]);
+    
+    if (l < mid) {
+      q.push({l, mid});
+    }
+    if (mid + 1 < r) {
+      q.push({mid + 1, r}); 
+    }
+  }
+}
+
+};
+
 void CacheMngr::init_gpu_mem_buffer(size_t num_buffers) {
   size_t num_cache_slot = cache_slots->slots.size();
   // CHECK(num_buffers % num_cache_slot == 0);
@@ -14,11 +64,25 @@ void CacheMngr::init_gpu_mem_buffer(size_t num_buffers) {
     size_t base_size = num_buffers / num_cache_slot;
     size_t remainder = num_buffers % num_cache_slot;
 
-    LOG(ERROR) << "for layer <  " << remainder << ", cache " << base_size+1 << "/" << metas->num_expert << " experts";
-    LOG(ERROR) << "for layer >= " << remainder << ", cache " << base_size   << "/" << metas->num_expert << " experts";
+    std::vector<int> priority_to_get_remainder;
+    std::vector<int> candidates(num_cache_slot, 0);
+    for (int i = 0; i < num_cache_slot; i++) {
+      candidates[i] = i;
+    }
+    if (num_cache_slot > 2) {
+      priority_to_get_remainder.push_back(candidates[0]);
+      priority_to_get_remainder.push_back(candidates[1]);
+      bi_traverse(candidates.data(), 2, num_cache_slot, priority_to_get_remainder);
+    } else {
+      priority_to_get_remainder = candidates;
+    }
 
     for (size_t i = 0; i < num_cache_slot; ++i) {
-      per_slot_cache_len[i] = base_size + (i < remainder ? 1 : 0);
+      auto slot_idx = priority_to_get_remainder[i];
+      per_slot_cache_len[slot_idx] = base_size + (i < remainder ? 1 : 0);
+    }
+    for (size_t i = 0; i < num_cache_slot; ++i) {
+      LOG(ERROR) << "layer " << i << " has " << per_slot_cache_len[i] << " buffers";
     }
 
     // Verify that max difference is <= 1
