@@ -438,7 +438,7 @@ def hack_transformers_um():
           for n,v in child_module.named_parameters():
             child_module._parameters[n] = to_um(v)
           for n,v in child_module.named_buffers():
-            if n.find('qweight') == -1: continue
+            if not param_buffer_name_to_prefetch(n): continue
             child_module._buffers[n] = to_um(v)
         recursive_traverse_childrens_leaf_only(module, update_child_param)
       recursive_traverse_childrens(model, f, filter)
