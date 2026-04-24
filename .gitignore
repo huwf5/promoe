@@ -1,3 +1,6 @@
+# install.sh 默认克隆的依赖仓库（本地开发，不提交）
+/deps/
+
 **/__pycache__
 **/*.egg-info
 **/*.so
@@ -5,3 +8,4 @@
 
 run-logs*
 .cache/clangd
+.worktrees/
