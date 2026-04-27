@@ -190,6 +190,9 @@ class SwitchRunner:
             SwitchTransformersTop1Router,
         )
 
+        if self._hook_handles:
+            self._remove_hooks()
+
         for m in self.model.modules():
             if isinstance(m, SwitchTransformersTop1Router):
                 m.jitter_noise = 0.0
@@ -205,9 +208,10 @@ class SwitchRunner:
                         h = mlp.register_forward_hook(self._sparse_mlp_hook)
                         self._hook_handles.append(h)
                         sparse_id += 1
-            assert sparse_id == NUM_SPARSE_LAYERS, (
-                f"{stack_name}: found {sparse_id} sparse MLPs, expected {NUM_SPARSE_LAYERS}"
-            )
+            if sparse_id != NUM_SPARSE_LAYERS:
+                raise RuntimeError(
+                    f"{stack_name}: found {sparse_id} sparse MLPs, expected {NUM_SPARSE_LAYERS}"
+                )
 
     def _remove_hooks(self) -> None:
         for h in self._hook_handles:
@@ -215,15 +219,62 @@ class SwitchRunner:
         self._hook_handles.clear()
 
     def _sparse_mlp_hook(self, module, inputs, output):
-        router_logits = output[1]
-        if router_logits.dim() == 2:
-            B, S = inputs[0].shape[0], inputs[0].shape[1]
-            router_logits = router_logits.view(B, S, -1)
+        router_logits = self._extract_router_logits(module, inputs, output)
         layer_id = module._promoe_sparse_layer_id
         if module._promoe_stage == "encoder":
             self._encoder_slot_buffer[layer_id] = router_logits.detach().cpu()
         else:
             self._decoder_step_buffer.setdefault(layer_id, []).append(router_logits.detach().cpu())
+
+    def _extract_router_logits(self, module, inputs, output) -> torch.Tensor:
+        if not isinstance(output, (tuple, list)) or len(output) < 2:
+            raise RuntimeError(
+                "Switch sparse MLP hook expected output as (hidden_states, router_logits), "
+                f"got {type(output).__name__}"
+            )
+
+        router_payload = output[1]
+        if isinstance(router_payload, torch.Tensor):
+            router_logits = router_payload
+        elif isinstance(router_payload, (tuple, list)) and router_payload:
+            router_logits = router_payload[0]
+        else:
+            raise RuntimeError(
+                "Switch sparse MLP hook could not find router logits in output[1]; "
+                f"got {type(router_payload).__name__}"
+            )
+
+        if not isinstance(router_logits, torch.Tensor):
+            raise RuntimeError(
+                "Switch sparse MLP hook expected router logits tensor, "
+                f"got {type(router_logits).__name__}"
+            )
+        if router_logits.shape[-1] != EXPECTED_NUM_EXPERTS:
+            raise RuntimeError(
+                f"{module._promoe_stage} sparse layer {module._promoe_sparse_layer_id}: "
+                f"expected router logits last dim {EXPECTED_NUM_EXPERTS}, "
+                f"got shape {tuple(router_logits.shape)}"
+            )
+        if router_logits.dim() == 2:
+            if not inputs or not isinstance(inputs[0], torch.Tensor) or inputs[0].dim() < 2:
+                raise RuntimeError(
+                    "Switch sparse MLP hook needs input hidden_states [B, S, ...] "
+                    f"to reshape 2-D router logits, got inputs={type(inputs).__name__}"
+                )
+            B, S = inputs[0].shape[0], inputs[0].shape[1]
+            if router_logits.shape[0] != B * S:
+                raise RuntimeError(
+                    f"{module._promoe_stage} sparse layer {module._promoe_sparse_layer_id}: "
+                    f"cannot reshape router logits {tuple(router_logits.shape)} to "
+                    f"({B}, {S}, {EXPECTED_NUM_EXPERTS})"
+                )
+            router_logits = router_logits.view(B, S, -1)
+        elif router_logits.dim() != 3:
+            raise RuntimeError(
+                f"{module._promoe_stage} sparse layer {module._promoe_sparse_layer_id}: "
+                f"expected router logits dim 2 or 3, got shape {tuple(router_logits.shape)}"
+            )
+        return router_logits
 
     def run(
         self,

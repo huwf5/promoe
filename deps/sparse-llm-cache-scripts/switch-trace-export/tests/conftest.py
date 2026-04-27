@@ -1,6 +1,7 @@
 """Shared test fixtures."""
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -22,7 +23,12 @@ def switch_model_path() -> Path:
         return SWITCH_BASE_128_PATH
     if MAIN_WORKSPACE_SWITCH_BASE_128_PATH.exists():
         return MAIN_WORKSPACE_SWITCH_BASE_128_PATH
-    return Path("google/switch-base-128")
+    if os.environ.get("PROMOE_SWITCH_TRACE_ALLOW_REMOTE_MODEL") == "1":
+        return Path("google/switch-base-128")
+    pytest.skip(
+        "Local switch-base-128 not found. Set PROMOE_SWITCH_TRACE_ALLOW_REMOTE_MODEL=1 "
+        "to opt in to loading from Hugging Face."
+    )
 
 
 @pytest.fixture
