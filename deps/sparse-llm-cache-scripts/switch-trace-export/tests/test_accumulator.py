@@ -54,3 +54,11 @@ def test_wrong_logit_shape_raises():
     bad[0] = torch.zeros(64)
     with pytest.raises(ValueError):
         acc.add_token(0, 0, 0, bad)
+
+
+def test_all_layers_wrong_expert_dim_raises():
+    acc = TraceAccumulator()
+    import pytest
+    all64 = [torch.zeros(64, dtype=torch.float32) for _ in range(NUM_SPARSE_LAYERS)]
+    with pytest.raises(ValueError):
+        acc.add_token(0, 0, 0, all64)

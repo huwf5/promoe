@@ -1,5 +1,10 @@
 # install.sh 默认克隆的依赖仓库（本地开发，不提交）
-/deps/
+# 使用 /deps/* 而非 /deps/，父目录不整体排除，下面的 ! 才能反选子树
+/deps/*
+# 例外：此子树为仓库内一等工作区，需可跟踪新文件
+!/deps/sparse-llm-cache-scripts/
+!/deps/sparse-llm-cache-scripts/switch-trace-export/
+!/deps/sparse-llm-cache-scripts/switch-trace-export/**
 
 **/__pycache__
 **/*.egg-info

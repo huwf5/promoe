@@ -25,13 +25,13 @@ PER_TOKEN_EXPERT = 1
 class TraceAccumulator:
     """Holds raw per-token router records for one stage."""
     num_layers: int = NUM_SPARSE_LAYERS
+    num_experts: int = EXPECTED_NUM_EXPERTS
 
     def __post_init__(self) -> None:
         self._seq_ids: list[int] = []
         self._token_idx: list[int] = []
         self._token_ids: list[int] = []
         self._per_layer: list[list[torch.Tensor]] = [[] for _ in range(self.num_layers)]
-        self._vocab_dim: Optional[int] = None
 
     def add_token(
         self,
@@ -47,11 +47,9 @@ class TraceAccumulator:
         for i, t in enumerate(per_layer_logits):
             if t.dim() != 1:
                 raise ValueError(f"layer {i}: expected 1-D logits, got shape {tuple(t.shape)}")
-            if self._vocab_dim is None:
-                self._vocab_dim = t.shape[0]
-            elif t.shape[0] != self._vocab_dim:
+            if t.shape[0] != self.num_experts:
                 raise ValueError(
-                    f"layer {i}: vocab dim mismatch {t.shape[0]} vs {self._vocab_dim}"
+                    f"layer {i}: expected expert dim {self.num_experts}, got {t.shape[0]}"
                 )
         self._seq_ids.append(int(seq_id))
         self._token_idx.append(int(token_idx_in_seq))
@@ -73,8 +71,7 @@ class TraceAccumulator:
 
     def stacked_logits(self) -> torch.Tensor:
         if self.total_tokens() == 0:
-            assert self._vocab_dim is not None, "no tokens added; vocab dim unknown"
-            return torch.zeros((0, self.num_layers, self._vocab_dim), dtype=torch.float32)
+            return torch.zeros((0, self.num_layers, self.num_experts), dtype=torch.float32)
         per_layer_stacked = [torch.stack(layer_list, dim=0) for layer_list in self._per_layer]
         return torch.stack(per_layer_stacked, dim=1)  # [N, L, V]
 
