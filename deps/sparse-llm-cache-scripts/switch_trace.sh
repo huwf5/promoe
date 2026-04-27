@@ -22,7 +22,12 @@ SEED="${SEED:-42}"
 EXTRA_FLAGS=("--verify")
 
 [[ -d "${MODEL_PATH}" ]] || { echo "Error: model dir not found: ${MODEL_PATH}" >&2; exit 1; }
-[[ -f "${PROMPT_FILE}" ]] || { echo "Error: prompt file not found: ${PROMPT_FILE}" >&2; exit 1; }
+[[ -f "${PROMPT_FILE}" ]] || {
+  echo "Error: prompt file not found: ${PROMPT_FILE}" >&2
+  echo "If the default dataset is not present in this checkout, set a prompts file explicitly, e.g.:" >&2
+  echo "  PROMPT_FILE=/path/to/prompt_list.txt ./switch_trace.sh" >&2
+  exit 1
+}
 
 echo "Using: MODEL_PATH=${MODEL_PATH}"
 echo "       PROMPT_FILE=${PROMPT_FILE}"

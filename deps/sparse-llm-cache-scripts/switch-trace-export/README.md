@@ -19,6 +19,8 @@ chmod +x switch_trace.sh   # 首次克隆后如需要
 ./switch_trace.sh
 ```
 
+当本目录下**已存在**包装器默认的模型与 prompt 路径（见下表 `MODEL_PATH`、`PROMPT_FILE`）时，可直接按上面命令运行。若当前 checkout 未包含 `dataset/chatgpt-prompts/` 等默认资源，请显式设置 `PROMPT_FILE`（及按需设置 `MODEL_PATH`），例如：`PROMPT_FILE=/path/to/prompt_list.txt ./switch_trace.sh`。
+
 默认会调用 `switch_trace_export.py` 并附带 **`--verify`**（契约层 Verifier）。可通过环境变量覆盖：
 
 | 变量 | 含义 | 默认 |
@@ -58,14 +60,14 @@ python3 switch-trace-export/switch_trace_export.py \
 - **`decoder/`** — decoder 自回归阶段契约。
 - **`run_log.json`** — 运行摘要（如 `seed`、`batch_size`、`N_enc`、`N_dec`、`elapsed_sec` 等）。
 
-具体张量命名与轴含义见设计文档及 `train-predict-model/TRACE_DATA_FORMAT.md`。
+具体张量命名与轴含义以设计文档与本文「输出目录结构」、以及写出到磁盘上的文件名为准。若你使用的仓库快照里存在 `train-predict-model/TRACE_DATA_FORMAT.md`，可一并参考。
 
 ## 用 `train_predict_model.py` 训练 predictor
 
 对 **encoder** 或 **decoder** 分别指定对应子目录为 `--logits_path`（不要混用两阶段数据于一次训练）。示例（路径请按实际修改）：
 
 ```bash
-python3 ../train-predict-model/train_predict_model.py \
+python3 train-predict-model/train_predict_model.py \
   --logits_path /path/to/out/encoder \
   --predict_model_path /path/to/predict_encoder \
   --predict_output freq \
