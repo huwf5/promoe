@@ -3,7 +3,15 @@
 from __future__ import annotations
 
 import argparse
+import json
+import sys
+import time
 from pathlib import Path
+
+THIS_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(THIS_DIR))
+
+from utils import ContractWriter, SwitchRunner, Verifier  # noqa: E402
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -27,7 +35,44 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    raise NotImplementedError("Wired in Task 8")
+    prompts = [line.strip() for line in args.prompt_file.read_text().splitlines() if line.strip()]
+    if not prompts:
+        print("No prompts to process.", file=sys.stderr)
+        return 1
+
+    runner = SwitchRunner(model_path=str(args.model_path), device=args.device, seed=args.seed)
+    t0 = time.time()
+    enc_acc, dec_acc = runner.run(prompts, args.max_new_tokens, args.batch_size)
+    elapsed = time.time() - t0
+
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    extra = {
+        "seed": args.seed,
+        "max_new_tokens": args.max_new_tokens,
+        "batch_size": args.batch_size,
+        "model_path": str(args.model_path),
+    }
+    ContractWriter(args.output_dir / "encoder", stage="encoder").write(enc_acc, extra)
+    ContractWriter(args.output_dir / "decoder", stage="decoder").write(dec_acc, extra)
+
+    log = {
+        "seed": args.seed,
+        "max_new_tokens": args.max_new_tokens,
+        "batch_size": args.batch_size,
+        "n_prompts": len(prompts),
+        "N_enc": enc_acc.total_tokens(),
+        "N_dec": dec_acc.total_tokens(),
+        "elapsed_sec": round(elapsed, 3),
+    }
+    (args.output_dir / "run_log.json").write_text(json.dumps(log, indent=2))
+    print(json.dumps(log, indent=2))
+
+    if args.verify:
+        Verifier.verify(args.output_dir / "encoder")
+        Verifier.verify(args.output_dir / "decoder")
+        print("Verifier: OK on both subdirs.")
+
+    return 0
 
 
 if __name__ == "__main__":
