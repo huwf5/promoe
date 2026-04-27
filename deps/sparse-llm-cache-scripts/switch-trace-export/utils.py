@@ -27,7 +27,11 @@ class TraceAccumulator:
     num_layers: int = NUM_SPARSE_LAYERS
 
     def __post_init__(self) -> None:
-        raise NotImplementedError
+        self._seq_ids: list[int] = []
+        self._token_idx: list[int] = []
+        self._token_ids: list[int] = []
+        self._per_layer: list[list[torch.Tensor]] = [[] for _ in range(self.num_layers)]
+        self._vocab_dim: Optional[int] = None
 
     def add_token(
         self,
@@ -36,10 +40,43 @@ class TraceAccumulator:
         token_id: int,
         per_layer_logits: list[torch.Tensor],
     ) -> None:
-        raise NotImplementedError
+        if len(per_layer_logits) != self.num_layers:
+            raise ValueError(
+                f"expected {self.num_layers} per-layer logits, got {len(per_layer_logits)}"
+            )
+        for i, t in enumerate(per_layer_logits):
+            if t.dim() != 1:
+                raise ValueError(f"layer {i}: expected 1-D logits, got shape {tuple(t.shape)}")
+            if self._vocab_dim is None:
+                self._vocab_dim = t.shape[0]
+            elif t.shape[0] != self._vocab_dim:
+                raise ValueError(
+                    f"layer {i}: vocab dim mismatch {t.shape[0]} vs {self._vocab_dim}"
+                )
+        self._seq_ids.append(int(seq_id))
+        self._token_idx.append(int(token_idx_in_seq))
+        self._token_ids.append(int(token_id))
+        for i, t in enumerate(per_layer_logits):
+            self._per_layer[i].append(t.detach().to(torch.float32).cpu())
 
     def total_tokens(self) -> int:
-        raise NotImplementedError
+        return len(self._seq_ids)
+
+    def seq_ids(self) -> list[int]:
+        return list(self._seq_ids)
+
+    def token_idx_in_seq(self) -> list[int]:
+        return list(self._token_idx)
+
+    def token_ids(self) -> list[int]:
+        return list(self._token_ids)
+
+    def stacked_logits(self) -> torch.Tensor:
+        if self.total_tokens() == 0:
+            assert self._vocab_dim is not None, "no tokens added; vocab dim unknown"
+            return torch.zeros((0, self.num_layers, self._vocab_dim), dtype=torch.float32)
+        per_layer_stacked = [torch.stack(layer_list, dim=0) for layer_list in self._per_layer]
+        return torch.stack(per_layer_stacked, dim=1)  # [N, L, V]
 
 
 class ContractWriter:
