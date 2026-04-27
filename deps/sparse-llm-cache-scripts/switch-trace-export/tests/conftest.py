@@ -5,9 +5,9 @@ from pathlib import Path
 
 import pytest
 
-REPO_ROOT = Path(__file__).resolve().parents[3]
+SCRIPTS_ROOT = Path(__file__).resolve().parents[2]
 SWITCH_BASE_128_PATH = (
-    REPO_ROOT
+    SCRIPTS_ROOT
     / "huggingface-modules/modules/transformers_modules/google/switch-base-128"
 )
 
