@@ -11,23 +11,24 @@ SWITCH_BASE_128_PATH = (
     SCRIPTS_ROOT
     / "huggingface-modules/modules/transformers_modules/google/switch-base-128"
 )
-MAIN_WORKSPACE_SWITCH_BASE_128_PATH = Path(
-    "/mnt/huwf5/promoe/deps/sparse-llm-cache-scripts/"
-    "huggingface-modules/modules/transformers_modules/google/switch-base-128"
-)
 
 
 @pytest.fixture
 def switch_model_path() -> Path:
+    env_model = os.environ.get("PROMOE_SWITCH_TRACE_MODEL_PATH")
+    if env_model:
+        p = Path(env_model).expanduser().resolve()
+        if p.is_dir():
+            return p
+        pytest.skip(f"PROMOE_SWITCH_TRACE_MODEL_PATH is set but not a directory: {p}")
     if SWITCH_BASE_128_PATH.exists():
         return SWITCH_BASE_128_PATH
-    if MAIN_WORKSPACE_SWITCH_BASE_128_PATH.exists():
-        return MAIN_WORKSPACE_SWITCH_BASE_128_PATH
     if os.environ.get("PROMOE_SWITCH_TRACE_ALLOW_REMOTE_MODEL") == "1":
         return Path("google/switch-base-128")
     pytest.skip(
-        "Local switch-base-128 not found. Set PROMOE_SWITCH_TRACE_ALLOW_REMOTE_MODEL=1 "
-        "to opt in to loading from Hugging Face."
+        "Local switch-base-128 not found under sparse-llm-cache-scripts. "
+        "Clone or place the model there, set PROMOE_SWITCH_TRACE_MODEL_PATH to a local dir, "
+        "or set PROMOE_SWITCH_TRACE_ALLOW_REMOTE_MODEL=1 to load from Hugging Face."
     )
 
 
