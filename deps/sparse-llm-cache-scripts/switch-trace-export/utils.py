@@ -160,4 +160,49 @@ class Verifier:
     @staticmethod
     def verify(trace_dir: Path) -> None:
         """Raise AssertionError on any contract violation."""
-        raise NotImplementedError
+        d = Path(trace_dir)
+
+        sel = torch.load(d / "expert_selection.pt")
+        feat = torch.load(d / "decode_stage_moe_layer_logits_per_token.pt")
+        gate = torch.load(d / "decode_stage_moe_layer_gate_logits_per_token.pt")
+        freq = torch.load(d / "decode_stage_expert_freq_per_token.pt")
+        tok = torch.load(d / "decode_stage_token_ids_per_token.pt")
+        seq = torch.load(d / "decode_stage_seq_id_of_token.pt")
+        idx = torch.load(d / "decode_stage_token_idx_in_seq.pt")
+
+        assert sel.dtype == torch.int64, f"expert_selection dtype {sel.dtype} != int64"
+        assert tok.dtype == seq.dtype == idx.dtype == torch.int64
+        assert feat.dtype == gate.dtype == freq.dtype == torch.float32
+
+        n = sel.shape[0]
+        assert feat.shape[0] == gate.shape[0] == freq.shape[0] == n
+        assert tok.shape == (n,) and seq.shape == (n,) and idx.shape == (n,)
+
+        assert gate.shape == feat.shape, f"gate shape {tuple(gate.shape)} != feat {tuple(feat.shape)}"
+
+        assert sel.shape == (n, NUM_SPARSE_LAYERS, PER_TOKEN_EXPERT), (
+            f"expert_selection shape {tuple(sel.shape)} != ({n}, {NUM_SPARSE_LAYERS}, {PER_TOKEN_EXPERT})"
+        )
+        assert feat.shape == (n, NUM_SPARSE_LAYERS, EXPECTED_NUM_EXPERTS), (
+            f"feat shape {tuple(feat.shape)} != ({n}, {NUM_SPARSE_LAYERS}, {EXPECTED_NUM_EXPERTS})"
+        )
+
+        sel_max = int(sel.max())
+        sel_min = int(sel.min())
+        assert 0 <= sel_min and sel_max < EXPECTED_NUM_EXPERTS, (
+            f"expert id out of range: [{sel_min}, {sel_max}], expected [0, {EXPECTED_NUM_EXPERTS - 1}]"
+        )
+
+        row_sums = freq.sum(dim=-1)
+        assert torch.allclose(row_sums, torch.ones_like(row_sums), atol=1e-5), (
+            "freq must sum to ~1 along expert dim"
+        )
+
+        # token_idx_in_seq strictly +1 monotonic within each seq, in seq's appearance order
+        for s_val in seq.unique().tolist():
+            mask = seq == s_val
+            sub = idx[mask]
+            expected = torch.arange(sub.shape[0], dtype=torch.int64)
+            assert torch.equal(sub, expected), (
+                f"token_idx not monotonic within seq {s_val}: {sub.tolist()}"
+            )
