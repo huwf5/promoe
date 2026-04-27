@@ -8,7 +8,7 @@ import torch
 THIS_DIR = Path(__file__).resolve().parent
 MODULE_DIR = THIS_DIR.parent
 sys.path.insert(0, str(MODULE_DIR))
-from utils import EXPECTED_NUM_EXPERTS, NUM_SPARSE_LAYERS, SwitchRunner  # noqa: E402
+from utils import EXPECTED_NUM_EXPERTS, NUM_SPARSE_LAYERS, SwitchRunner, TraceAccumulator  # noqa: E402
 
 
 @pytest.fixture
@@ -104,3 +104,65 @@ def test_run_two_prompts_produces_records(switch_model_path):
         s_idx = [i for i, ss in enumerate(dec_acc.seq_ids()) if ss == s]
         if s_idx:
             assert dec_acc.token_idx_in_seq()[s_idx[0]] == 0
+
+
+def test_run_records_generated_decoder_tokens_not_decoder_start(switch_model_path):
+    prompts = ["Translate: hello", "Summarize: the quick brown fox"]
+    max_new_tokens = 4
+    runner = SwitchRunner(model_path=str(switch_model_path), device="cpu", seed=42)
+    _, dec_acc = runner.run(prompts=prompts, max_new_tokens=max_new_tokens, batch_size=2)
+
+    encoded = runner.tokenizer(prompts, padding="longest", return_tensors="pt")
+    input_ids = encoded["input_ids"].to(runner.device)
+    attn_mask = encoded["attention_mask"].to(runner.device)
+    with torch.inference_mode():
+        output = runner.model.generate(
+            input_ids=input_ids,
+            attention_mask=attn_mask,
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
+            num_beams=1,
+            decoder_start_token_id=runner._decoder_start_token_id(),
+            output_scores=False,
+            return_dict_in_generate=True,
+        )
+
+    sequences = output.sequences.cpu()
+    eos_id = runner.model.config.eos_token_id
+    pad_id = runner.tokenizer.pad_token_id
+    expected = []
+    alive = [True] * len(prompts)
+    for step_idx in range(sequences.shape[1] - 1):
+        for batch_idx in range(len(prompts)):
+            if not alive[batch_idx]:
+                continue
+            generated_token = int(sequences[batch_idx, step_idx + 1])
+            if pad_id is not None and generated_token == pad_id:
+                alive[batch_idx] = False
+                continue
+            expected.append(generated_token)
+            if eos_id is not None and generated_token == eos_id:
+                alive[batch_idx] = False
+
+    assert dec_acc.token_ids() == expected
+    assert dec_acc.token_ids()[0] != int(sequences[0, 0])
+
+
+def test_drain_decoder_rejects_inconsistent_layer_steps(runner_cpu):
+    runner_cpu._decoder_acc = TraceAccumulator()
+    runner_cpu._decoder_step_buffer = {
+        layer_id: [torch.zeros((1, 1, EXPECTED_NUM_EXPERTS), dtype=torch.float32)]
+        for layer_id in range(NUM_SPARSE_LAYERS)
+    }
+    runner_cpu._decoder_step_buffer[0].append(
+        torch.zeros((1, 1, EXPECTED_NUM_EXPERTS), dtype=torch.float32)
+    )
+
+    with pytest.raises(RuntimeError, match="decoder sparse layer step counts differ"):
+        runner_cpu._drain_decoder(
+            global_seq_ids=[0],
+            gen_seqs=torch.tensor([[0, 10, 1]], dtype=torch.long),
+            pad_id=0,
+            eos_id=1,
+            decoder_start=0,
+        )

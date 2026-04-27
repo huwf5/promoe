@@ -416,22 +416,23 @@ class SwitchRunner:
                 f"generated sequence batch {gen_seqs.shape[0]} != prompt batch {batch_size}"
             )
 
-        max_routed_steps = min(len(steps) for steps in per_layer_steps)
+        step_counts = [len(steps) for steps in per_layer_steps]
+        if len(set(step_counts)) != 1:
+            raise RuntimeError(f"decoder sparse layer step counts differ: {step_counts}")
+
+        routed_steps = step_counts[0]
         max_sequence_steps = max(int(gen_seqs.shape[1]) - 1, 0)
-        steps_to_drain = min(max_routed_steps, max_sequence_steps)
+        steps_to_drain = min(routed_steps, max_sequence_steps)
         alive = [True] * batch_size
 
         for step_idx in range(steps_to_drain):
             for batch_idx, seq_id in enumerate(global_seq_ids):
                 if not alive[batch_idx]:
                     continue
-                input_token = int(gen_seqs[batch_idx, step_idx])
-                is_decoder_start = decoder_start is not None and input_token == decoder_start
-                if pad_id is not None and input_token == pad_id and not (
-                    step_idx == 0 and is_decoder_start
-                ):
-                    continue
-                if step_idx > 0 and is_decoder_start:
+                # Router step k predicts generated token sequences[:, k + 1].
+                # Record EOS when generated, then suppress all later padded steps.
+                generated_token = int(gen_seqs[batch_idx, step_idx + 1])
+                if pad_id is not None and generated_token == pad_id:
                     continue
                 layers = [
                     per_layer_steps[layer_id][step_idx][batch_idx]
@@ -440,14 +441,14 @@ class SwitchRunner:
                 self._decoder_acc.add_token(
                     seq_id=seq_id,
                     token_idx_in_seq=step_idx,
-                    token_id=input_token,
+                    token_id=generated_token,
                     per_layer_logits=layers,
                 )
 
             for batch_idx in range(batch_size):
-                next_token = int(gen_seqs[batch_idx, step_idx + 1])
-                if (eos_id is not None and next_token == eos_id) or (
-                    pad_id is not None and next_token == pad_id
+                generated_token = int(gen_seqs[batch_idx, step_idx + 1])
+                if (eos_id is not None and generated_token == eos_id) or (
+                    pad_id is not None and generated_token == pad_id
                 ):
                     alive[batch_idx] = False
 
