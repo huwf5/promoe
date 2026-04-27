@@ -84,3 +84,23 @@ def test_forward_populates_encoder_hook_buffers(runner_cpu):
         assert 0 <= layer_id < NUM_SPARSE_LAYERS
         assert isinstance(tensor, torch.Tensor)
         assert tensor.shape[-1] == EXPECTED_NUM_EXPERTS
+
+
+def test_run_two_prompts_produces_records(switch_model_path):
+    runner = SwitchRunner(model_path=str(switch_model_path), device="cpu", seed=42)
+    enc_acc, dec_acc = runner.run(
+        prompts=["Translate: hello", "Summarize: the quick brown fox"],
+        max_new_tokens=4,
+        batch_size=2,
+    )
+    # encoder: every prompt token recorded
+    assert enc_acc.total_tokens() > 0
+    assert max(enc_acc.seq_ids()) == 1
+    # decoder: at most 2*4 = 8 tokens (less if EOS)
+    assert 0 < dec_acc.total_tokens() <= 8
+    assert max(dec_acc.seq_ids()) == 1
+    # token_idx within seq starts at 0
+    for s in (0, 1):
+        s_idx = [i for i, ss in enumerate(dec_acc.seq_ids()) if ss == s]
+        if s_idx:
+            assert dec_acc.token_idx_in_seq()[s_idx[0]] == 0

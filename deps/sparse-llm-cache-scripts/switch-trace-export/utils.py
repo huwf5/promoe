@@ -283,7 +283,173 @@ class SwitchRunner:
         batch_size: int,
     ) -> tuple[TraceAccumulator, TraceAccumulator]:
         """Returns (encoder_acc, decoder_acc)."""
-        raise NotImplementedError("Wired in Task 5")
+        if self.model is None:
+            self._load_model()
+        if not self._hook_handles:
+            self._install_hooks()
+        self._encoder_acc = TraceAccumulator()
+        self._decoder_acc = TraceAccumulator()
+
+        try:
+            for batch_start in range(0, len(prompts), batch_size):
+                batch_prompts = prompts[batch_start : batch_start + batch_size]
+                global_seq_ids = list(range(batch_start, batch_start + len(batch_prompts)))
+                self._run_one_batch(batch_prompts, global_seq_ids, max_new_tokens)
+        finally:
+            self._remove_hooks()
+
+        return self._encoder_acc, self._decoder_acc
+
+    def _run_one_batch(
+        self,
+        batch_prompts: list[str],
+        global_seq_ids: list[int],
+        max_new_tokens: int,
+    ) -> None:
+        enc_inputs = self.tokenizer(batch_prompts, padding="longest", return_tensors="pt")
+        input_ids = enc_inputs["input_ids"].to(self.device)
+        attn_mask = enc_inputs["attention_mask"].to(self.device)
+
+        self._encoder_slot_buffer = {}
+        self._decoder_step_buffer = {}
+        decoder_start = self._decoder_start_token_id()
+
+        with torch.inference_mode():
+            output = self.model.generate(
+                input_ids=input_ids,
+                attention_mask=attn_mask,
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
+                num_beams=1,
+                decoder_start_token_id=decoder_start,
+                output_scores=False,
+                return_dict_in_generate=True,
+            )
+
+        gen_seqs = output.sequences
+        pad_id = self.tokenizer.pad_token_id
+        eos_id = self.model.config.eos_token_id
+
+        self._drain_encoder(global_seq_ids, input_ids.cpu(), attn_mask.cpu())
+        self._drain_decoder(global_seq_ids, gen_seqs.cpu(), pad_id, eos_id, decoder_start)
+
+    def _decoder_start_token_id(self) -> int:
+        decoder_start = self.model.config.decoder_start_token_id
+        if decoder_start is None:
+            decoder_start = self.model.config.bos_token_id
+        if decoder_start is None:
+            decoder_start = self.tokenizer.pad_token_id
+        if decoder_start is None:
+            raise RuntimeError("could not determine decoder_start_token_id for generation")
+        return int(decoder_start)
+
+    def _drain_encoder(
+        self,
+        global_seq_ids: list[int],
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+    ) -> None:
+        if self._encoder_acc is None:
+            raise RuntimeError("encoder accumulator is not initialized")
+        for layer_id in range(NUM_SPARSE_LAYERS):
+            if layer_id not in self._encoder_slot_buffer:
+                raise RuntimeError(f"missing encoder router logits for sparse layer {layer_id}")
+            tensor = self._encoder_slot_buffer[layer_id]
+            if tensor.shape[:2] != input_ids.shape:
+                raise RuntimeError(
+                    f"encoder layer {layer_id}: router logits shape {tuple(tensor.shape)} "
+                    f"does not match input ids shape {tuple(input_ids.shape)}"
+                )
+
+        for batch_idx, seq_id in enumerate(global_seq_ids):
+            token_idx_in_seq = 0
+            for slot_idx in range(input_ids.shape[1]):
+                if int(attention_mask[batch_idx, slot_idx]) == 0:
+                    continue
+                layers = [
+                    self._encoder_slot_buffer[layer_id][batch_idx, slot_idx]
+                    for layer_id in range(NUM_SPARSE_LAYERS)
+                ]
+                self._encoder_acc.add_token(
+                    seq_id=seq_id,
+                    token_idx_in_seq=token_idx_in_seq,
+                    token_id=int(input_ids[batch_idx, slot_idx]),
+                    per_layer_logits=layers,
+                )
+                token_idx_in_seq += 1
+
+    def _drain_decoder(
+        self,
+        global_seq_ids: list[int],
+        gen_seqs: torch.Tensor,
+        pad_id: Optional[int],
+        eos_id: Optional[int],
+        decoder_start: Optional[int],
+    ) -> None:
+        if self._decoder_acc is None:
+            raise RuntimeError("decoder accumulator is not initialized")
+
+        batch_size = len(global_seq_ids)
+        per_layer_steps: list[list[torch.Tensor]] = []
+        for layer_id in range(NUM_SPARSE_LAYERS):
+            if layer_id not in self._decoder_step_buffer:
+                raise RuntimeError(f"missing decoder router logits for sparse layer {layer_id}")
+
+            steps: list[torch.Tensor] = []
+            for tensor in self._decoder_step_buffer[layer_id]:
+                if tensor.dim() != 3:
+                    raise RuntimeError(
+                        f"decoder layer {layer_id}: expected [B, S, V] router logits, "
+                        f"got shape {tuple(tensor.shape)}"
+                    )
+                if tensor.shape[0] != batch_size:
+                    raise RuntimeError(
+                        f"decoder layer {layer_id}: router batch {tensor.shape[0]} "
+                        f"!= prompt batch {batch_size}"
+                    )
+                for slot_idx in range(tensor.shape[1]):
+                    steps.append(tensor[:, slot_idx, :])
+            per_layer_steps.append(steps)
+
+        if gen_seqs.shape[0] != batch_size:
+            raise RuntimeError(
+                f"generated sequence batch {gen_seqs.shape[0]} != prompt batch {batch_size}"
+            )
+
+        max_routed_steps = min(len(steps) for steps in per_layer_steps)
+        max_sequence_steps = max(int(gen_seqs.shape[1]) - 1, 0)
+        steps_to_drain = min(max_routed_steps, max_sequence_steps)
+        alive = [True] * batch_size
+
+        for step_idx in range(steps_to_drain):
+            for batch_idx, seq_id in enumerate(global_seq_ids):
+                if not alive[batch_idx]:
+                    continue
+                input_token = int(gen_seqs[batch_idx, step_idx])
+                is_decoder_start = decoder_start is not None and input_token == decoder_start
+                if pad_id is not None and input_token == pad_id and not (
+                    step_idx == 0 and is_decoder_start
+                ):
+                    continue
+                if step_idx > 0 and is_decoder_start:
+                    continue
+                layers = [
+                    per_layer_steps[layer_id][step_idx][batch_idx]
+                    for layer_id in range(NUM_SPARSE_LAYERS)
+                ]
+                self._decoder_acc.add_token(
+                    seq_id=seq_id,
+                    token_idx_in_seq=step_idx,
+                    token_id=input_token,
+                    per_layer_logits=layers,
+                )
+
+            for batch_idx in range(batch_size):
+                next_token = int(gen_seqs[batch_idx, step_idx + 1])
+                if (eos_id is not None and next_token == eos_id) or (
+                    pad_id is not None and next_token == pad_id
+                ):
+                    alive[batch_idx] = False
 
 
 class Verifier:
