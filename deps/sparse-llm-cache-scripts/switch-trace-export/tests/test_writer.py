@@ -1,4 +1,3 @@
-import importlib.util
 import json
 import sys
 from pathlib import Path
@@ -11,31 +10,15 @@ MODULE_DIR = THIS_DIR.parent
 sys.path.insert(0, str(MODULE_DIR))
 from utils import NUM_SPARSE_LAYERS, ContractWriter, TraceAccumulator  # noqa: E402
 
-_TRAIN_UTILS_REL = Path("deps") / "sparse-llm-cache-scripts" / "train-predict-model" / "utils.py"
-
-
-def resolve_train_predict_utils_path(start: Path | None = None) -> Path:
-    """Find train-predict-model/utils.py: same-repo `deps/...` under an ancestor, walk upward."""
-    here = (start or THIS_DIR).resolve()
-    for d in (here, *here.parents):
-        cand = d / _TRAIN_UTILS_REL
-        if cand.is_file():
-            return cand
-    raise FileNotFoundError(
-        f"could not find train-predict-model utils at */{_TRAIN_UTILS_REL!s} starting from {here}"
-    )
-
-
-def _load_trace_class():
-    p = resolve_train_predict_utils_path()
-    spec = importlib.util.spec_from_file_location("train_predict_model_utils", p)
-    assert spec and spec.loader
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod.Trace
-
-
-Trace = _load_trace_class()
+CONTRACT_PT_FILES = [
+    "expert_selection.pt",
+    "decode_stage_moe_layer_logits_per_token.pt",
+    "decode_stage_moe_layer_gate_logits_per_token.pt",
+    "decode_stage_expert_freq_per_token.pt",
+    "decode_stage_token_ids_per_token.pt",
+    "decode_stage_seq_id_of_token.pt",
+    "decode_stage_token_idx_in_seq.pt",
+]
 
 
 def _make_layer_logits(peak: int, vocab: int) -> torch.Tensor:
@@ -68,16 +51,7 @@ def test_write_files_present(tmp_out: Path):
     writer = ContractWriter(tmp_out / "decoder", stage="decoder")
     writer.write(acc, extra_metadata={"max_new_tokens": 4})
     d = tmp_out / "decoder"
-    for fn in [
-        "expert_selection.pt",
-        "decode_stage_moe_layer_logits_per_token.pt",
-        "decode_stage_moe_layer_gate_logits_per_token.pt",
-        "decode_stage_expert_freq_per_token.pt",
-        "decode_stage_token_ids_per_token.pt",
-        "decode_stage_seq_id_of_token.pt",
-        "decode_stage_token_idx_in_seq.pt",
-        "metadata.json",
-    ]:
+    for fn in [*CONTRACT_PT_FILES, "metadata.json"]:
         assert (d / fn).exists(), fn
 
 
@@ -86,12 +60,12 @@ def test_shapes_and_dtypes(tmp_out: Path):
     writer = ContractWriter(tmp_out / "decoder", stage="decoder")
     writer.write(acc)
 
-    sel = torch.load(tmp_out / "decoder/expert_selection.pt")
+    sel = torch.load(tmp_out / "decoder/expert_selection.pt", weights_only=True)
     assert sel.shape == (6, 6, 1) and sel.dtype == torch.int64
 
-    feat = torch.load(tmp_out / "decoder/decode_stage_moe_layer_logits_per_token.pt")
-    gate = torch.load(tmp_out / "decoder/decode_stage_moe_layer_gate_logits_per_token.pt")
-    freq = torch.load(tmp_out / "decoder/decode_stage_expert_freq_per_token.pt")
+    feat = torch.load(tmp_out / "decoder/decode_stage_moe_layer_logits_per_token.pt", weights_only=True)
+    gate = torch.load(tmp_out / "decoder/decode_stage_moe_layer_gate_logits_per_token.pt", weights_only=True)
+    freq = torch.load(tmp_out / "decoder/decode_stage_expert_freq_per_token.pt", weights_only=True)
     for t in (feat, gate, freq):
         assert t.shape == (6, 6, 128) and t.dtype == torch.float32
 
@@ -99,23 +73,43 @@ def test_shapes_and_dtypes(tmp_out: Path):
     row_sums = freq.sum(dim=-1)
     assert torch.allclose(row_sums, torch.ones_like(row_sums), atol=1e-5)
 
-    seq = torch.load(tmp_out / "decoder/decode_stage_seq_id_of_token.pt")
-    idx = torch.load(tmp_out / "decoder/decode_stage_token_idx_in_seq.pt")
-    tids = torch.load(tmp_out / "decoder/decode_stage_token_ids_per_token.pt")
+    seq = torch.load(tmp_out / "decoder/decode_stage_seq_id_of_token.pt", weights_only=True)
+    idx = torch.load(tmp_out / "decoder/decode_stage_token_idx_in_seq.pt", weights_only=True)
+    tids = torch.load(tmp_out / "decoder/decode_stage_token_ids_per_token.pt", weights_only=True)
     for t in (seq, idx, tids):
         assert t.shape == (6,) and t.dtype == torch.int64
 
 
-def test_unpack_from_dir_works(tmp_out: Path):
+def test_contract_files_load_and_have_consistent_shapes(tmp_out: Path):
     acc = _make_acc(n_seqs=2, tokens_per_seq=3, vocab=128)
     writer = ContractWriter(tmp_out / "decoder", stage="decoder")
     writer.write(acc)
-    trace = Trace()
-    trace.unpack_from_dir(str(tmp_out / "decoder"))
-    trace.prepare_tensors()
-    assert trace.num_expert == 128
-    assert trace.num_moe_layer == 6
-    assert trace.per_token_expert == 1
+    d = tmp_out / "decoder"
+
+    tensors = {
+        fn: torch.load(d / fn, weights_only=True)
+        for fn in CONTRACT_PT_FILES
+    }
+    expert_selection = tensors["expert_selection.pt"]
+    assert expert_selection.shape == (6, 6, 1)
+    n_tokens, n_layers, per_token_expert = expert_selection.shape
+    num_expert = int(expert_selection.max()) + 1
+
+    assert num_expert == 128
+    assert n_layers == NUM_SPARSE_LAYERS
+    assert per_token_expert == 1
+    for fn in [
+        "decode_stage_moe_layer_logits_per_token.pt",
+        "decode_stage_moe_layer_gate_logits_per_token.pt",
+        "decode_stage_expert_freq_per_token.pt",
+    ]:
+        assert tensors[fn].shape == (n_tokens, n_layers, num_expert)
+    for fn in [
+        "decode_stage_token_ids_per_token.pt",
+        "decode_stage_seq_id_of_token.pt",
+        "decode_stage_token_idx_in_seq.pt",
+    ]:
+        assert tensors[fn].shape == (n_tokens,)
 
 
 def test_metadata_records_stage(tmp_out: Path):

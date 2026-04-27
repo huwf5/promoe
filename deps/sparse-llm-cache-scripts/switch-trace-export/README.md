@@ -50,7 +50,8 @@ python3 switch-trace-export/switch_trace_export.py \
 可选标志：
 
 - **`--verify`**：写入后对 `encoder/` 与 `decoder/` 运行契约 Verifier。
-- **`--smoke-train`**：在两侧子目录上各跑一次 `train-predict-model/train_predict_model.py` 端到端冒烟训练（需该脚本存在且依赖齐全）；用于确认产出可被训练脚本消费。
+- **`--smoke-train`**：在两侧子目录上各跑一次真实的 `train-predict-model/train_predict_model.py` 端到端冒烟训练（需该脚本存在且依赖齐全）；用于确认产出可被训练脚本消费。
+- **`--train-script-path`**：为 `--smoke-train` 显式指定真实 `train_predict_model.py`。未指定时会依次尝试 `PROMOE_SWITCH_TRACE_TRAIN_SCRIPT` 与 repo-local `../train-predict-model/train_predict_model.py`。
 
 ## 输出目录结构
 
@@ -83,6 +84,30 @@ python3 train-predict-model/train_predict_model.py \
 ```
 
 decoder 将 `--logits_path` 改为 `.../decoder` 即可。超参需与任务规模匹配；`--smoke-train` 使用的就是与 CLI 内置冒烟一致的一组较小超参。
+
+`--smoke-train` 不包含训练脚本 stub，必须能找到真实 `train_predict_model.py`。在 worktree 或精简 checkout 中如果 repo-local `train-predict-model/` 不存在，可使用：
+
+```bash
+python3 switch-trace-export/switch_trace_export.py \
+  --model-path /path/to/switch-base-128 \
+  --prompt-file /path/to/prompt_list.txt \
+  --output-dir /path/to/out \
+  --verify \
+  --smoke-train \
+  --train-script-path /path/to/train-predict-model/train_predict_model.py
+```
+
+也可以设置环境变量：
+
+```bash
+PROMOE_SWITCH_TRACE_TRAIN_SCRIPT=/path/to/train-predict-model/train_predict_model.py \
+python3 switch-trace-export/switch_trace_export.py \
+  --model-path /path/to/switch-base-128 \
+  --prompt-file /path/to/prompt_list.txt \
+  --output-dir /path/to/out \
+  --verify \
+  --smoke-train
+```
 
 ## 测试
 

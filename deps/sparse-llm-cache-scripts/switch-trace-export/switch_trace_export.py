@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 import time
@@ -14,14 +15,34 @@ sys.path.insert(0, str(THIS_DIR))
 
 from utils import ContractWriter, SwitchRunner, Verifier  # noqa: E402
 
+TRAIN_SCRIPT_ENV = "PROMOE_SWITCH_TRACE_TRAIN_SCRIPT"
 
-def _train_script_path() -> Path:
+
+def _repo_train_script_path() -> Path:
     return THIS_DIR.parent / "train-predict-model" / "train_predict_model.py"
 
 
-def _smoke_train_cmd(trace_dir: Path, model_dir: Path) -> list[str]:
+def _train_script_candidates(train_script_path: Path | None) -> list[tuple[str, Path]]:
+    candidates: list[tuple[str, Path]] = []
+    if train_script_path is not None:
+        candidates.append(("--train-script-path", train_script_path.expanduser()))
+    env_path = os.environ.get(TRAIN_SCRIPT_ENV)
+    if env_path:
+        candidates.append((TRAIN_SCRIPT_ENV, Path(env_path).expanduser()))
+    candidates.append(("repo-local default", _repo_train_script_path()))
+    return candidates
+
+
+def _resolve_train_script_path(train_script_path: Path | None) -> Path | None:
+    for _, candidate in _train_script_candidates(train_script_path):
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def _smoke_train_cmd(trace_dir: Path, model_dir: Path, train_script: Path) -> list[str]:
     return [
-        sys.executable, str(_train_script_path()),
+        sys.executable, str(train_script),
         "--logits_path", str(trace_dir),
         "--predict_model_path", str(model_dir),
         "--predict_output", "freq",
@@ -37,17 +58,23 @@ def _smoke_train_cmd(trace_dir: Path, model_dir: Path) -> list[str]:
     ]
 
 
-def _run_smoke_train(output_dir: Path) -> int:
-    train_script = _train_script_path()
-    if not train_script.is_file():
-        print(f"train_predict_model.py not found at {train_script}", file=sys.stderr)
+def _run_smoke_train(output_dir: Path, train_script_path: Path | None = None) -> int:
+    train_script = _resolve_train_script_path(train_script_path)
+    if train_script is None:
+        print("Could not find real train_predict_model.py for --smoke-train.", file=sys.stderr)
+        print(
+            f"Pass --train-script-path or set {TRAIN_SCRIPT_ENV}; checked:",
+            file=sys.stderr,
+        )
+        for label, candidate in _train_script_candidates(train_script_path):
+            print(f"  {label}: {candidate}", file=sys.stderr)
         return 1
 
     for stage in ("encoder", "decoder"):
         trace_dir = output_dir / stage
         model_dir = output_dir / "smoke_train" / stage
         print(f"Smoke training {stage} trace with {train_script}")
-        r = subprocess.run(_smoke_train_cmd(trace_dir, model_dir))
+        r = subprocess.run(_smoke_train_cmd(trace_dir, model_dir, train_script))
         if r.returncode != 0:
             print(f"Smoke training failed for {stage} with exit code {r.returncode}", file=sys.stderr)
             return r.returncode
@@ -70,6 +97,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Run contract-level Verifier on both subdirs after writing.")
     p.add_argument("--smoke-train", action="store_true",
                    help="Run train_predict_model.py end-to-end smoke on both subdirs.")
+    p.add_argument("--train-script-path", type=Path, default=None,
+                   help=f"Path to real train_predict_model.py for --smoke-train; "
+                        f"defaults to ${TRAIN_SCRIPT_ENV}, then repo-local train-predict-model/.")
     return p
 
 
@@ -113,7 +143,7 @@ def main(argv: list[str] | None = None) -> int:
         print("Verifier: OK on both subdirs.")
 
     if args.smoke_train:
-        smoke_rc = _run_smoke_train(args.output_dir)
+        smoke_rc = _run_smoke_train(args.output_dir, args.train_script_path)
         if smoke_rc != 0:
             return smoke_rc
 

@@ -1,3 +1,4 @@
+import importlib.util
 import json
 import subprocess
 import sys
@@ -10,6 +11,11 @@ THIS_DIR = Path(__file__).resolve().parent
 MODULE_DIR = THIS_DIR.parent
 SCRIPT = MODULE_DIR / "switch_trace_export.py"
 TRAIN_SCRIPT = MODULE_DIR.parent / "train-predict-model" / "train_predict_model.py"
+
+_SPEC = importlib.util.spec_from_file_location("switch_trace_export_under_test", SCRIPT)
+assert _SPEC and _SPEC.loader
+SWITCH_TRACE_EXPORT = importlib.util.module_from_spec(_SPEC)
+_SPEC.loader.exec_module(SWITCH_TRACE_EXPORT)
 
 
 def _write_prompts(p: Path) -> Path:
@@ -27,6 +33,29 @@ def _write_prompts(p: Path) -> Path:
         + "\n"
     )
     return p
+
+
+def test_resolve_train_script_path_prefers_cli_then_env(tmp_path, monkeypatch):
+    cli_script = tmp_path / "cli_train.py"
+    env_script = tmp_path / "env_train.py"
+    cli_script.write_text("# cli\n")
+    env_script.write_text("# env\n")
+    monkeypatch.setenv("PROMOE_SWITCH_TRACE_TRAIN_SCRIPT", str(env_script))
+
+    assert SWITCH_TRACE_EXPORT._resolve_train_script_path(cli_script) == cli_script
+    assert SWITCH_TRACE_EXPORT._resolve_train_script_path(None) == env_script
+
+
+def test_smoke_train_reports_missing_train_script(tmp_path, monkeypatch, capsys):
+    monkeypatch.delenv("PROMOE_SWITCH_TRACE_TRAIN_SCRIPT", raising=False)
+    fake_module_dir = tmp_path / "switch-trace-export"
+    fake_module_dir.mkdir()
+    monkeypatch.setattr(SWITCH_TRACE_EXPORT, "THIS_DIR", fake_module_dir)
+
+    rc = SWITCH_TRACE_EXPORT._run_smoke_train(tmp_path / "out")
+
+    assert rc != 0
+    assert "--train-script-path" in capsys.readouterr().err
 
 
 def test_cli_smoke_writes_both_dirs(tmp_path, switch_model_path):
