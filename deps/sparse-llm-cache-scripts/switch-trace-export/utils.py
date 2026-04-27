@@ -8,6 +8,7 @@ Classes:
 """
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -80,10 +81,42 @@ class ContractWriter:
     """Serialize a TraceAccumulator to a directory matching train_predict_model contract."""
 
     def __init__(self, out_dir: Path, stage: str):
-        raise NotImplementedError
+        if stage not in STAGES:
+            raise ValueError(f"stage must be one of {STAGES}, got {stage!r}")
+        self.out_dir = Path(out_dir)
+        self.stage = stage
 
     def write(self, acc: TraceAccumulator, extra_metadata: Optional[dict] = None) -> None:
-        raise NotImplementedError
+        self.out_dir.mkdir(parents=True, exist_ok=True)
+        n = acc.total_tokens()
+
+        gate = acc.stacked_logits()  # [N, L, V] float32
+        feat = gate.clone()  # input feature == gate (per design)
+        freq = torch.softmax(gate.to(torch.float32), dim=-1)  # [N, L, V]
+        sel = gate.argmax(dim=-1, keepdim=True).to(torch.int64)  # [N, L, 1]
+
+        seq_ids = torch.tensor(acc.seq_ids(), dtype=torch.int64)
+        tok_idx = torch.tensor(acc.token_idx_in_seq(), dtype=torch.int64)
+        tok_ids = torch.tensor(acc.token_ids(), dtype=torch.int64)
+
+        torch.save(sel, self.out_dir / "expert_selection.pt")
+        torch.save(feat, self.out_dir / "decode_stage_moe_layer_logits_per_token.pt")
+        torch.save(gate, self.out_dir / "decode_stage_moe_layer_gate_logits_per_token.pt")
+        torch.save(freq, self.out_dir / "decode_stage_expert_freq_per_token.pt")
+        torch.save(tok_ids, self.out_dir / "decode_stage_token_ids_per_token.pt")
+        torch.save(seq_ids, self.out_dir / "decode_stage_seq_id_of_token.pt")
+        torch.save(tok_idx, self.out_dir / "decode_stage_token_idx_in_seq.pt")
+
+        meta = {
+            "stage": self.stage,
+            "num_expert": int(gate.shape[-1]),
+            "num_moe_layer": int(gate.shape[1]),
+            "per_token_expert": PER_TOKEN_EXPERT,
+            "N": n,
+        }
+        if extra_metadata:
+            meta.update(extra_metadata)
+        (self.out_dir / "metadata.json").write_text(json.dumps(meta, indent=2))
 
 
 class SwitchRunner:
