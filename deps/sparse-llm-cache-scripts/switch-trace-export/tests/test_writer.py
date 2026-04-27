@@ -3,6 +3,7 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
 import torch
 
 THIS_DIR = Path(__file__).resolve().parent
@@ -10,25 +11,53 @@ MODULE_DIR = THIS_DIR.parent
 sys.path.insert(0, str(MODULE_DIR))
 from utils import NUM_SPARSE_LAYERS, ContractWriter, TraceAccumulator  # noqa: E402
 
-# Worktree may only vendor `switch-trace-export/`; load train_predict Trace from main promoe tree.
-_PROMOE_ROOT = THIS_DIR.parent.parent.parent.parent.parent.parent
-TRAIN_UTILS_PATH = _PROMOE_ROOT / "deps" / "sparse-llm-cache-scripts" / "train-predict-model" / "utils.py"
-_spec = importlib.util.spec_from_file_location("train_predict_model_utils", TRAIN_UTILS_PATH)
-assert _spec and _spec.loader
-_train_utils = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(_train_utils)
-Trace = _train_utils.Trace
+_TRAIN_UTILS_REL = Path("deps") / "sparse-llm-cache-scripts" / "train-predict-model" / "utils.py"
+
+
+def resolve_train_predict_utils_path(start: Path | None = None) -> Path:
+    """Find train-predict-model/utils.py: same-repo `deps/...` under an ancestor, walk upward."""
+    here = (start or THIS_DIR).resolve()
+    for d in (here, *here.parents):
+        cand = d / _TRAIN_UTILS_REL
+        if cand.is_file():
+            return cand
+    raise FileNotFoundError(
+        f"could not find train-predict-model utils at */{_TRAIN_UTILS_REL!s} starting from {here}"
+    )
+
+
+def _load_trace_class():
+    p = resolve_train_predict_utils_path()
+    spec = importlib.util.spec_from_file_location("train_predict_model_utils", p)
+    assert spec and spec.loader
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod.Trace
+
+
+Trace = _load_trace_class()
+
+
+def _make_layer_logits(peak: int, vocab: int) -> torch.Tensor:
+    t = torch.arange(vocab, dtype=torch.float32) * 1e-3
+    t[peak] = 100.0
+    return t
 
 
 def _make_acc(n_seqs: int = 2, tokens_per_seq: int = 3, vocab: int = 128) -> TraceAccumulator:
+    """Build logits so argmax hits expert vocab-1 at least once; other peaks stay below that."""
     acc = TraceAccumulator(num_experts=vocab)
     tok = 1000
     for s in range(n_seqs):
         for k in range(tokens_per_seq):
-            layers = [
-                torch.linspace(s + 0.1 * i, s + 0.1 * i + 0.5, vocab, dtype=torch.float32)
-                for i in range(NUM_SPARSE_LAYERS)
-            ]
+            layers = []
+            for i in range(NUM_SPARSE_LAYERS):
+                flat = s * (tokens_per_seq * NUM_SPARSE_LAYERS) + k * NUM_SPARSE_LAYERS + i
+                if flat == 0:
+                    peak = vocab - 1
+                else:
+                    peak = flat % (vocab - 1)
+                layers.append(_make_layer_logits(peak, vocab))
             acc.add_token(seq_id=s, token_idx_in_seq=k, token_id=tok, per_layer_logits=layers)
             tok += 1
     return acc
@@ -100,3 +129,24 @@ def test_metadata_records_stage(tmp_out: Path):
     assert meta["per_token_expert"] == 1
     assert meta["N"] == 6
     assert meta["foo"] == "bar"
+
+
+def test_empty_accumulator_raises(tmp_out: Path):
+    acc = TraceAccumulator()
+    w = ContractWriter(tmp_out / "empty", stage="decoder")
+    with pytest.raises(ValueError, match="empty trace"):
+        w.write(acc)
+    assert not (tmp_out / "empty").exists()
+
+
+def test_incomplete_expert_coverage_raises(tmp_out: Path):
+    """All argmax on expert 0 => max+1 < V; writer must not emit a self-contradicting trace dir."""
+    acc = TraceAccumulator(num_experts=128)
+    for s in range(1):
+        for k in range(2):
+            layers = [_make_layer_logits(0, 128) for _ in range(NUM_SPARSE_LAYERS)]
+            acc.add_token(seq_id=s, token_idx_in_seq=k, token_id=100 + k, per_layer_logits=layers)
+    w = ContractWriter(tmp_out / "bad", stage="decoder")
+    with pytest.raises(ValueError, match="do not cover the full last-dim"):
+        w.write(acc)
+    assert not (tmp_out / "bad").exists()

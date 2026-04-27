@@ -87,13 +87,29 @@ class ContractWriter:
         self.stage = stage
 
     def write(self, acc: TraceAccumulator, extra_metadata: Optional[dict] = None) -> None:
-        self.out_dir.mkdir(parents=True, exist_ok=True)
         n = acc.total_tokens()
+        if n == 0:
+            raise ValueError(
+                "refusing to write an empty trace: TraceAccumulator has no tokens. "
+                "Downstream train_predict_model.Trace.prepare_tensors() cannot handle empty expert_selection."
+            )
 
         gate = acc.stacked_logits()  # [N, L, V] float32
         feat = gate.clone()  # input feature == gate (per design)
         freq = torch.softmax(gate.to(torch.float32), dim=-1)  # [N, L, V]
         sel = gate.argmax(dim=-1, keepdim=True).to(torch.int64)  # [N, L, 1]
+
+        v = int(gate.shape[-1])
+        max_eid = int(sel.max().item())
+        if max_eid + 1 != v:
+            raise ValueError(
+                "observed expert indices in argmax do not cover the full last-dim of gate logits: "
+                f"max selected index is {max_eid} but the router tensor has {v} experts "
+                f"(downstream infers num_expert from max index + 1; at least one token/layer must select "
+                f"expert {v - 1} so the written directory matches the zero-change training contract)."
+            )
+
+        self.out_dir.mkdir(parents=True, exist_ok=True)
 
         seq_ids = torch.tensor(acc.seq_ids(), dtype=torch.int64)
         tok_idx = torch.tensor(acc.token_idx_in_seq(), dtype=torch.int64)
