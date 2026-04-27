@@ -10,6 +10,7 @@ import torch
 
 def load_train_predict_model():
     script_dir = Path(__file__).resolve().parents[2] / "train-predict-model"
+    previous_utils = sys.modules.pop("utils", None)
     sys.path.insert(0, str(script_dir))
     spec = importlib.util.spec_from_file_location(
         "train_predict_model_under_test", script_dir / "train_predict_model.py"
@@ -17,7 +18,13 @@ def load_train_predict_model():
     assert spec is not None
     assert spec.loader is not None
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        sys.path.remove(str(script_dir))
+        sys.modules.pop("utils", None)
+        if previous_utils is not None:
+            sys.modules["utils"] = previous_utils
     return module
 
 
