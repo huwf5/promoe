@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -12,6 +13,45 @@ THIS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(THIS_DIR))
 
 from utils import ContractWriter, SwitchRunner, Verifier  # noqa: E402
+
+
+def _train_script_path() -> Path:
+    return THIS_DIR.parent / "train-predict-model" / "train_predict_model.py"
+
+
+def _smoke_train_cmd(trace_dir: Path, model_dir: Path) -> list[str]:
+    return [
+        sys.executable, str(_train_script_path()),
+        "--logits_path", str(trace_dir),
+        "--predict_model_path", str(model_dir),
+        "--predict_output", "freq",
+        "--model_type", "split",
+        "--window", "1",
+        "--hidden_size", "16",
+        "--n_layer", "1",
+        "--batch_size", "16",
+        "--lr", "0.001",
+        "--threshold", "1.0",
+        "--threshold_window", "1",
+        "--model_index", "0",
+    ]
+
+
+def _run_smoke_train(output_dir: Path) -> int:
+    train_script = _train_script_path()
+    if not train_script.is_file():
+        print(f"train_predict_model.py not found at {train_script}", file=sys.stderr)
+        return 1
+
+    for stage in ("encoder", "decoder"):
+        trace_dir = output_dir / stage
+        model_dir = output_dir / "smoke_train" / stage
+        print(f"Smoke training {stage} trace with {train_script}")
+        r = subprocess.run(_smoke_train_cmd(trace_dir, model_dir))
+        if r.returncode != 0:
+            print(f"Smoke training failed for {stage} with exit code {r.returncode}", file=sys.stderr)
+            return r.returncode
+    return 0
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -71,6 +111,11 @@ def main(argv: list[str] | None = None) -> int:
         Verifier.verify(args.output_dir / "encoder")
         Verifier.verify(args.output_dir / "decoder")
         print("Verifier: OK on both subdirs.")
+
+    if args.smoke_train:
+        smoke_rc = _run_smoke_train(args.output_dir)
+        if smoke_rc != 0:
+            return smoke_rc
 
     return 0
 

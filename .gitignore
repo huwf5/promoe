@@ -3,6 +3,8 @@
 /deps/*
 # 例外：此子树为仓库内一等工作区，需可跟踪新文件
 !/deps/sparse-llm-cache-scripts/
+!/deps/sparse-llm-cache-scripts/train-predict-model/
+!/deps/sparse-llm-cache-scripts/train-predict-model/**
 !/deps/sparse-llm-cache-scripts/switch-trace-export/
 !/deps/sparse-llm-cache-scripts/switch-trace-export/**
 
