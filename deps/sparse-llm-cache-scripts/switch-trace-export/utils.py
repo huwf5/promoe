@@ -175,10 +175,16 @@ class Verifier:
         assert feat.dtype == gate.dtype == freq.dtype == torch.float32
 
         n = sel.shape[0]
+        assert n > 0, "trace must be non-empty"
+
         assert feat.shape[0] == gate.shape[0] == freq.shape[0] == n
         assert tok.shape == (n,) and seq.shape == (n,) and idx.shape == (n,)
 
         assert gate.shape == feat.shape, f"gate shape {tuple(gate.shape)} != feat {tuple(feat.shape)}"
+        assert freq.shape == gate.shape == feat.shape, (
+            f"freq/gate/feat shape mismatch: freq {tuple(freq.shape)}, "
+            f"gate {tuple(gate.shape)}, feat {tuple(feat.shape)}"
+        )
 
         assert sel.shape == (n, NUM_SPARSE_LAYERS, PER_TOKEN_EXPERT), (
             f"expert_selection shape {tuple(sel.shape)} != ({n}, {NUM_SPARSE_LAYERS}, {PER_TOKEN_EXPERT})"
@@ -186,11 +192,15 @@ class Verifier:
         assert feat.shape == (n, NUM_SPARSE_LAYERS, EXPECTED_NUM_EXPERTS), (
             f"feat shape {tuple(feat.shape)} != ({n}, {NUM_SPARSE_LAYERS}, {EXPECTED_NUM_EXPERTS})"
         )
+        assert freq.shape == (n, NUM_SPARSE_LAYERS, EXPECTED_NUM_EXPERTS), (
+            f"freq shape {tuple(freq.shape)} != ({n}, {NUM_SPARSE_LAYERS}, {EXPECTED_NUM_EXPERTS})"
+        )
 
-        sel_max = int(sel.max())
         sel_min = int(sel.min())
-        assert 0 <= sel_min and sel_max < EXPECTED_NUM_EXPERTS, (
-            f"expert id out of range: [{sel_min}, {sel_max}], expected [0, {EXPECTED_NUM_EXPERTS - 1}]"
+        assert sel_min >= 0, f"expert id out of range: min {sel_min}, expected >= 0"
+        assert int(sel.max()) + 1 == EXPECTED_NUM_EXPERTS, (
+            f"expert_selection max+1 must equal {EXPECTED_NUM_EXPERTS} (downstream num_expert), "
+            f"got {int(sel.max()) + 1}"
         )
 
         row_sums = freq.sum(dim=-1)

@@ -7,7 +7,14 @@ import torch
 THIS_DIR = Path(__file__).resolve().parent
 MODULE_DIR = THIS_DIR.parent
 sys.path.insert(0, str(MODULE_DIR))
-from utils import NUM_SPARSE_LAYERS, ContractWriter, TraceAccumulator, Verifier  # noqa: E402
+from utils import (  # noqa: E402
+    EXPECTED_NUM_EXPERTS,
+    NUM_SPARSE_LAYERS,
+    PER_TOKEN_EXPERT,
+    ContractWriter,
+    TraceAccumulator,
+    Verifier,
+)
 
 
 def _build_good_dir(d: Path):
@@ -56,4 +63,41 @@ def test_verifier_catches_token_idx_not_monotonic(tmp_out: Path):
     bad_idx = torch.tensor(list(range(64)) + [0, 2] + list(range(2, 64)), dtype=torch.int64)
     torch.save(bad_idx, d / "decode_stage_token_idx_in_seq.pt")
     with pytest.raises(AssertionError, match="monotonic|token_idx"):
+        Verifier.verify(d)
+
+
+def test_verifier_catches_incomplete_expert_coverage(tmp_out: Path):
+    d = tmp_out / "decoder"
+    _build_good_dir(d)
+    torch.save(
+        torch.zeros((128, NUM_SPARSE_LAYERS, PER_TOKEN_EXPERT), dtype=torch.int64),
+        d / "expert_selection.pt",
+    )
+    with pytest.raises(AssertionError, match="downstream|max\\+1"):
+        Verifier.verify(d)
+
+
+def test_verifier_catches_wrong_freq_shape(tmp_out: Path):
+    d = tmp_out / "decoder"
+    _build_good_dir(d)
+    bad_freq = torch.ones((128, NUM_SPARSE_LAYERS, 1), dtype=torch.float32)
+    torch.save(bad_freq, d / "decode_stage_expert_freq_per_token.pt")
+    with pytest.raises(AssertionError, match="freq|shape|mismatch"):
+        Verifier.verify(d)
+
+
+def test_verifier_catches_empty_trace(tmp_out: Path):
+    d = tmp_out / "decoder"
+    d.mkdir(parents=True)
+    n = 0
+    L = NUM_SPARSE_LAYERS
+    E = EXPECTED_NUM_EXPERTS
+    torch.save(torch.zeros((n, L, PER_TOKEN_EXPERT), dtype=torch.int64), d / "expert_selection.pt")
+    torch.save(torch.zeros((n, L, E), dtype=torch.float32), d / "decode_stage_moe_layer_logits_per_token.pt")
+    torch.save(torch.zeros((n, L, E), dtype=torch.float32), d / "decode_stage_moe_layer_gate_logits_per_token.pt")
+    torch.save(torch.zeros((n, L, E), dtype=torch.float32), d / "decode_stage_expert_freq_per_token.pt")
+    torch.save(torch.zeros((n,), dtype=torch.int64), d / "decode_stage_token_ids_per_token.pt")
+    torch.save(torch.zeros((n,), dtype=torch.int64), d / "decode_stage_seq_id_of_token.pt")
+    torch.save(torch.zeros((n,), dtype=torch.int64), d / "decode_stage_token_idx_in_seq.pt")
+    with pytest.raises(AssertionError, match="non-empty|trace must"):
         Verifier.verify(d)
