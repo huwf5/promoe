@@ -9,10 +9,12 @@ Classes:
 from __future__ import annotations
 
 import json
+import random
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
+import numpy as np
 import torch
 
 
@@ -144,7 +146,84 @@ class SwitchRunner:
         device: str = "cuda:0",
         seed: int = 42,
     ):
-        raise NotImplementedError
+        self.model_path = model_path
+        self.device = device
+        self.seed = seed
+        self.model = None
+        self.tokenizer = None
+        self._hook_handles: list = []
+        self._encoder_acc: Optional[TraceAccumulator] = None
+        self._decoder_acc: Optional[TraceAccumulator] = None
+        self._current_batch_seq_ids: list[int] = []
+        self._current_batch_token_ids_per_step: list[list[int]] = []
+        self._current_batch_alive_mask: list[bool] = []
+        self._current_batch_step: int = 0
+        self._stage: str = "idle"  # "idle" | "encoder" | "decoder"
+        self._encoder_attn_mask: Optional[torch.Tensor] = None
+        self._decoder_step_buffer: dict[int, list[torch.Tensor]] = {}
+        self._encoder_slot_buffer: dict[int, torch.Tensor] = {}
+
+    def _seed_all(self) -> None:
+        from transformers import set_seed as hf_set_seed
+
+        random.seed(self.seed)
+        np.random.seed(self.seed)
+        torch.manual_seed(self.seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(self.seed)
+        hf_set_seed(self.seed)
+
+    def _load_model(self) -> None:
+        from transformers import AutoTokenizer, SwitchTransformersForConditionalGeneration
+
+        self._seed_all()
+        self.tokenizer = AutoTokenizer.from_pretrained(self.model_path)
+        self.model = SwitchTransformersForConditionalGeneration.from_pretrained(
+            self.model_path, torch_dtype=torch.float32
+        )
+        self.model.eval()
+        self.model.to(self.device)
+
+    def _install_hooks(self) -> None:
+        from transformers.models.switch_transformers.modeling_switch_transformers import (
+            SwitchTransformersSparseMLP,
+            SwitchTransformersTop1Router,
+        )
+
+        for m in self.model.modules():
+            if isinstance(m, SwitchTransformersTop1Router):
+                m.jitter_noise = 0.0
+
+        for stack_name, stack in (("encoder", self.model.encoder), ("decoder", self.model.decoder)):
+            sparse_id = 0
+            for block in stack.block:
+                for layer in block.layer:
+                    mlp = getattr(layer, "mlp", None)
+                    if isinstance(mlp, SwitchTransformersSparseMLP):
+                        mlp._promoe_stage = stack_name
+                        mlp._promoe_sparse_layer_id = sparse_id
+                        h = mlp.register_forward_hook(self._sparse_mlp_hook)
+                        self._hook_handles.append(h)
+                        sparse_id += 1
+            assert sparse_id == NUM_SPARSE_LAYERS, (
+                f"{stack_name}: found {sparse_id} sparse MLPs, expected {NUM_SPARSE_LAYERS}"
+            )
+
+    def _remove_hooks(self) -> None:
+        for h in self._hook_handles:
+            h.remove()
+        self._hook_handles.clear()
+
+    def _sparse_mlp_hook(self, module, inputs, output):
+        router_logits = output[1]
+        if router_logits.dim() == 2:
+            B, S = inputs[0].shape[0], inputs[0].shape[1]
+            router_logits = router_logits.view(B, S, -1)
+        layer_id = module._promoe_sparse_layer_id
+        if module._promoe_stage == "encoder":
+            self._encoder_slot_buffer[layer_id] = router_logits.detach().cpu()
+        else:
+            self._decoder_step_buffer.setdefault(layer_id, []).append(router_logits.detach().cpu())
 
     def run(
         self,
@@ -153,7 +232,7 @@ class SwitchRunner:
         batch_size: int,
     ) -> tuple[TraceAccumulator, TraceAccumulator]:
         """Returns (encoder_acc, decoder_acc)."""
-        raise NotImplementedError
+        raise NotImplementedError("Wired in Task 5")
 
 
 class Verifier:
