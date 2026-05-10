@@ -7,11 +7,11 @@
 
 std::vector<std::pair<int, int>> build_predict_layer_mapping(ModuleMeta * metas) {
   std::vector<int> layers_to_predict;
-  for (int l = 0; l < metas->num_layer; l+= metas->layer_predict_interval) {
+  for (int l = 0; l < metas->predictor_num_layer; l+= metas->layer_predict_interval) {
     layers_to_predict.push_back(l);
   }
 
-  std::vector<int> predict_layers(metas->num_layer + 1, 0);
+  std::vector<int> predict_layers(metas->predictor_num_layer + 1, 0);
 
   int stop_l = 0;
   for (auto l : layers_to_predict) {
@@ -20,25 +20,25 @@ std::vector<std::pair<int, int>> build_predict_layer_mapping(ModuleMeta * metas)
       window = metas->limit_layer_0_window;
     }
     predict_layers[l] = stop_l;
-    predict_layers[l + 1] = (l % metas->num_layer) + window;
-    predict_layers[l + 1] = std::min(predict_layers[l + 1], metas->num_layer);
+    predict_layers[l + 1] = (l % metas->predictor_num_layer) + window;
+    predict_layers[l + 1] = std::min(predict_layers[l + 1], metas->predictor_num_layer);
     stop_l = predict_layers[l + 1];
   }
 
-  for (int l = 1; l <= metas->num_layer; l++) {
+  for (int l = 1; l <= metas->predictor_num_layer; l++) {
     if (predict_layers[l] < predict_layers[l - 1]) {
       predict_layers[l] = predict_layers[l - 1];
     }
   }
 
-  std::vector<std::pair<int, int>> ret(metas->num_layer + 1, {0, 0});
-  for (int l = 0; l < metas->num_layer; l++) {
+  std::vector<std::pair<int, int>> ret(metas->predictor_num_layer + 1, {0, 0});
+  for (int l = 0; l < metas->predictor_num_layer; l++) {
     ret[l] = {predict_layers[l], predict_layers[l + 1]};
   }
 
   if (metas->layer_predict_replace_first_input_with_last_output) {
     CHECK(metas->predict_input_mode == kMoeLayerLogits);
-    ret[metas->num_layer] = ret[0];
+    ret[metas->predictor_num_layer] = ret[0];
     ret[0] = {0, 0};
   }
 
@@ -576,7 +576,11 @@ PredictOutput SepPredictor::predict_one_job(int input_layer_id, int job_idx) {
       input = this->moe_layer_logits_buffer_list[input_layer_id];
       if (input.numel() == 0) {
         LOG(DEBUG) << "skip prediction due to prefill";
-        return PredictOutput::empty(1, input_layer_id, predict_models[input_layer_id].enabled_output_layers[job_idx]);
+        return PredictOutput::empty(
+          1,
+          input_layer_id,
+          predict_models[input_layer_id].enabled_output_layers[job_idx] + metas->predictor_layer_offset
+        );
       }
       CHECK(predict_models[input_layer_id].num_output_layer() > 0);
       LOG_BLOCK(DEBUG, logger, {
@@ -603,7 +607,11 @@ PredictOutput SepPredictor::predict_one_job(int input_layer_id, int job_idx) {
     output = output.reshape({-1, metas->num_expert});
   }
   profiler->push(TimeProfiler::kPredictTime, t.dur_us());
-  return PredictOutput(output, input_layer_id, predict_models[input_layer_id].enabled_output_layers[job_idx]);
+  return PredictOutput(
+    output,
+    input_layer_id,
+    predict_models[input_layer_id].enabled_output_layers[job_idx] + metas->predictor_layer_offset
+  );
 }
 
 
@@ -614,12 +622,12 @@ void SepPredictor::load_model_from(std::string model_path) {
   CHECK(S_ISDIR(path_stat.st_mode)) << "Model file is not a directory: " << model_path;
   // fixme: meta json?
 
-  for (int l = 0; l < metas->num_layer + 1; l++) {
+  for (int l = 0; l < metas->predictor_num_layer + 1; l++) {
     predict_models[l] = PredictSepModel();
   }
   c10::Device cpu_device(c10::DeviceType::CPU);
   auto predict_layers = build_predict_layer_mapping(metas.get());
-  for (int src_l = 0; src_l < metas->num_layer + 1; src_l++) {
+  for (int src_l = 0; src_l < metas->predictor_num_layer + 1; src_l++) {
     for (int dst_l = predict_layers[src_l].first; dst_l < predict_layers[src_l].second; dst_l++) {
       predict_models[src_l].models[dst_l] = torch::jit::load(model_path + "/" + std::to_string(src_l) + "-" + std::to_string(dst_l) + ".pt", cpu_device);
       predict_models[src_l].models[dst_l].eval();
@@ -659,7 +667,7 @@ void SepPredictor::record_moe_layer_logits(int layer_id, torch::Tensor layer_log
         moe_layer_logits_buffer_list[layer_id] = torch::empty({0});
         break;
       }
-      if ((layer_id % metas->num_layer) % metas->layer_predict_interval != 0) {
+      if ((layer_id % metas->predictor_num_layer) % metas->layer_predict_interval != 0) {
         LOG(DEBUG) << "predictor, skip record due to interval";
         moe_layer_logits_buffer_list[layer_id] = torch::empty({0});
         break;
@@ -682,7 +690,7 @@ void SepPredictor::record_moe_layer_logits(int layer_id, torch::Tensor layer_log
   }
 }
 SepPredictor::SepPredictor(std::shared_ptr<ModuleMeta> metas) : PredictorBase(metas) {
-  for (int l = 0; l <= metas->num_layer; l++) {
+  for (int l = 0; l <= metas->predictor_num_layer; l++) {
     logits_record_event[l] = 0;
     CUDA_CALL(cudaEventCreateWithFlags(&logits_record_event[l], cudaEventDisableTiming));
   }

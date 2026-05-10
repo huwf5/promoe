@@ -11,6 +11,13 @@
 #include "utils.hpp"
 
 class ExpertMemHanlderBase;
+inline torch::Tensor make_non_owning_tensor_from_blob(
+    void* data,
+    c10::IntArrayRef sizes,
+    const torch::TensorOptions& options) {
+  return torch::from_blob(data, sizes, [](void*) {}, options);
+}
+
 class MemMngrCtx {
  public:
   // CUmemGenericAllocationHandle dummy_mem_handle = 0;
@@ -149,6 +156,7 @@ class ExpertParamWrapperBase {
   virtual void unmap() = 0;
   virtual void map_to(ExpertMemHanlderBase* physical, MemMngrCtx* ctx) = 0;
   virtual void make_logical(HostExpertMemHanlderBase* other, MemMngrCtx* ctx) = 0;
+  void release_tensor_references();
   torch::Tensor get_tensor(int idx) { return model_parameter_reference[idx]; }
   virtual ~ExpertParamWrapperBase() {}
 };
@@ -187,7 +195,7 @@ class ExpertParamWrapperCUDriver : public ExpertParamWrapperBase {
     this->map_to(ctx->dummy_physical, ctx);
     for (int i = 0; i < model_parameter_reference.size(); i++) {
       torch::TensorOptions options = torch::TensorOptions().device(torch::kCUDA, ctx->device_id).dtype(other->dtype(i));
-      model_parameter_reference[i] = torch::from_blob((void*)ptrs[i], other->get_tensor(i).sizes(), options);
+      model_parameter_reference[i] = make_non_owning_tensor_from_blob((void*)ptrs[i], other->get_tensor(i).sizes(), options);
     }
   }
   void unmap() override;
@@ -217,7 +225,7 @@ class ExpertParamWrapperCUDriverUnified : public ExpertParamWrapperBase {
 
     for (int i = 0; i < model_parameter_reference.size(); i++) {
       torch::TensorOptions options = torch::TensorOptions().device(torch::kCUDA, ctx->device_id).dtype(other->dtype(i));
-      model_parameter_reference[i] = torch::from_blob((uint8_t*)ptr + offsets_of_each_param[i], other->get_tensor(i).sizes(), options);
+      model_parameter_reference[i] = make_non_owning_tensor_from_blob((uint8_t*)ptr + offsets_of_each_param[i], other->get_tensor(i).sizes(), options);
     }
   }
   void unmap() override;
@@ -311,6 +319,7 @@ class ModelLoader {
   torch::Tensor ref_one_expert_param(int layer_id, int expert_id, int param_id) {
     return source_list[metas->squeeze_expert_idx(layer_id, expert_id)]->reference_to_model_param->get_tensor(param_id);
   }
+  void release_logical_expert_param_refs();
   void pin_memory();
   ExpertHandler* get_source(int layer_id, int expert_id) {
     return source_list[metas->squeeze_expert_idx(layer_id, expert_id)];

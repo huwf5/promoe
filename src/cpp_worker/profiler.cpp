@@ -17,8 +17,12 @@ void TraceEventCollector::add_meta_event() {
   { TRACE_EVENT_GURAD_WITH_ARGS(kGPU,            "thread_name", 'M', arg_var, { arg_var["name"] = "kGPU";            }); }
 }
 void PrecisionProfiler::report() {
+  if (activated_experts.empty() || predicted_experts.empty()) {
+    return;
+  }
   std::map<int, std::vector<double>> per_layer_rates;
-  for (int i = 0; i < activated_experts.size(); i++) {
+  const size_t num_pairs = std::min(activated_experts.size(), predicted_experts.size());
+  for (size_t i = 0; i < num_pairs; i++) {
     auto &a = activated_experts[i], &p = predicted_experts[i];
     if (a.layer_id != p.layer_id) {
       std::cerr << "layer id mismatch " << a.layer_id << " " << p.layer_id << "\n";
@@ -40,6 +44,9 @@ void PrecisionProfiler::report() {
     per_layer_rates[a.layer_id].push_back((float)a.intersect(p) / p.experts.size());
   }
   for (auto &[layer_id, rates] : per_layer_rates) {
+    if (rates.empty()) {
+      continue;
+    }
     double sum = 0;
     for (auto r : rates) {
       sum += r;

@@ -218,13 +218,18 @@ class CacheStatistics {
   void add_reporter(std::function<void(CacheStatistics*)> reporter) {
     reporters.push_back(reporter);
   }
+  void ensure_current_iter() {
+    if (per_iter_per_layer_cnts.empty()) {
+      forward();
+    }
+  }
   void forward() {
     per_iter_per_layer_cnts.push_back(HitMissCnt());
   }
-  void hit()         { per_iter_per_layer_cnts.back().hit++; }
-  void hit(int cnt)  { per_iter_per_layer_cnts.back().hit+=cnt; }
-  void miss()        { per_iter_per_layer_cnts.back().miss++; }
-  void miss(int cnt) { per_iter_per_layer_cnts.back().miss+=cnt; }
+  void hit()         { ensure_current_iter(); per_iter_per_layer_cnts.back().hit++; }
+  void hit(int cnt)  { ensure_current_iter(); per_iter_per_layer_cnts.back().hit+=cnt; }
+  void miss()        { ensure_current_iter(); per_iter_per_layer_cnts.back().miss++; }
+  void miss(int cnt) { ensure_current_iter(); per_iter_per_layer_cnts.back().miss+=cnt; }
   torch::Tensor to_tensor() {
     torch::Tensor ret = torch::zeros({static_cast<long>(per_iter_per_layer_cnts.size()), 2});
     for (int i = 0; i < per_iter_per_layer_cnts.size(); i++) {
@@ -302,6 +307,9 @@ class TimeProfiler : public std::enable_shared_from_this<TimeProfiler> {
   }
   void add_reporter(std::function<void(TimeProfiler*)> reporter) {
     reporters.push_back(reporter);
+  }
+  void clear_reporters() {
+    reporters.clear();
   }
   void push(TimeType type, uint64_t dur) {
     buffer[type].push_back(dur);

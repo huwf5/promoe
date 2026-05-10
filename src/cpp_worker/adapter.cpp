@@ -28,6 +28,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     .def_readwrite("chunk_prefetch",               &ModuleMeta::chunk_prefetch)
     .def_readwrite("predict_input_mode",           &ModuleMeta::predict_input_mode)
     .def_readwrite("predictor_type",               &ModuleMeta::predictor_type)
+    .def_readwrite("predictor_num_layer",          &ModuleMeta::predictor_num_layer)
+    .def_readwrite("predictor_layer_offset",       &ModuleMeta::predictor_layer_offset)
     .def_readwrite("layer_predict_interval",       &ModuleMeta::layer_predict_interval)
     .def_readwrite("layer_predict_max_window",     &ModuleMeta::layer_predict_max_window)
     .def_readwrite("layer_predict_replace_first_input_with_last_output",     &ModuleMeta::layer_predict_replace_first_input_with_last_output)

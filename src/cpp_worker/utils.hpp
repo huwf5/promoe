@@ -145,6 +145,8 @@ class ModuleMeta {
   PredictorType    predictor_type         = kSepPredictor;
 
   std::string predictor_model_path = "";
+  int  predictor_num_layer = -1;
+  int  predictor_layer_offset = 0;
   int  layer_predict_interval   = 1; // the frequency of layer prediction
   int  layer_predict_max_window = 3; // the max distance of layer prediction, n: 0 -> [0,...,n-1]
   bool layer_predict_replace_first_input_with_last_output = false;

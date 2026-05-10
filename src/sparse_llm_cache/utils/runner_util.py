@@ -48,8 +48,10 @@ def prepare_argparser(parser = None):
   parser.add_argument("--trace_event",        action=CustomBooleanAction)
   parser.add_argument("--module_trace_event", action=CustomBooleanAction)
   parser.add_argument("--cache_trace_path",   type=str)
+  parser.add_argument("--gpu_mem_limit_gb",   type=float, default=None)
 
   parser.add_argument("--max_num_batch",                type=int, default=20)
+  parser.add_argument("--max_new_tokens",               type=int, default=128)
   parser.add_argument("--batch_size",                   type=int, default=1)
   parser.add_argument("--dataset",                      type=str, default='chatgpt-prompts-small')
   return parser

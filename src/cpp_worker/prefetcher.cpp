@@ -224,7 +224,9 @@ void PrefetchMngr::one_moe_layer_done(int layer_id) {
 
 void PrefetchMngr::report_one_expert(int layer_id, int expert_id) {
   TRACE_EVENT_GURAD(kHook, "report_one_expert");
-  if (metas->early_preempt == false) {
+  auto expert = model_loader->get_source(layer_id, expert_id);
+  auto current_status = expert->expert_status.get();
+  if (metas->early_preempt == false || current_status != kLaunching) {
     PreemptOneExpertTask task;
     task.layer_id = layer_id;
     task.expert_id = expert_id;
@@ -484,6 +486,9 @@ PrefetchMngr::~PrefetchMngr() {
   predict_thread->exit();
   expert_unlocker_thread->exit();
   fetch_schedule_thread->exit();
+  model_loader->release_logical_expert_param_refs();
+  profiler->clear_reporters();
+  profiler.reset();
   if (TraceEventCollector::globally_enabled) {
     LOG(WARNING) << "dumping trace event to trace.json";
     std::ofstream f("trace.json", std::ios::out | std::ios::trunc);

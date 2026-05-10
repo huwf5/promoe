@@ -1,6 +1,7 @@
 import os
 import re
 
+from . import hooks
 from .hooks import *
 from .filter import *
 from .common_metas import *
@@ -20,10 +21,13 @@ def recursive_traverse_childrens_leaf_only(module, func, filter=Filter(), prefix
     if filter(prefix):
       func(module, prefix)
 
-def add_metadata_to_submodules(model, parse_expert_meta_from_name):
+def add_metadata_to_submodules(model, parse_or_attach):
   def f(module, name):
+    if hasattr(parse_or_attach, "__self__"):
+      parse_or_attach(module, name)
+      return
     module._prefix = name
-    expert_meta = parse_expert_meta_from_name(name)
+    expert_meta = parse_or_attach(name)
     try:
       module._layer_id = int(expert_meta[0])
       module._expert_id = int(expert_meta[1])
@@ -79,8 +83,10 @@ def move_non_moe_to_gpu(model, device='cuda', filter=RegexFilter(r'.*layers\.(\d
       module.to(device)
   recursive_traverse_childrens_leaf_only(model, f, filter)
 
-def replace_mlp_report_experts(model, prefetch_mngr, predictor, num_moe_layer, num_expert, num_predict_expert, filter=RegexFilter(r'.*layers\.([1-9]\d*)\.mlp$')):
+def replace_mlp_report_experts(model, prefetch_mngr, predictor, num_moe_layer, num_expert, num_predict_expert, filter=RegexFilter(r'.*layers\.([1-9]\d*)\.mlp$'), adapter=None):
   def f(module, name):
+    if adapter is not None and not adapter.should_patch_report_experts(module):
+      return
     def new_report_experts(experts):
       prefetch_mngr.report_one_layer(module._layer_id, experts)
 
@@ -102,8 +108,8 @@ def add_hook_to_moe_attns(model, prefetch_mngr, filter):
     hooks.add_hook_to_module(module, hook)
   recursive_traverse_childrens(model, f, filter)
 
-def add_hook_to_moe_layers(model, prefetch_mngr, filter):
-  hook = MoeLayerHook(prefetch_mngr)
+def add_hook_to_moe_layers(model, prefetch_mngr, filter, adapter=None):
+  hook = MoeLayerHook(prefetch_mngr, adapter=adapter)
   def f(module, name):
     # print(f'adding hook to {name}')
     hooks.add_hook_to_module(module, hook)
@@ -231,8 +237,19 @@ def inject_model(
   if len(kwargs) > 0:
     print("warning, unused kwargs", kwargs)
   model_id = model.config._name_or_path if model_id is None else model_id
+  from sparse_llm_cache.model_adapters import get_model_adapter
+  adapter = get_model_adapter(model, model_id)
 
   if num_moe_layer is None:
+    num_moe_layer         = adapter.num_moe_layer
+    num_expert_per_layer  = adapter.num_expert_per_layer
+    num_expert_per_token  = adapter.num_expert_per_token
+    expert_meta_parser    = adapter.expert_meta_parser
+    expert_name_filter    = adapter.expert_name_filter
+    moe_mlp_name_filter   = adapter.moe_mlp_name_filter
+    moe_layer_name_filter = adapter.moe_layer_name_filter
+    moe_attn_name_filter  = adapter.moe_attn_name_filter
+  else:
     auto_infered_model_metas = auto_infer_model_metas(model_id, return_dict=False)
     num_moe_layer         = auto_infered_model_metas.num_moe_layer
     num_expert_per_layer  = auto_infered_model_metas.num_expert_per_layer
@@ -285,7 +302,9 @@ def inject_model(
 
   meta.init_from_map(param_dict)
 
+  adapter.configure_module_meta(meta)
   meta.handle_uninited_configs()
+  adapter.validate_predictor_path(predictor_model_path, num_predict_expert_per_layer)
 
   model_loader  = cpp_worker.ModelLoader(meta)
   predictor     = cpp_worker.PredictorBase.create(meta)
@@ -293,16 +312,25 @@ def inject_model(
   torch.cuda.set_stream(torch.cuda.ExternalStream(prefetch_mngr.compute_stream, 0))
   print("initializing cache lib...done")
 
-  add_metadata_to_submodules(model, expert_meta_parser)
+  add_metadata_to_submodules(model, adapter.add_metadata_to_module)
 
   print("injecting model...")
   register_expert_params(model, model_loader, expert_name_filter)
   prefetch_mngr.init_gpu_mem_buffer()
   replace_expert_param_reference(model, model_loader, expert_name_filter)
-  replace_mlp_report_experts(model, prefetch_mngr, predictor, num_moe_layer, num_expert_per_layer, num_predict_expert_per_layer, moe_mlp_name_filter)
+  replace_mlp_report_experts(
+    model,
+    prefetch_mngr,
+    predictor,
+    num_moe_layer,
+    num_expert_per_layer,
+    num_predict_expert_per_layer,
+    moe_mlp_name_filter,
+    adapter=adapter,
+  )
 
-  # fixme: a general model path
-  predictor.load_model()
+  if num_predict_expert_per_layer:
+    predictor.load_model()
 
   if meta.cache_policy == 'min':
     # prefetch_mngr.cache.cache_oracle.load_from_file(cache_trace_path)
@@ -314,7 +342,7 @@ def inject_model(
 
   add_hook_to_experts(model, prefetch_mngr, expert_name_filter)
   # add_hook_to_moe_attns(model, prefetch_mngr, moe_attn_name_filter)
-  add_hook_to_moe_layers(model, prefetch_mngr, moe_layer_name_filter)
+  add_hook_to_moe_layers(model, prefetch_mngr, moe_layer_name_filter, adapter=adapter)
   add_hook_to_quant_expert_post_init(model, prefetch_mngr, expert_name_filter)
   attach_prefetch_mngr_to_all_module(model, prefetch_mngr)
 
