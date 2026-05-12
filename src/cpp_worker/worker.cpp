@@ -55,6 +55,7 @@ void PredictWorker::do_one_task_impl(PredictJob job) {
         LOG(INFO) << "predict worker: add layer task now " << layer_idx;
         PrefetchLayerTask task;
         task.layer_idx   = layer_idx;
+        task.generation  = job.generation;
         task.expert_idxs = pred_result.top_experts(inner_l);
         if (layer_idx == 0 && metas->limit_layer_0_num_predict != -1) {
           task.num_expert = std::min<int>(per_layer_num_expert, metas->limit_layer_0_num_predict);
@@ -107,22 +108,22 @@ void PredictWorker::add_prefetch_layer_budget() {
   LOG(DEBUG) << "predict worker: add prefetch layer budget";
   prefetch_layer_budget.push(0);
 }
-void PredictWorker::on_one_iter_done() {
+void PredictWorker::on_one_iter_done(int64_t generation) {
   LOG(DEBUG) << "predict workers, one iter done";
   switch (metas->predict_input_mode) {
     // case kNoPredict:               { break; }
-    case kNoPredict:                { add_one_task(PredictJob()); break; }
-    case kOneToken:                { add_one_task(PredictJob()); break; }
-    case kDecodeCumsum:            { add_one_task(PredictJob()); break; }
-    case kLastUseDistance:         { add_one_task(PredictJob()); break; }
-    case kWeighedDecodeCumsum:     { add_one_task(PredictJob()); break; }
+    case kNoPredict:                { add_one_task(PredictJob(0, generation)); break; }
+    case kOneToken:                { add_one_task(PredictJob(0, generation)); break; }
+    case kDecodeCumsum:            { add_one_task(PredictJob(0, generation)); break; }
+    case kLastUseDistance:         { add_one_task(PredictJob(0, generation)); break; }
+    case kWeighedDecodeCumsum:     { add_one_task(PredictJob(0, generation)); break; }
     case kFirstMoeAttnInputLogits: { break; }
     case kMoeAttnInputLogits:      { break; }
     case kMoeLayerLogits:          { break; }
     default: { CHECK(false) << "Unknown predict input mode"; }
   }
 }
-void PredictWorker::on_moe_attn_input_logits_recorded(int layer_id) {
+void PredictWorker::on_moe_attn_input_logits_recorded(int layer_id, int64_t generation) {
   LOG(DEBUG) << "predict workers, on_moe_attn_input_logits_recorded " << layer_id;
   switch (metas->predict_input_mode) {
     case kNoPredict:               { break; }
@@ -131,13 +132,13 @@ void PredictWorker::on_moe_attn_input_logits_recorded(int layer_id) {
     case kLastUseDistance:         { break;}
     case kWeighedDecodeCumsum:     { break;}
     case kFirstMoeAttnInputLogits: {
-      if (layer_id == 0) { add_one_task(PredictJob()); }
+      if (layer_id == 0) { add_one_task(PredictJob(0, generation)); }
       break;
     }
     case kMoeAttnInputLogits:      {
       if (predictor->layer_predict_enabled(layer_id)) {
       // if (layer_id % metas->layer_predict_interval == 0) {
-        add_one_task(PredictJob(layer_id));
+        add_one_task(PredictJob(layer_id, generation));
       }
       break;
     }
@@ -145,7 +146,7 @@ void PredictWorker::on_moe_attn_input_logits_recorded(int layer_id) {
     default: { CHECK(false) << "Unknown predict input mode"; }
   }
 }
-void PredictWorker::on_moe_layer_logits_recorded(int layer_id) {
+void PredictWorker::on_moe_layer_logits_recorded(int layer_id, int64_t generation) {
   LOG(DEBUG) << "predict workers, on_moe_layer_logits_recorded " << layer_id;
   switch (metas->predict_input_mode) {
     case kNoPredict:               { break; }
@@ -157,7 +158,7 @@ void PredictWorker::on_moe_layer_logits_recorded(int layer_id) {
     case kMoeAttnInputLogits:      { break;}
     case kMoeLayerLogits:          {
       if (predictor->layer_predict_enabled(layer_id)) {
-        add_one_task(PredictJob(layer_id));
+        add_one_task(PredictJob(layer_id, generation));
       }
       break;
     }

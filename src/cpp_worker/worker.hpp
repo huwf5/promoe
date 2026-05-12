@@ -153,12 +153,15 @@ class CopyTask : public BaseTask {
  public:
   int start_mem_buf_idx, stop_mem_buf_idx;
   bool is_precise = false;
+  int64_t generation = 0;
   ExpertHandler *expert = nullptr;
   CacheMngr::CacheLineOccupancyWaiter lambda_wait = [](){};
   std::string toString() const {
     std::stringstream ss;
     if (expert) {
-      ss << expert->toString() << ".[" << start_mem_buf_idx << "," << stop_mem_buf_idx << "), precise " << (is_precise?"true":"false");
+      ss << expert->toString() << ".[" << start_mem_buf_idx << "," << stop_mem_buf_idx
+         << "), precise " << (is_precise ? "true" : "false")
+         << ", gen " << generation;
     } else {
       ss << "null";
     }
@@ -198,8 +201,10 @@ class ExpertUnlockWorker : public WorkerThread<ExpertHandler*> {
  */
 struct PredictJob {
   int input_layer_id = 0;
+  int64_t generation = 0;
   PredictJob() {}
-  PredictJob(int input_layer_id) : input_layer_id(input_layer_id) {}
+  PredictJob(int input_layer_id, int64_t generation = 0)
+      : input_layer_id(input_layer_id), generation(generation) {}
 };
 class AtomicQueue {
  public:
@@ -312,9 +317,9 @@ class PredictWorker : public WorkerThread<PredictJob> {
   int  consume_prefetch_layer_progress() {
     return prefetch_layer_progress.pop();
   }
-  void on_one_iter_done();
-  void on_moe_attn_input_logits_recorded(int layer_id);
-  void on_moe_layer_logits_recorded(int layer_id);
+  void on_one_iter_done(int64_t generation);
+  void on_moe_attn_input_logits_recorded(int layer_id, int64_t generation);
+  void on_moe_layer_logits_recorded(int layer_id, int64_t generation);
 
 protected:
   void do_one_task_impl(PredictJob job) override;
