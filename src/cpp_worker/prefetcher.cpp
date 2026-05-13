@@ -2,6 +2,7 @@
 #include "prefetcher.hpp"
 #include "profiler.hpp"
 #include "logging.hpp"
+#include "nvtx_utils.hpp"
 
 void FetchScheduleWorker::reorder_experts(int layer_idx, int64_t *expert_idxs, size_t num_expert) {
   TRACE_EVENT_GURAD(kFetchScheduler, "reorder_experts");
@@ -57,6 +58,26 @@ void FetchScheduleWorker::clear_all_prefetch_queues() {
   }
 }
 
+void FetchScheduleWorker::clear_all_job_queues() {
+  clear_all_prefetch_queues();
+  precise_job_queue.clear();
+}
+
+bool FetchScheduleWorker::is_idle() {
+  if (current_task.expert != nullptr) {
+    return false;
+  }
+  if (!precise_job_queue.empty()) {
+    return false;
+  }
+  for (auto &queue : per_layer_job_queues) {
+    if (!queue.empty()) {
+      return false;
+    }
+  }
+  return true;
+}
+
 void FetchScheduleWorker::clear_prefetch_queues_up_to_layer(int layer_idx) {
   if (layer_idx < 0 || per_layer_job_queues.empty()) {
     return;
@@ -71,7 +92,7 @@ void FetchScheduleWorker::start_generation(int64_t generation) {
   if (generation > current_generation) {
     current_generation = generation;
     current_layer = -1;
-    clear_all_prefetch_queues();
+    clear_all_job_queues();
   }
 }
 
@@ -171,6 +192,12 @@ void FetchScheduleWorker::preempt_one_layer_without_reorder_(int layer_idx, int6
 }
 void FetchScheduleWorker::add_single_tasks_for_one_expert(int layer_idx, int expert_idx, TaskQueue* queue, int starting_mem_buffer, int stop_mem_buffer, bool is_precise, int64_t generation) {
   auto expert_handler = model_loader->get_source(layer_idx, expert_idx);
+  NVTX_RANGE(std::string(is_precise ? "submit/demand_io " : "submit/prefetch_io ") +
+             "L" + std::to_string(layer_idx) +
+             " E" + std::to_string(expert_idx) +
+             " P" + std::to_string(starting_mem_buffer) +
+             "-" + std::to_string(stop_mem_buffer) +
+             " G" + std::to_string(generation));
   CopyTask task;
   task.start_mem_buf_idx = starting_mem_buffer;
   task.stop_mem_buf_idx = stop_mem_buffer;
@@ -222,6 +249,20 @@ void PrefetchMngr::init_gpu_mem_buffer() {
   cache->init_gpu_mem_buffer(cache_len);
   model_loader->mem_mngr_ctx->dummy_physical = cache->cache_slots->slots.front().unused_mems.front();
 }
+
+void PrefetchMngr::reset_and_load_initial_cache() {
+  if (!metas->reset_cache_on_generate_start) {
+    return;
+  }
+  prefetch_generation += 1;
+  fetch_schedule_thread->generation_start_task.generation = prefetch_generation;
+  auto handler = fetch_schedule_thread->add_one_task(&fetch_schedule_thread->generation_start_task);
+  fetch_schedule_thread->wait_progress(handler);
+  while (!fetch_schedule_thread->is_idle()) {}
+  cache->reset_cache_contents();
+  cache->load_initial_plan_sync((cudaStream_t)copy_stream);
+}
+
 void PrefetchMngr::preempt_and_launch_one_layer(int layer_idx, int64_t* experts, int64_t num_expert) {
   PreemptTask preempt_task;
   preempt_task.layer_idx = layer_idx;
@@ -238,6 +279,9 @@ void PrefetchMngr::report_one_layer(int layer_id, torch::Tensor experts) {
 }
 void PrefetchMngr::report_one_layer(int layer_id, int64_t* experts, int64_t num_expert) {
   TRACE_EVENT_GURAD(kHook, "report_one_layer");
+  NVTX_RANGE("hook/report_one_layer L" + std::to_string(layer_id) + " N" + std::to_string(num_expert));
+  NVTX_DETAIL_MARK("demand/layer_experts L" + std::to_string(layer_id) +
+                   " experts=[" + array_to_str(experts, num_expert) + "]");
   cache_stats->forward();
   LOG(INFO) << "prefetcher: consume prefetch layer progress at layer " << layer_id;
   int progress_idx = predict_thread->consume_prefetch_layer_progress();
@@ -250,6 +294,7 @@ void PrefetchMngr::report_one_layer(int layer_id, int64_t* experts, int64_t num_
 }
 void PrefetchMngr::one_moe_layer_done(int layer_id) {
   TRACE_EVENT_GURAD(kHook, "one_moe_layer_done");
+  NVTX_RANGE("hook/one_moe_layer_done L" + std::to_string(layer_id));
   if (metas->early_preempt == false) {
     LOG(INFO) << "prefetcher: one moe layer done, add prefetch layer budget : " << layer_id;
     predict_thread->add_prefetch_layer_budget();
@@ -286,6 +331,8 @@ void PrefetchMngr::one_moe_layer_done(int layer_id) {
 
 void PrefetchMngr::report_one_expert(int layer_id, int expert_id) {
   TRACE_EVENT_GURAD(kHook, "report_one_expert");
+  NVTX_RANGE("hook/report_one_expert L" + std::to_string(layer_id) + " E" + std::to_string(expert_id));
+  NVTX_MARK("demand/need_expert L" + std::to_string(layer_id) + " E" + std::to_string(expert_id));
   auto expert = model_loader->get_source(layer_id, expert_id);
   auto current_status = expert->expert_status.get();
   if (metas->early_preempt == false || current_status != kLaunching) {
@@ -299,6 +346,7 @@ void PrefetchMngr::report_one_expert(int layer_id, int expert_id) {
 }
 void PrefetchMngr::one_expert_done(int layer_id, int expert_id) {
   TRACE_EVENT_GURAD(kHook, "one_expert_done");
+  NVTX_RANGE("hook/one_expert_done L" + std::to_string(layer_id) + " E" + std::to_string(expert_id));
   mark_expert_using(layer_id, expert_id);
 }
 
@@ -312,6 +360,7 @@ void PrefetchMngr::wait_expert(int layer_id, int expert_id) {
     cache_stats->hit();
     profiler->add(TimeProfiler::kReadyCnt, 1);
   } else {
+    NVTX_RANGE("hook/wait_expert L" + std::to_string(layer_id) + " E" + std::to_string(expert_id));
     Timer timer;
     cache_stats->miss();
     profiler->add(TimeProfiler::kUnreadyCnt, 1);
@@ -501,6 +550,7 @@ void PrefetchMngr::set_compute_stream(int64_t stream) {
 }
 
 void PrefetchMngr::report_moe_attn_logits(int layer_id, torch::Tensor attn_logits) {
+  NVTX_RANGE("hook/report_moe_attn_logits L" + std::to_string(layer_id));
   if (layer_id == 0 &&
       (metas->predict_input_mode == kFirstMoeAttnInputLogits ||
        metas->predict_input_mode == kMoeAttnInputLogits)) {
@@ -517,6 +567,7 @@ void PrefetchMngr::report_moe_attn_logits(int layer_id, torch::Tensor attn_logit
 }
 
 void PrefetchMngr::report_moe_layer_logits(int layer_id, torch::Tensor layer_logits) {
+  NVTX_RANGE("hook/report_moe_layer_logits L" + std::to_string(layer_id));
   if (layer_id == 0 && metas->predict_input_mode == kMoeLayerLogits) {
     prefetch_generation += 1;
     fetch_schedule_thread->generation_start_task.generation = prefetch_generation;
@@ -605,6 +656,7 @@ void FetchScheduleWorker::do_one_task_impl(FetchScheduleTaskBase *task) {
 }
 void FetchScheduleWorker::do_one_task_impl(PreemptTask *task) {
   TRACE_EVENT_GURAD(kFetchScheduler, "do preempt");
+  NVTX_RANGE("sched/preempt_layer L" + std::to_string(task->layer_idx) + " N" + std::to_string(task->num_expert));
   advance_actual_layer(task->generation, task->layer_idx);
   if (metas->reorder_experts) {
     this->reorder_experts(task->layer_idx, task->expert_idxs, task->num_expert);
@@ -627,6 +679,7 @@ void FetchScheduleWorker::do_one_task_impl(GenerationStartTask *task) {
 }
 void FetchScheduleWorker::do_one_task_impl(PreemptOneExpertTask *task) {
   TRACE_EVENT_GURAD(kFetchScheduler, "do preempt one expert");
+  NVTX_RANGE("sched/preempt_one L" + std::to_string(task->layer_id) + " E" + std::to_string(task->expert_id));
   this->preempt_one_expert(task->layer_id, task->expert_id);
 }
 
@@ -674,6 +727,9 @@ void FetchScheduleWorker::do_one_task_impl(IdleTask *idle_task) {
 
 void FetchScheduleWorker::do_one_task_impl(PrefetchLayerTask *task) {
   TRACE_EVENT_GURAD(kFetchScheduler, "add task for layer " + std::to_string(task->layer_idx) + "[" + array_to_str(task->expert_idxs, task->num_expert) + "]");
+  NVTX_RANGE("sched/prefetch_layer L" + std::to_string(task->layer_idx) +
+             " N" + std::to_string(task->num_expert) +
+             " G" + std::to_string(task->generation));
   LOG(TRACE) << "scheduler: do PrefetchLayerTask, add prefetch task for layer " << task->layer_idx;
   if (is_stale_prefetch(task->generation, task->layer_idx)) {
     LOG(TRACE) << "scheduler: drop stale prefetch layer " << task->layer_idx
@@ -715,6 +771,17 @@ void FetchScheduleWorker::do_one_task_impl(PrefetchLayerTask *task) {
 
 bool FetchScheduleWorker::send_one_job(CopyTask *task) {
   TRACE_EVENT_GURAD(kFetchScheduler, "send:" + task->toString());
+  NVTX_RANGE("sched/send L" + std::to_string(task->expert->layer_idx) +
+             " E" + std::to_string(task->expert->expert_idx) +
+             " P" + std::to_string(task->start_mem_buf_idx) +
+             "-" + std::to_string(task->stop_mem_buf_idx) +
+             (task->is_precise ? " precise" : " prefetch"));
+  NVTX_RANGE(std::string(task->is_precise ? "dispatch/demand_io " : "dispatch/prefetch_io ") +
+             "L" + std::to_string(task->expert->layer_idx) +
+             " E" + std::to_string(task->expert->expert_idx) +
+             " P" + std::to_string(task->start_mem_buf_idx) +
+             "-" + std::to_string(task->stop_mem_buf_idx) +
+             " G" + std::to_string(task->generation));
   LOG(TRACE) << "scheduler: send one prefetch task " << task->toString();
 
   if (task->is_precise == false && task->expert != nullptr &&

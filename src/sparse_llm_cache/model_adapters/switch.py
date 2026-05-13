@@ -173,7 +173,12 @@ class SwitchAdapter(ModelAdapter):
       module._stage_layer_id = stage_layer_id
       module._layer_id = global_layer_id
 
-  def validate_predictor_path(self, predictor_model_path: str | None, num_predict_expert_per_layer: int | None) -> None:
+  def validate_predictor_path(
+    self,
+    predictor_model_path: str | None,
+    num_predict_expert_per_layer: int | None,
+    predictor_type: str | None = None,
+  ) -> None:
     if not num_predict_expert_per_layer:
       return
     if predictor_model_path is None:
@@ -193,9 +198,15 @@ class SwitchAdapter(ModelAdapter):
     global_like_layers = {str(i) for i in range(self.num_encoder_sparse_layers, self.num_moe_layer)}
     if global_like_layers.issubset(set(metas.keys())):
       raise ValueError("decoder predictor appears to use global layer ids; expected stage-local ids 0..D-1")
+    use_legacy_files = predictor_type == "legacy"
     for src_layer, span in metas.items():
       src_layer_id = int(src_layer)
       if src_layer_id >= self.num_decoder_sparse_layers:
+        continue
+      if use_legacy_files:
+        model_file = path / f"{src_layer_id}.pt"
+        if not model_file.exists():
+          raise FileNotFoundError(f"decoder predictor model file does not exist: {model_file}")
         continue
       start_layer, stop_layer = span
       for dst_layer_id in range(int(start_layer), int(stop_layer)):
@@ -204,6 +215,8 @@ class SwitchAdapter(ModelAdapter):
           raise FileNotFoundError(f"decoder predictor model file does not exist: {model_file}")
 
   def configure_module_meta(self, meta) -> None:
+    meta.num_encoder_moe_layer = self.num_encoder_sparse_layers
+    meta.num_decoder_moe_layer = self.num_decoder_sparse_layers
     meta.predictor_num_layer = self.num_decoder_sparse_layers
     meta.predictor_layer_offset = self.num_encoder_sparse_layers
     meta.layer_predict_replace_first_input_with_last_output = False

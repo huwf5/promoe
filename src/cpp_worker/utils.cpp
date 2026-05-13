@@ -128,6 +128,13 @@ void ModuleMeta::init_from_map(std::unordered_map<std::string, std::string> conf
   limit_layer_0_window      = optional_int("limit_layer_0_window",      limit_layer_0_window);
   limit_layer_0_num_predict = optional_int("limit_layer_0_num_predict", limit_layer_0_num_predict);
 
+  num_encoder_moe_layer = optional_int("num_encoder_moe_layer", num_encoder_moe_layer);
+  num_decoder_moe_layer = optional_int("num_decoder_moe_layer", num_decoder_moe_layer);
+  reset_cache_on_generate_start = optional_bool("reset_cache_on_generate_start", reset_cache_on_generate_start);
+  initial_cache_policy = optional_str("initial_cache_policy", initial_cache_policy);
+  initial_layer_budgets = optional_str("initial_layer_budgets", initial_layer_budgets);
+  initial_expert_plan = optional_str("initial_expert_plan", initial_expert_plan);
+
   max_prefetch_layer_distance      = optional_int  ("max_prefetch_layer_distance",      max_prefetch_layer_distance);
   cache_only                       = optional_bool ("cache_only",                       cache_only);
   per_layer_cache                  = optional_bool ("per_layer_cache",                  per_layer_cache);
@@ -204,6 +211,13 @@ void ModuleMeta::log_configs() {
   LOG_CONFIG(limit_layer_0_window);
   LOG_CONFIG(limit_layer_0_num_predict);
 
+  LOG_CONFIG(num_encoder_moe_layer);
+  LOG_CONFIG(num_decoder_moe_layer);
+  LOG_CONFIG_BOOL(reset_cache_on_generate_start);
+  LOG_CONFIG(initial_cache_policy);
+  LOG_CONFIG(initial_layer_budgets);
+  LOG_CONFIG(initial_expert_plan);
+
   LOG_CONFIG(max_prefetch_layer_distance);
   LOG_CONFIG_BOOL(cache_only);
   LOG_CONFIG_BOOL(per_layer_cache);
@@ -226,6 +240,21 @@ void ModuleMeta::log_configs() {
 void ModuleMeta::handle_uninited_configs() {
   if (predictor_num_layer == -1) {
     predictor_num_layer = num_layer;
+  }
+  if (num_decoder_moe_layer == -1) {
+    num_decoder_moe_layer = num_layer - num_encoder_moe_layer;
+  }
+  CHECK(num_encoder_moe_layer >= 0);
+  CHECK(num_decoder_moe_layer >= 0);
+  CHECK(num_encoder_moe_layer + num_decoder_moe_layer == num_layer)
+      << "invalid stage split: encoder=" << num_encoder_moe_layer
+      << ", decoder=" << num_decoder_moe_layer
+      << ", num_layer=" << num_layer;
+  if (reset_cache_on_generate_start || initial_cache_policy != "" || initial_layer_budgets != "" || initial_expert_plan != "") {
+    CHECK(per_layer_cache == false)
+        << "deterministic initial cache requires per_layer_cache=false";
+    CHECK(initial_cache_policy == "manual")
+        << "only initial_cache_policy=manual is supported";
   }
   // if (layer_predict_interval == -1) {
   //   layer_predict_interval   = num_layer;

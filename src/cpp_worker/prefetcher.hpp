@@ -137,6 +137,8 @@ class FetchScheduleWorker : public WorkerThread<FetchScheduleTaskBase*> {
   void advance_actual_layer(int64_t generation, int layer_idx);
   void clear_prefetch_queues_up_to_layer(int layer_idx);
   void clear_all_prefetch_queues();
+  void clear_all_job_queues();
+  bool is_idle();
 
  public:
   #ifdef DEAD_CODE
@@ -192,6 +194,7 @@ public:
                TimeProfiler* profiler = nullptr);
   ~PrefetchMngr();
   void init_gpu_mem_buffer();
+  void reset_and_load_initial_cache();
 
   void report_one_layer(int layer_id, torch::Tensor experts);
   void report_one_layer(int layer_id, int64_t* experts, int64_t num_expert);

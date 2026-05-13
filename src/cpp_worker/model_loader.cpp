@@ -4,6 +4,7 @@
 #include "logging.hpp"
 #include "profiler.hpp"
 #include "utils.hpp"
+#include "nvtx_utils.hpp"
 
 void ExpertParamWrapperBase::release_tensor_references() {
   for (auto &tensor : model_parameter_reference) {
@@ -139,6 +140,7 @@ void MemMngrCtx::cu_unmap_address(CUdeviceptr ptr, size_t size) {
 void ExpertParamWrapperCUDriver::map_to(ExpertMemHanlderBase *physical_base, MemMngrCtx *ctx) {
   auto physical = dynamic_cast<ExpertMemHanlderCUDriver *>(physical_base);
   CHECK(physical != nullptr) << "mismatch physical - logical mem type";
+  NVTX_RANGE("mem/map_cu_driver");
   {
     TRACE_EVENT_GURAD(kCache, "map");
     for (int i = 0; i < ptrs.size(); i++) {
@@ -156,6 +158,7 @@ void ExpertParamWrapperCUDriver::map_to(ExpertMemHanlderBase *physical_base, Mem
 void ExpertParamWrapperCUDriverUnified::map_to(ExpertMemHanlderBase *physical_base, MemMngrCtx *ctx) {
   auto physical = dynamic_cast<ExpertMemHanlderCUDriverUnified *>(physical_base);
   CHECK(physical != nullptr) << "mismatch physical - logical mem type";
+  NVTX_RANGE("mem/map_cu_driver_unified");
   {
     TRACE_EVENT_GURAD(kCache, "map");
     ctx->cu_map_address(ptr, address_range_nbyte, physical->handle);
@@ -168,6 +171,7 @@ void ExpertParamWrapperCUDriverUnified::map_to(ExpertMemHanlderBase *physical_ba
 }
 void ExpertParamWrapperTensor::map_to(ExpertMemHanlderBase *physical, MemMngrCtx *ctx) {
   TRACE_EVENT_GURAD(kCache, "map");
+  NVTX_RANGE("mem/map_tensor");
   for (int i = 0; i < model_parameter_reference.size(); i++) {
     auto &prebuilt_t = physical->get_prebuilt_tensor(i);
     model_parameter_reference[i].set_(prebuilt_t, 0, prebuilt_t.sizes(), prebuilt_t.strides());
@@ -175,12 +179,14 @@ void ExpertParamWrapperTensor::map_to(ExpertMemHanlderBase *physical, MemMngrCtx
 }
 void ExpertParamWrapperCUDriver::unmap() {
   TRACE_EVENT_GURAD(kCache, "unmap");
+  NVTX_RANGE("mem/unmap_cu_driver");
   for (int i = 0; i < ptrs.size(); i++) {
     MemMngrCtx::cu_unmap_address(ptrs[i], mapped_nbytes[i]);
   }
 }
 void ExpertParamWrapperCUDriverUnified::unmap() {
   TRACE_EVENT_GURAD(kCache, "unmap");
+  NVTX_RANGE("mem/unmap_cu_driver_unified");
   MemMngrCtx::cu_unmap_address(ptr, mapped_nbyte);
 }
 

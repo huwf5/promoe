@@ -241,6 +241,7 @@ class CachePolicyFactory {
 struct CacheSlot {
   std::shared_ptr<CachePolicy> policy;
   std::vector<ExpertMemHanlderBase*> unused_mems;
+  std::vector<ExpertMemHanlderBase*> all_mems;
   size_t full_len;
 };
 
@@ -271,6 +272,7 @@ class CacheMngr {
  public:
   std::shared_ptr<CacheOracle> cache_oracle;
   using CacheLineOccupancyWaiter = std::function<void()>;
+  using InitialExpert = std::pair<int, int>;
   size_t cache_len = 0;
   std::shared_ptr<ModuleMeta> metas;
   std::shared_ptr<ModelLoader> model_loader;
@@ -292,6 +294,10 @@ class CacheMngr {
     return is_in_cache(model_loader->get_source(layer_id, expert_id));
   }
   void init_gpu_mem_buffer(size_t num_buffers);
+  std::vector<InitialExpert> build_manual_initial_plan() const;
+  void validate_initial_plan_size(const std::vector<InitialExpert>& plan) const;
+  void reset_cache_contents();
+  void load_initial_plan_sync(cudaStream_t stream);
 
 
   // formal methods

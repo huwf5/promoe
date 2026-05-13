@@ -62,9 +62,15 @@ class ModelAdapter:
       pass
 
   def configure_module_meta(self, meta) -> None:
-    return None
+    meta.num_encoder_moe_layer = 0
+    meta.num_decoder_moe_layer = self.num_moe_layer
 
-  def validate_predictor_path(self, predictor_model_path: str | None, num_predict_expert_per_layer: int | None) -> None:
+  def validate_predictor_path(
+    self,
+    predictor_model_path: str | None,
+    num_predict_expert_per_layer: int | None,
+    predictor_type: str | None = None,
+  ) -> None:
     return None
 
   def should_report_moe_layer_to_predictor(self, stage: str | None, global_layer_id: int) -> bool:

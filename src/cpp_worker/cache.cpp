@@ -1,10 +1,35 @@
 #include <nlohmann/json.hpp>
 #include <fstream>
+#include <sstream>
 #include "cache.hpp"
 #include "logging.hpp"
 #include "profiler.hpp"
+#include "nvtx_utils.hpp"
 
 namespace {
+
+int parse_initial_plan_int(const std::string &value,
+                           const std::string &entry,
+                           const std::string &initial_plan_config) {
+  CHECK(!value.empty())
+      << "invalid initial cache plan entry: " << entry
+      << ", initial plan config=" << initial_plan_config;
+  size_t pos = 0;
+  int parsed = 0;
+  try {
+    parsed = std::stoi(value, &pos);
+  } catch (const std::invalid_argument&) {
+    CHECK(false) << "invalid initial cache plan entry: " << entry
+                 << ", initial plan config=" << initial_plan_config;
+  } catch (const std::out_of_range&) {
+    CHECK(false) << "invalid initial cache plan entry: " << entry
+                 << ", initial plan config=" << initial_plan_config;
+  }
+  CHECK(pos == value.size())
+      << "invalid initial cache plan entry: " << entry
+      << ", initial plan config=" << initial_plan_config;
+  return parsed;
+}
 
 void bi_traverse(int* array, int begin, int end, std::vector<int>& ret) {
   if (begin == end) {
@@ -55,6 +80,7 @@ void bi_traverse(int* array, int begin, int end, std::vector<int>& ret) {
 };
 
 void CacheMngr::init_gpu_mem_buffer(size_t num_buffers) {
+  cache_len = num_buffers;
   size_t num_cache_slot = cache_slots->slots.size();
   // CHECK(num_buffers % num_cache_slot == 0);
   // size_t per_layer_cache_len = num_buffers / num_cache_slot;
@@ -123,12 +149,187 @@ void CacheMngr::init_gpu_mem_buffer(size_t num_buffers) {
     for (auto & cache_line : cache_slot.unused_mems) {
       cache_line = ExpertMemParamFactory::get().create_physical(metas->physical_mem_impl);
       cache_line->allocate_like(max_expert_example, model_loader->mem_mngr_ctx.get());
+      cache_slot.all_mems.push_back(cache_line);
       total_nbytes += cache_line->get_allocation_nbytes();
     }
   }
   LOG(ERROR) << "cache allocated " << total_nbytes / 1024.0 / 1024.0 << " MiB";
   LOG(ERROR) << "changing num_predict from " << metas->num_predict_expert_per_layer << " to min(" << metas->num_predict_expert_per_layer << ", " << query_per_layer_cache_len() << ")";
   metas->num_predict_expert_per_layer = std::min<int>(metas->num_predict_expert_per_layer, query_per_layer_cache_len());
+}
+
+std::vector<CacheMngr::InitialExpert> CacheMngr::build_manual_initial_plan() const {
+  CHECK(metas->initial_cache_policy == "manual")
+      << "only initial_cache_policy=manual is supported";
+
+  std::vector<InitialExpert> plan;
+
+  if (!metas->initial_expert_plan.empty()) {
+    CHECK(metas->initial_expert_plan.back() != ',')
+        << "invalid initial_expert_plan entry: "
+        << ", initial_expert_plan=" << metas->initial_expert_plan;
+
+    std::unordered_set<int64_t> seen_experts;
+    std::stringstream explicit_plan(metas->initial_expert_plan);
+    std::string entry;
+    while (std::getline(explicit_plan, entry, ',')) {
+      auto sep = entry.find(':');
+      CHECK(!entry.empty() && sep != std::string::npos && entry.find(':', sep + 1) == std::string::npos)
+          << "invalid initial_expert_plan entry: " << entry
+          << ", initial_expert_plan=" << metas->initial_expert_plan;
+      int layer_idx = parse_initial_plan_int(entry.substr(0, sep),
+                                             entry,
+                                             metas->initial_expert_plan);
+      int expert_idx = parse_initial_plan_int(entry.substr(sep + 1),
+                                              entry,
+                                              metas->initial_expert_plan);
+
+      CHECK(layer_idx >= 0 && layer_idx < metas->num_layer)
+          << "initial_expert_plan layer out of range: layer=" << layer_idx
+          << ", num_layer=" << metas->num_layer
+          << ", initial_expert_plan=" << metas->initial_expert_plan;
+      CHECK(expert_idx >= 0 && expert_idx < metas->num_expert)
+          << "initial_expert_plan expert out of range: layer=" << layer_idx
+          << ", expert=" << expert_idx
+          << ", num_expert=" << metas->num_expert
+          << ", initial_expert_plan=" << metas->initial_expert_plan;
+      int64_t gid = int64_t(layer_idx) * int64_t(metas->num_expert) + int64_t(expert_idx);
+      CHECK(seen_experts.insert(gid).second)
+          << "duplicate expert in initial_expert_plan: layer=" << layer_idx
+          << ", expert=" << expert_idx
+          << ", initial_expert_plan=" << metas->initial_expert_plan;
+      plan.push_back({layer_idx, expert_idx});
+    }
+
+    validate_initial_plan_size(plan);
+    return plan;
+  }
+
+  CHECK(!metas->initial_layer_budgets.empty())
+      << "initial_layer_budgets must be non-empty";
+  CHECK(metas->initial_layer_budgets.back() != ',')
+      << "invalid initial_layer_budgets entry: "
+      << ", initial_layer_budgets=" << metas->initial_layer_budgets;
+
+  std::unordered_set<int> seen_layers;
+  std::stringstream budgets(metas->initial_layer_budgets);
+  std::string entry;
+  while (std::getline(budgets, entry, ',')) {
+    auto sep = entry.find(':');
+    CHECK(!entry.empty() && sep != std::string::npos && entry.find(':', sep + 1) == std::string::npos)
+        << "invalid initial_layer_budgets entry: " << entry
+        << ", initial_layer_budgets=" << metas->initial_layer_budgets;
+    int layer_idx = parse_initial_plan_int(entry.substr(0, sep),
+                                           entry,
+                                           metas->initial_layer_budgets);
+    int budget = parse_initial_plan_int(entry.substr(sep + 1),
+                                        entry,
+                                        metas->initial_layer_budgets);
+
+    CHECK(layer_idx >= 0 && layer_idx < metas->num_layer)
+        << "initial_layer_budgets layer out of range: layer=" << layer_idx
+        << ", num_layer=" << metas->num_layer
+        << ", initial_layer_budgets=" << metas->initial_layer_budgets;
+    CHECK(budget >= 0 && budget <= metas->num_expert)
+        << "initial_layer_budgets budget out of range: layer=" << layer_idx
+        << ", budget=" << budget
+        << ", num_expert=" << metas->num_expert
+        << ", initial_layer_budgets=" << metas->initial_layer_budgets;
+    CHECK(seen_layers.insert(layer_idx).second)
+        << "duplicate layer in initial_layer_budgets: layer=" << layer_idx
+        << ", initial_layer_budgets=" << metas->initial_layer_budgets;
+
+    for (int expert_idx = 0; expert_idx < budget; expert_idx++) {
+      plan.push_back({layer_idx, expert_idx});
+    }
+  }
+
+  validate_initial_plan_size(plan);
+  return plan;
+}
+
+void CacheMngr::validate_initial_plan_size(const std::vector<InitialExpert>& plan) const {
+  size_t plan_size = plan.size();
+  if (plan_size < cache_len) {
+    CHECK(false) << "initial cache plan smaller than cache_size"
+                 << ", cache_size=" << cache_len
+                 << ", plan_size=" << plan_size
+                 << ", missing=" << (cache_len - plan_size)
+                 << ", initial_expert_plan=" << metas->initial_expert_plan
+                 << ", initial_layer_budgets=" << metas->initial_layer_budgets;
+  }
+  if (plan_size > cache_len) {
+    CHECK(false) << "initial cache plan larger than cache_size"
+                 << ", cache_size=" << cache_len
+                 << ", plan_size=" << plan_size
+                 << ", overflow=" << (plan_size - cache_len)
+                 << ", initial_expert_plan=" << metas->initial_expert_plan
+                 << ", initial_layer_budgets=" << metas->initial_layer_budgets;
+  }
+}
+
+void CacheMngr::reset_cache_contents() {
+  CHECK(metas->per_layer_cache == false)
+      << "deterministic initial cache requires global cache";
+  CHECK(cache_slots->slots.size() == 1)
+      << "deterministic initial cache requires global cache";
+
+  for (auto &pair : prefetched_experts) {
+    auto expert = pair.first;
+    auto status = expert->expert_status.get();
+    CHECK(status == kReady || status == kIdle)
+        << "cannot reset active expert " << expert->toString()
+        << " with status " << status;
+    if (status == kReady) {
+      expert->expert_status.transfer(kReady, kIdle);
+    }
+    expert->gpu_data = nullptr;
+    expert->num_ready = 0;
+  }
+  prefetched_experts.clear();
+  for (auto &cache_slot : cache_slots->slots) {
+    cache_slot.unused_mems = cache_slot.all_mems;
+    cache_slot.policy = policy_factory.create_policy(metas->cache_policy);
+  }
+  max_priority = std::numeric_limits<float>::min();
+  if (metas->cache_policy == "nn") {
+    priority.zero_();
+  }
+
+  CHECK(cache_slots->slots[0].unused_mems.size() == cache_len)
+      << "cache reset did not restore all cache lines: restored="
+      << cache_slots->slots[0].unused_mems.size()
+      << ", cache_len=" << cache_len;
+}
+
+void CacheMngr::load_initial_plan_sync(cudaStream_t stream) {
+  auto plan = build_manual_initial_plan();
+  for (auto [layer_idx, expert_idx] : plan) {
+    auto expert = model_loader->get_source(layer_idx, expert_idx);
+    CHECK(!is_in_cache(expert));
+    auto waiter = miss(expert, false);
+    waiter();
+    expert->expert_status.transfer(kIdle, kFetching);
+
+    for (int mem_buf_idx = 0; mem_buf_idx < metas->num_per_expert_param; mem_buf_idx++) {
+      CUDA_CALL(cudaMemcpyAsync(
+          expert->gpu_data->ptr(mem_buf_idx),
+          expert->host_data->ptr(mem_buf_idx),
+          expert->host_data->nbytes(mem_buf_idx),
+          cudaMemcpyHostToDevice, stream));
+    }
+    expert->reference_to_model_param->unmap();
+    expert->reference_to_model_param->map_to(expert->gpu_data,
+                                             model_loader->mem_mngr_ctx.get());
+    CUDA_CALL(cudaStreamSynchronize(stream));
+    expert->num_ready = metas->num_per_expert_param;
+    expert->expert_status.transfer(kFetching, kReady);
+  }
+  for (auto [layer_idx, expert_idx] : plan) {
+    auto expert = model_loader->get_source(layer_idx, expert_idx);
+    CHECK(expert->num_ready == metas->num_per_expert_param);
+    CHECK(expert->expert_status.get() == kReady);
+  }
 }
 CacheMngr::~CacheMngr() {
   size_t used_mem_cnt = prefetched_experts.size();
@@ -247,6 +448,9 @@ void CacheMngr::hit(ExpertHandler *expert, bool is_precise) {
 
 CacheMngr::CacheLineOccupancyWaiter CacheMngr::miss(ExpertHandler *incoming_e, bool is_precise) {
   TRACE_EVENT_GURAD(kCache, "miss:" + incoming_e->toString());
+  NVTX_RANGE("cache/miss L" + std::to_string(incoming_e->layer_idx) +
+             " E" + std::to_string(incoming_e->expert_idx) +
+             (is_precise ? " precise" : " prefetch"));
   LOG(TRACE) << "cache miss " << incoming_e->toString();
   auto cache_slot = cache_slots->to_slot(incoming_e);
   // if (is_precise && metas->predict_input_mode == kOneToken) {
@@ -266,6 +470,10 @@ CacheMngr::CacheLineOccupancyWaiter CacheMngr::miss(ExpertHandler *incoming_e, b
     // incoming_e->gpu_data = evict(e_to_evict, incoming_e, true);
     {
       TRACE_EVENT_GURAD(kCache, "evict " + e_to_evict->toString());
+      NVTX_RANGE("cache/evict oldL" + std::to_string(e_to_evict->layer_idx) +
+                 " oldE" + std::to_string(e_to_evict->expert_idx) +
+                 " newL" + std::to_string(incoming_e->layer_idx) +
+                 " newE" + std::to_string(incoming_e->expert_idx));
       LOG_BLOCK(DEBUG, logger, {
         logger << "evict " << e_to_evict->toString() << ", policy state is " << cache_slot->policy->toString();
       });
@@ -292,6 +500,8 @@ CacheMngr::CacheLineOccupancyWaiter CacheMngr::miss(ExpertHandler *incoming_e, b
       if (orig_status == kUsing || orig_status == kLaunching) {
         lambda_to_wait_expert_occupancy = [e_to_evict]() {
           TRACE_EVENT_GURAD(kFetcher, "waiting " + e_to_evict->toString());
+          NVTX_RANGE("cache/wait_evict oldL" + std::to_string(e_to_evict->layer_idx) +
+                     " oldE" + std::to_string(e_to_evict->expert_idx));
           e_to_evict->expert_status.wait(kReady, kIdle);
         };
         // lambda_to_wait_expert_occupancy();

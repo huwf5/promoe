@@ -1,5 +1,6 @@
 import os
 import re
+import math
 
 from . import hooks
 from .hooks import *
@@ -150,6 +151,61 @@ def repo_folder_name(repo_id: str, repo_type: str = 'model') -> str:
   parts = [f"{repo_type}s", *repo_id.split("/")]
   return '--'.join(parts)
 
+def wrap_generate_with_initial_cache(model, prefetch_mngr):
+  if hasattr(model, "_sparse_cache_old_generate"):
+    return
+  model._sparse_cache_old_generate = model.generate
+
+  def generate_with_initial_cache(*args, **kwargs):
+    prefetch_mngr.reset_and_load_initial_cache()
+    return model._sparse_cache_old_generate(*args, **kwargs)
+
+  model.generate = generate_with_initial_cache
+
+def round_like_cpp(value):
+  return math.floor(float(value) + 0.5)
+
+def _resolve_initial_cache_inputs(
+    initial_cache_policy,
+    initial_layer_budgets,
+    initial_hot_expert_file,
+    per_layer_cache,
+):
+  if initial_cache_policy is None:
+    if initial_layer_budgets:
+      raise ValueError("initial_layer_budgets requires initial_cache_policy=manual")
+    if initial_hot_expert_file:
+      raise ValueError("initial_hot_expert_file requires initial_cache_policy=hot_expert")
+    return {
+      "initial_cache_policy": None,
+      "initial_layer_budgets": None,
+      "initial_hot_expert_file": None,
+      "reset_cache_on_generate_start": False,
+      "per_layer_cache": per_layer_cache,
+    }
+
+  if initial_cache_policy == "manual":
+    if not initial_layer_budgets:
+      raise ValueError("manual initial cache requires initial_layer_budgets")
+    if initial_hot_expert_file:
+      raise ValueError("manual initial cache does not use initial_hot_expert_file")
+  elif initial_cache_policy == "hot_expert":
+    if not initial_hot_expert_file:
+      raise ValueError("hot_expert initial cache requires initial_hot_expert_file")
+    if initial_layer_budgets:
+      raise ValueError("hot_expert initial cache does not use initial_layer_budgets")
+  else:
+    raise ValueError(f"unsupported initial_cache_policy={initial_cache_policy!r}")
+
+  return {
+    # "hot_expert" is also use "manual" into cpp
+    "initial_cache_policy": "manual",
+    "initial_layer_budgets": initial_layer_budgets if initial_cache_policy == "manual" else None,
+    "initial_hot_expert_file": initial_hot_expert_file if initial_cache_policy == "hot_expert" else None,
+    "reset_cache_on_generate_start": True,
+    "per_layer_cache": False,
+  }
+
 def inject_model(
     model : torch.nn.Module,
     model_id = None,
@@ -181,6 +237,9 @@ def inject_model(
     per_layer_cache : bool = None,
     promote_hit_in_prefetch : bool = None,
     cache_policy : str = None,
+    initial_cache_policy: str | None = None,
+    initial_layer_budgets: str | None = None,
+    initial_hot_expert_file: str | None = None,
 
     cache_device : str|int = 'cuda',
     pin_memory : bool  = True,
@@ -277,6 +336,36 @@ def inject_model(
   print(param_key_list)
   meta.init_param_list(param_key_list)
 
+  initial_inputs = _resolve_initial_cache_inputs(
+    initial_cache_policy,
+    initial_layer_budgets,
+    initial_hot_expert_file,
+    per_layer_cache,
+  )
+  initial_cache_policy = initial_inputs["initial_cache_policy"]
+  initial_layer_budgets = initial_inputs["initial_layer_budgets"]
+  initial_hot_expert_file = initial_inputs["initial_hot_expert_file"]
+  reset_cache_on_generate_start = initial_inputs["reset_cache_on_generate_start"]
+  per_layer_cache = initial_inputs["per_layer_cache"]
+
+  adapter.configure_module_meta(meta)
+  initial_expert_plan = None
+  if initial_hot_expert_file:
+    from sparse_llm_cache.utils.hot_experts import (
+      build_hot_initial_plan,
+      format_initial_expert_plan,
+    )
+    effective_cache_rate = 0.5 if cache_rate is None else float(cache_rate)
+    initial_total_slots = round_like_cpp(
+      effective_cache_rate * int(num_moe_layer) * int(num_expert_per_layer)
+    )
+    initial_plan = build_hot_initial_plan(
+      initial_hot_expert_file,
+      adapter,
+      total_slots=initial_total_slots,
+    )
+    initial_expert_plan = format_initial_expert_plan(initial_plan)
+
   param_dict = {
     'model_arch_string'            : str(model_id),
     'num_expert_per_token'         : str(num_expert_per_token),
@@ -298,13 +387,21 @@ def inject_model(
     'per_layer_cache'              : str(per_layer_cache),
     'promote_hit_in_prefetch'      : str(promote_hit_in_prefetch),
     'cache_policy'                 : str(cache_policy),
+    'num_encoder_moe_layer'        : str(meta.num_encoder_moe_layer),
+    'num_decoder_moe_layer'        : str(meta.num_decoder_moe_layer),
+    'reset_cache_on_generate_start': str(reset_cache_on_generate_start),
+    'initial_cache_policy'         : str(initial_cache_policy),
+    'initial_layer_budgets'        : str(initial_layer_budgets),
+    'initial_expert_plan'          : str(initial_expert_plan),
   }
 
   meta.init_from_map(param_dict)
 
   adapter.configure_module_meta(meta)
   meta.handle_uninited_configs()
-  adapter.validate_predictor_path(predictor_model_path, num_predict_expert_per_layer)
+  adapter.validate_predictor_path(
+    predictor_model_path, num_predict_expert_per_layer, predictor_type
+  )
 
   model_loader  = cpp_worker.ModelLoader(meta)
   predictor     = cpp_worker.PredictorBase.create(meta)
@@ -361,6 +458,8 @@ def inject_model(
     model_loader.pin_memory()
     print("pin model parameters on cpu...done")
   model._prefetch_mngr = prefetch_mngr
+  if reset_cache_on_generate_start:
+    wrap_generate_with_initial_cache(model, prefetch_mngr)
   if launch_now:
     launch(model)
   return prefetch_mngr

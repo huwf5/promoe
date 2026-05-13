@@ -4,6 +4,7 @@
 #include "logging.hpp"
 #include "profiler.hpp"
 #include "utils.hpp"
+#include "nvtx_utils.hpp"
 
 std::vector<std::pair<int, int>> build_predict_layer_mapping(ModuleMeta * metas) {
   std::vector<int> layers_to_predict;
@@ -130,11 +131,13 @@ void convert_jit_model_dtype(torch::jit::script::Module &model, torch::ScalarTyp
 
 PredictOutput LegacyPredictor::predict(int input_layer_id) {
   TRACE_EVENT_GURAD(kPredictor, "predict " + std::to_string(input_layer_id));
+  NVTX_RANGE("predict/legacy L" + std::to_string(input_layer_id));
   LOG(DEBUG) << "predictor, predict " + std::to_string(input_layer_id);
   torch::Tensor input;
   auto model = predict_models[0].model;
   {
     TRACE_EVENT_GURAD_NAME(kPredictor, "logits copy", guardguard);
+    NVTX_RANGE("predict/wait_logits L" + std::to_string(input_layer_id));
     CUDA_CALL(cudaEventSynchronize(logits_record_event[input_layer_id]));
   }
   switch (metas->predict_input_mode) {
@@ -242,7 +245,11 @@ PredictOutput LegacyPredictor::predict(int input_layer_id) {
   std::vector<torch::jit::IValue> inputs{input.flatten(1, -1)};
   // std::vector<torch::jit::IValue> inputs{input.flatten().unsqueeze(0)};
   torch::NoGradGuard no_grad;
-  torch::Tensor output = model.forward(inputs).toTensor();
+  torch::Tensor output;
+  {
+    NVTX_RANGE("predict/forward L" + std::to_string(input_layer_id));
+    output = model.forward(inputs).toTensor();
+  }
   output = output.reshape({bs, -1, metas->num_expert});
   output = output.sum({0});
   profiler->push(TimeProfiler::kPredictTime, t.dur_us());
@@ -318,7 +325,7 @@ void LegacyPredictor::load_model_from(std::string model_path) {
 
   auto predict_layers = build_predict_layer_mapping(metas.get());
 
-  for (int l = 0; l < metas->num_layer + 1; l++) {
+  for (int l = 0; l < metas->predictor_num_layer + 1; l++) {
     CHECK(predict_models.find(l) != predict_models.end()) << "No model meta for layer " << l;
     auto &model = predict_models[l];
     CHECK(predict_layers[l].first <= predict_layers[l].second) << "Invalid predict layer range: " << predict_layers[l].first << " " << predict_layers[l].second;
@@ -394,7 +401,10 @@ void LegacyPredictor::record_moe_attn_logits(int layer_id, torch::Tensor attn_lo
         if (attn_logits.numel() == attn_logits.size(-1)) {
           LOG(DEBUG) << "predictor, record attn logits";
           first_moe_attn_input_logits_buffer = torch::empty_like(attn_logits, attn_logits.options().device(torch::kCPU).pinned_memory(true));
-          CUDA_CALL(cudaMemcpyAsync(first_moe_attn_input_logits_buffer.data_ptr(), attn_logits.data_ptr(), attn_logits.nbytes(), cudaMemcpyDeviceToHost, this->compute_stream));
+          {
+            NVTX_RANGE("logits/attn_d2h L" + std::to_string(layer_id) + " bytes=" + std::to_string(attn_logits.nbytes()));
+            CUDA_CALL(cudaMemcpyAsync(first_moe_attn_input_logits_buffer.data_ptr(), attn_logits.data_ptr(), attn_logits.nbytes(), cudaMemcpyDeviceToHost, this->compute_stream));
+          }
           CUDA_CALL(cudaEventRecord(logits_record_event[layer_id], this->compute_stream));
           // first_moe_attn_input_logits_buffer = attn_logits.to("cpu");
         } else {
@@ -419,7 +429,10 @@ void LegacyPredictor::record_moe_attn_logits(int layer_id, torch::Tensor attn_lo
       }
       LOG(DEBUG) << "predictor, record attn logits";
       moe_attn_input_logits_buffer_list[layer_id] = torch::empty_like(attn_logits, attn_logits.options().device(torch::kCPU).pinned_memory(true));
-      CUDA_CALL(cudaMemcpyAsync(moe_attn_input_logits_buffer_list[layer_id].data_ptr(), attn_logits.data_ptr(), attn_logits.nbytes(), cudaMemcpyDeviceToHost, this->compute_stream));
+      {
+        NVTX_RANGE("logits/attn_d2h L" + std::to_string(layer_id) + " bytes=" + std::to_string(attn_logits.nbytes()));
+        CUDA_CALL(cudaMemcpyAsync(moe_attn_input_logits_buffer_list[layer_id].data_ptr(), attn_logits.data_ptr(), attn_logits.nbytes(), cudaMemcpyDeviceToHost, this->compute_stream));
+      }
       CUDA_CALL(cudaEventRecord(logits_record_event[layer_id], this->compute_stream));
       // moe_attn_input_logits_buffer_list[layer_id] = attn_logits.to("cpu");
       break;
@@ -467,7 +480,10 @@ void LegacyPredictor::record_moe_layer_logits(int layer_id, torch::Tensor layer_
       }
       LOG(DEBUG) << "predictor, record attn logits";
       moe_layer_logits_buffer_list[layer_id] = torch::empty_like(layer_logits, layer_logits.options().device(torch::kCPU).pinned_memory(true));
-      CUDA_CALL(cudaMemcpyAsync(moe_layer_logits_buffer_list[layer_id].data_ptr(), layer_logits.data_ptr(), layer_logits.nbytes(), cudaMemcpyDeviceToHost, this->compute_stream));
+      {
+        NVTX_RANGE("logits/layer_d2h L" + std::to_string(layer_id) + " bytes=" + std::to_string(layer_logits.nbytes()));
+        CUDA_CALL(cudaMemcpyAsync(moe_layer_logits_buffer_list[layer_id].data_ptr(), layer_logits.data_ptr(), layer_logits.nbytes(), cudaMemcpyDeviceToHost, this->compute_stream));
+      }
       CUDA_CALL(cudaEventRecord(logits_record_event[layer_id], this->compute_stream));
       // moe_layer_logits_buffer_list[layer_id] = layer_logits.to("cpu");
       break;
@@ -495,12 +511,14 @@ void LegacyPredictor::slice_predict_output_layer(PredictOutput &output) {
 
 PredictOutput SepPredictor::predict(int input_layer_id) {
   TRACE_EVENT_GURAD(kPredictor, "predict " + std::to_string(input_layer_id));
+  NVTX_RANGE("predict/sep L" + std::to_string(input_layer_id));
   LOG(DEBUG) << "predictor, predict " + std::to_string(input_layer_id);
   CHECK(layer_predict_enabled(input_layer_id)) << "layer " << input_layer_id << " not enabled";
   torch::Tensor input;
   auto * model = &predict_models[0];
   {
     TRACE_EVENT_GURAD_NAME(kPredictor, "logits copy", guardguard);
+    NVTX_RANGE("predict/wait_logits L" + std::to_string(input_layer_id));
     CUDA_CALL(cudaEventSynchronize(logits_record_event[input_layer_id]));
   }
   switch (metas->predict_input_mode) {
@@ -537,7 +555,11 @@ PredictOutput SepPredictor::predict(int input_layer_id) {
   std::vector<torch::Tensor> per_layer_outputs;
   for (auto output_layer_id : model->enabled_output_layers) {
     auto& m = model->models[output_layer_id];
-    torch::Tensor output = m.forward(inputs).toTensor().reshape({bs, -1, metas->num_expert});
+    torch::Tensor output;
+    {
+      NVTX_RANGE("predict/forward inL" + std::to_string(input_layer_id) + " outL" + std::to_string(output_layer_id));
+      output = m.forward(inputs).toTensor().reshape({bs, -1, metas->num_expert});
+    }
     per_layer_outputs.push_back(output);
   }
   torch::Tensor output;
@@ -557,12 +579,14 @@ PredictOutput SepPredictor::predict(int input_layer_id) {
 
 PredictOutput SepPredictor::predict_one_job(int input_layer_id, int job_idx) {
   TRACE_EVENT_GURAD(kPredictor, "predict_one_job " + std::to_string(input_layer_id));
+  NVTX_RANGE("predict/job inL" + std::to_string(input_layer_id) + " job" + std::to_string(job_idx));
   LOG(DEBUG) << "predictor, predict_one_job " + std::to_string(input_layer_id);
   CHECK(layer_predict_enabled(input_layer_id)) << "layer " << input_layer_id << " not enabled";
   torch::Tensor input;
   auto * model = &predict_models[0];
   if (job_idx == 0) {
     TRACE_EVENT_GURAD_NAME(kPredictor, "logits copy", guardguard);
+    NVTX_RANGE("predict/wait_logits L" + std::to_string(input_layer_id));
     CUDA_CALL(cudaEventSynchronize(logits_record_event[input_layer_id]));
   }
   switch (metas->predict_input_mode) {
@@ -600,7 +624,11 @@ PredictOutput SepPredictor::predict_one_job(int input_layer_id, int job_idx) {
   torch::NoGradGuard no_grad;
   auto output_layer_id = model->enabled_output_layers[job_idx];
   auto& m = model->models[output_layer_id];
-  torch::Tensor output = m.forward(inputs).toTensor().reshape({bs, -1, metas->num_expert});
+  torch::Tensor output;
+  {
+    NVTX_RANGE("predict/forward inL" + std::to_string(input_layer_id) + " outL" + std::to_string(output_layer_id));
+    output = m.forward(inputs).toTensor().reshape({bs, -1, metas->num_expert});
+  }
   if (output.size(0) > 1  ) {
     output = output.sum({0});
   } else {
@@ -679,7 +707,10 @@ void SepPredictor::record_moe_layer_logits(int layer_id, torch::Tensor layer_log
       }
       LOG(DEBUG) << "predictor, record attn logits";
       moe_layer_logits_buffer_list[layer_id] = torch::empty_like(layer_logits, layer_logits.options().device(torch::kCPU).pinned_memory(true));
-      CUDA_CALL(cudaMemcpyAsync(moe_layer_logits_buffer_list[layer_id].data_ptr(), layer_logits.data_ptr(), layer_logits.nbytes(), cudaMemcpyDeviceToHost, this->compute_stream));
+      {
+        NVTX_RANGE("logits/layer_d2h L" + std::to_string(layer_id) + " bytes=" + std::to_string(layer_logits.nbytes()));
+        CUDA_CALL(cudaMemcpyAsync(moe_layer_logits_buffer_list[layer_id].data_ptr(), layer_logits.data_ptr(), layer_logits.nbytes(), cudaMemcpyDeviceToHost, this->compute_stream));
+      }
       CUDA_CALL(cudaEventRecord(logits_record_event[layer_id], this->compute_stream));
       // moe_layer_logits_buffer_list[layer_id] = layer_logits.to("cpu");
       break;

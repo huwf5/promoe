@@ -2,9 +2,11 @@
 #include "logging.hpp"
 #include "profiler.hpp"
 #include "prefetcher.hpp"
+#include "nvtx_utils.hpp"
 
 void PredictWorker::do_one_task_impl(PredictJob job) {
   TRACE_EVENT_GURAD(kPredictor, "predict thread " + std::to_string(job.input_layer_id));
+  NVTX_RANGE("predict/thread L" + std::to_string(job.input_layer_id));
 
   int num_predict_jobs = predictor->query_predict_jobs(job.input_layer_id);
 
@@ -62,10 +64,20 @@ void PredictWorker::do_one_task_impl(PredictJob job) {
         } else {
           task.num_expert  = per_layer_num_expert;
         }
-        auto wait_handler = fetch_schedule_thread->add_one_task(&task);
-        fetch_schedule_thread->wait_progress(wait_handler);
-        // fetch_schedule_thread->add_one_layer_task(layer_idx, predicted_expert[layer_idx].data_ptr<int64_t>(), per_layer_num_expert);
-        prefetch_layer_progress.push(layer_idx);
+        std::string nvtx_range_name = "predict/submit_prefetch_layer inL" + std::to_string(job.input_layer_id) +
+                                      " outL" + std::to_string(layer_idx) +
+                                      " N" + std::to_string(task.num_expert) +
+                                      " G" + std::to_string(job.generation);
+        if (NvtxDetailEnabled()) {
+          nvtx_range_name += " experts=[" + array_to_str(task.expert_idxs, task.num_expert) + "]";
+        }
+        {
+          NVTX_RANGE(nvtx_range_name);
+          auto wait_handler = fetch_schedule_thread->add_one_task(&task);
+          fetch_schedule_thread->wait_progress(wait_handler);
+          // fetch_schedule_thread->add_one_layer_task(layer_idx, predicted_expert[layer_idx].data_ptr<int64_t>(), per_layer_num_expert);
+          prefetch_layer_progress.push(layer_idx);
+        }
       }
     }
     if (pred_result.inner_l_to_outer_l(num_predicted_layers) == metas->num_layer) {
@@ -78,30 +90,58 @@ void PredictWorker::do_one_task_impl(PredictJob job) {
 }
 void ExpertUnlockWorker::do_one_task_impl(ExpertHandler *task) {
   TRACE_EVENT_GURAD(kUnlocker, "unlock:" + task->toString());
+  NVTX_RANGE("unlock/wait_compute L" + std::to_string(task->layer_idx) +
+             " E" + std::to_string(task->expert_idx));
   task->expert_status.wait(kUsing);
   CUDA_CALL(cudaEventSynchronize(task->event));
   task->expert_status.transfer(kUsing, kReady);
 }
 void FetchWorker::do_one_task_impl(CopyTask *task) {
   TRACE_EVENT_GURAD(kFetcher, "fetch:" + task->toString());
+  NVTX_RANGE("fetch/task L" + std::to_string(task->expert->layer_idx) +
+             " E" + std::to_string(task->expert->expert_idx) +
+             " P" + std::to_string(task->start_mem_buf_idx) +
+             "-" + std::to_string(task->stop_mem_buf_idx) +
+             (task->is_precise ? " precise" : " prefetch"));
   LOG(TRACE) << "fetcher: copying " << task->toString();
   {
+    NVTX_RANGE("fetch/wait_evict L" + std::to_string(task->expert->layer_idx) +
+               " E" + std::to_string(task->expert->expert_idx));
     task->lambda_wait();
   }
-  for (int mem_buf_idx = task->start_mem_buf_idx; mem_buf_idx < task->stop_mem_buf_idx; mem_buf_idx++) {
-    // LOG(ERROR) << "fetcher: copy from " << task->expert->host_data.ptr(mem_buf_idx) << " to " << task->expert->gpu_data->ptr(mem_buf_idx);
-    CUDA_CALL(cudaMemcpyAsync(
-      task->expert->gpu_data->ptr(mem_buf_idx),
-      task->expert->host_data->ptr(mem_buf_idx),
-      task->expert->host_data->nbytes(mem_buf_idx),
-      cudaMemcpyHostToDevice, this->stream));
+  {
+    size_t total_nbytes = 0;
+    for (int mem_buf_idx = task->start_mem_buf_idx; mem_buf_idx < task->stop_mem_buf_idx; mem_buf_idx++) {
+      total_nbytes += task->expert->host_data->nbytes(mem_buf_idx);
+    }
+    NVTX_RANGE(std::string(task->is_precise ? "fetch/demand_h2d " : "fetch/prefetch_h2d ") +
+               "L" + std::to_string(task->expert->layer_idx) +
+               " E" + std::to_string(task->expert->expert_idx) +
+               " P" + std::to_string(task->start_mem_buf_idx) +
+               "-" + std::to_string(task->stop_mem_buf_idx) +
+               " chunks=" + std::to_string(task->stop_mem_buf_idx - task->start_mem_buf_idx) +
+               " bytes=" + std::to_string(total_nbytes));
+    for (int mem_buf_idx = task->start_mem_buf_idx; mem_buf_idx < task->stop_mem_buf_idx; mem_buf_idx++) {
+      // LOG(ERROR) << "fetcher: copy from " << task->expert->host_data.ptr(mem_buf_idx) << " to " << task->expert->gpu_data->ptr(mem_buf_idx);
+      CUDA_CALL(cudaMemcpyAsync(
+        task->expert->gpu_data->ptr(mem_buf_idx),
+        task->expert->host_data->ptr(mem_buf_idx),
+        task->expert->host_data->nbytes(mem_buf_idx),
+        cudaMemcpyHostToDevice, this->stream));
+    }
   }
   if (task->start_mem_buf_idx == 0) {
+    NVTX_RANGE("fetch/remap L" + std::to_string(task->expert->layer_idx) +
+               " E" + std::to_string(task->expert->expert_idx));
     task->expert->reference_to_model_param->unmap();
     task->expert->reference_to_model_param->map_to(task->expert->gpu_data, mem_mngr_ctx);
   }
 
-  CUDA_CALL(cudaStreamSynchronize(this->stream));
+  {
+    NVTX_RANGE("fetch/sync L" + std::to_string(task->expert->layer_idx) +
+               " E" + std::to_string(task->expert->expert_idx));
+    CUDA_CALL(cudaStreamSynchronize(this->stream));
+  }
   fetch_schedule_thread->add_one_task(&fetch_schedule_thread->copy_done_task);
 }
 void PredictWorker::add_prefetch_layer_budget() {

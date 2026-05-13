@@ -154,6 +154,14 @@ class ModuleMeta {
   int limit_layer_0_window = -1;
   int limit_layer_0_num_predict = -1;
 
+  int num_encoder_moe_layer = 0;
+  int num_decoder_moe_layer = -1;
+
+  bool reset_cache_on_generate_start = false;
+  std::string initial_cache_policy = "";
+  std::string initial_layer_budgets = "";
+  std::string initial_expert_plan = "";
+
   // deprecated
   int         max_prefetch_layer_distance = -1;
   bool        cache_only = false;
@@ -184,6 +192,15 @@ class ModuleMeta {
   }
   inline std::pair<int,int> unsqueeze_expert_idx(int flatten_expert_id) {
     return std::make_pair(flatten_expert_id / num_expert, flatten_expert_id % num_expert);
+  }
+  int first_decoder_layer() const {
+    return num_encoder_moe_layer;
+  }
+  bool is_encoder_layer(int layer_idx) const {
+    return layer_idx >= 0 && layer_idx < num_encoder_moe_layer;
+  }
+  bool is_decoder_layer(int layer_idx) const {
+    return layer_idx >= first_decoder_layer() && layer_idx < num_layer;
   }
 
   void init_from_map(std::unordered_map<std::string, std::string> config_map);
