@@ -1,9 +1,63 @@
 #include <omp.h>
 #include <climits>
+#include <cstdlib>
 #include "prefetcher.hpp"
 #include "profiler.hpp"
 #include "logging.hpp"
 #include "nvtx_utils.hpp"
+
+namespace {
+class AtomicQueueLockGuard {
+  AtomicQueueLock& lock_;
+
+ public:
+  explicit AtomicQueueLockGuard(AtomicQueueLock& lock) : lock_(lock) {
+    lock_.lock();
+  }
+  ~AtomicQueueLockGuard() {
+    lock_.unlock();
+  }
+  AtomicQueueLockGuard(const AtomicQueueLockGuard&) = delete;
+  AtomicQueueLockGuard& operator=(const AtomicQueueLockGuard&) = delete;
+};
+
+// Set SPARSE_CACHE_LOG_ENCODER_EXPERTS_ON_DECODER_ENTRY=1 to print encoder-side
+// cache occupancy when the scheduler first enters the decoder predictor phase.
+void log_encoder_experts_in_cache_on_decoder_entry(
+    ModuleMeta* metas,
+    ModelLoader* model_loader,
+    CacheMngr* cache) {
+  if (metas == nullptr || model_loader == nullptr || cache == nullptr) {
+    return;
+  }
+  const char* flag = std::getenv("SPARSE_CACHE_LOG_ENCODER_EXPERTS_ON_DECODER_ENTRY");
+  if (flag == nullptr || flag[0] == '\0' || flag[0] == '0') {
+    return;
+  }
+  const int enc_layers = metas->num_encoder_moe_layer;
+  if (enc_layers <= 0) {
+    LOG(INFO) << "decoder phase entry: num_encoder_moe_layer=0, skip encoder cache scan";
+    return;
+  }
+  int in_cache = 0;
+  int fully_ready = 0;
+  for (int layer = 0; layer < enc_layers; layer++) {
+    for (int expert = 0; expert < metas->num_expert; expert++) {
+      ExpertHandler* e = model_loader->get_source(layer, expert);
+      if (!cache->is_in_cache(e)) {
+        continue;
+      }
+      in_cache++;
+      if (e->num_ready >= metas->num_per_expert_param) {
+        fully_ready++;
+      }
+    }
+  }
+  const int total = enc_layers * metas->num_expert;
+  LOG(INFO) << "decoder phase entry: encoder experts in cache (gpu slot) " << in_cache << "/" << total
+            << ", fully_ready(num_ready>=" << metas->num_per_expert_param << ") " << fully_ready;
+}
+} // namespace
 
 void FetchScheduleWorker::reorder_experts(int layer_idx, int64_t *expert_idxs, size_t num_expert) {
   TRACE_EVENT_GURAD(kFetchScheduler, "reorder_experts");
@@ -83,12 +137,171 @@ int64_t FetchScheduleWorker::flatten_expert(int layer_idx, int expert_idx) const
   return int64_t(layer_idx) * int64_t(metas->num_expert) + int64_t(expert_idx);
 }
 
+void FetchScheduleWorker::ensure_reclaimable_pending_initialized() {
+  if (pending_reclaimable_updates.size() != static_cast<size_t>(metas->num_layer)) {
+    pending_reclaimable_updates.resize(metas->num_layer);
+  }
+  if (pending_reclaimable_layer_mask.size() != static_cast<size_t>(metas->num_layer)) {
+    pending_reclaimable_layer_mask.assign(metas->num_layer, 0);
+  }
+}
+
+void FetchScheduleWorker::note_pending_reclaimable_layer_locked(int layer_idx) {
+  if (!pending_reclaimable_layer_mask[layer_idx]) {
+    pending_reclaimable_layer_mask[layer_idx] = 1;
+    pending_reclaimable_layers.push_back(layer_idx);
+  }
+}
+
+void FetchScheduleWorker::enqueue_layer_reclaimable_except(
+    int layer_idx,
+    const std::vector<uint8_t>& needed_mask) {
+  if (!metas->is_encoder_layer(layer_idx)) {
+    return;
+  }
+  AtomicQueueLockGuard guard(reclaimable_update_lock);
+  ensure_reclaimable_pending_initialized();
+  auto& pending = pending_reclaimable_updates[layer_idx];
+  if (pending.mode == PendingReclaimableUpdate::kLayerAll) {
+    return;
+  }
+
+  std::vector<uint8_t> merged = needed_mask;
+  if (merged.size() != static_cast<size_t>(metas->num_expert)) {
+    merged.resize(metas->num_expert, 0);
+  }
+  if (pending.mode == PendingReclaimableUpdate::kSomeExperts) {
+    if (pending.expert_mask.size() != static_cast<size_t>(metas->num_expert)) {
+      pending.expert_mask.resize(metas->num_expert, 0);
+    }
+    for (int expert_idx = 0; expert_idx < metas->num_expert; expert_idx++) {
+      if (pending.expert_mask[expert_idx]) {
+        merged[expert_idx] = 0;
+      }
+    }
+  } else if (pending.mode == PendingReclaimableUpdate::kLayerExcept) {
+    if (pending.needed_mask.size() != static_cast<size_t>(metas->num_expert)) {
+      pending.needed_mask.resize(metas->num_expert, 0);
+    }
+    for (int expert_idx = 0; expert_idx < metas->num_expert; expert_idx++) {
+      merged[expert_idx] = merged[expert_idx] && pending.needed_mask[expert_idx];
+    }
+  }
+
+  pending.mode = PendingReclaimableUpdate::kLayerExcept;
+  pending.needed_mask = std::move(merged);
+  pending.expert_mask.clear();
+  note_pending_reclaimable_layer_locked(layer_idx);
+  has_pending_reclaimable_updates.store(true, std::memory_order_release);
+}
+
+void FetchScheduleWorker::enqueue_expert_reclaimable(int layer_idx, int expert_idx) {
+  if (!metas->is_encoder_layer(layer_idx)) {
+    return;
+  }
+  CHECK(expert_idx >= 0 && expert_idx < metas->num_expert)
+      << "expert index out of range for reclaimable update: " << expert_idx;
+  AtomicQueueLockGuard guard(reclaimable_update_lock);
+  ensure_reclaimable_pending_initialized();
+  auto& pending = pending_reclaimable_updates[layer_idx];
+  if (pending.mode == PendingReclaimableUpdate::kLayerAll) {
+    return;
+  }
+  if (pending.mode == PendingReclaimableUpdate::kLayerExcept) {
+    if (expert_idx >= 0 && expert_idx < static_cast<int>(pending.needed_mask.size())) {
+      pending.needed_mask[expert_idx] = 0;
+    }
+  } else {
+    if (pending.expert_mask.empty()) {
+      pending.expert_mask.assign(metas->num_expert, 0);
+    }
+    pending.mode = PendingReclaimableUpdate::kSomeExperts;
+    pending.expert_mask[expert_idx] = 1;
+  }
+  note_pending_reclaimable_layer_locked(layer_idx);
+  has_pending_reclaimable_updates.store(true, std::memory_order_release);
+}
+
+void FetchScheduleWorker::enqueue_layer_reclaimable(int layer_idx) {
+  if (!metas->is_encoder_layer(layer_idx)) {
+    return;
+  }
+  AtomicQueueLockGuard guard(reclaimable_update_lock);
+  ensure_reclaimable_pending_initialized();
+  auto& pending = pending_reclaimable_updates[layer_idx];
+  pending.mode = PendingReclaimableUpdate::kLayerAll;
+  pending.expert_mask.clear();
+  pending.needed_mask.clear();
+  note_pending_reclaimable_layer_locked(layer_idx);
+  has_pending_reclaimable_updates.store(true, std::memory_order_release);
+}
+
+void FetchScheduleWorker::drain_reclaimable_updates(int max_updates) {
+  if (!has_pending_reclaimable_updates.load(std::memory_order_acquire)) {
+    return;
+  }
+
+  std::vector<PendingReclaimableUpdate> local_updates;
+  std::vector<int> local_layers;
+
+  {
+    AtomicQueueLockGuard guard(reclaimable_update_lock);
+    ensure_reclaimable_pending_initialized();
+
+    int drained = 0;
+    std::vector<int> remaining_layers;
+    for (int layer_idx : pending_reclaimable_layers) {
+      if (max_updates >= 0 && drained >= max_updates) {
+        remaining_layers.push_back(layer_idx);
+        continue;
+      }
+      local_layers.push_back(layer_idx);
+      local_updates.push_back(std::move(pending_reclaimable_updates[layer_idx]));
+      pending_reclaimable_updates[layer_idx] = PendingReclaimableUpdate();
+      pending_reclaimable_layer_mask[layer_idx] = 0;
+      drained += 1;
+    }
+
+    pending_reclaimable_layers.swap(remaining_layers);
+    has_pending_reclaimable_updates.store(!pending_reclaimable_layers.empty(),
+                                          std::memory_order_release);
+  }
+
+  for (size_t i = 0; i < local_layers.size(); i++) {
+    const int layer_idx = local_layers[i];
+    const auto& update = local_updates[i];
+    switch (update.mode) {
+      case PendingReclaimableUpdate::kSomeExperts: {
+        for (int expert_idx = 0; expert_idx < metas->num_expert; expert_idx++) {
+          if (expert_idx < static_cast<int>(update.expert_mask.size()) &&
+              update.expert_mask[expert_idx]) {
+            cache->mark_reclaimable(layer_idx, expert_idx);
+          }
+        }
+        break;
+      }
+      case PendingReclaimableUpdate::kLayerExcept: {
+        cache->mark_layer_reclaimable_except(layer_idx, update.needed_mask);
+        break;
+      }
+      case PendingReclaimableUpdate::kLayerAll: {
+        cache->mark_layer_reclaimable(layer_idx);
+        break;
+      }
+      case PendingReclaimableUpdate::kNone: {
+        break;
+      }
+    }
+  }
+}
+
 void FetchScheduleWorker::set_phase(SchedulerPhase next_phase) {
   if (phase == next_phase) {
     return;
   }
   phase = next_phase;
   if (phase == kDecoderPredictorPhase) {
+    log_encoder_experts_in_cache_on_decoder_entry(metas, model_loader, cache);
     clear_decoder_warmup_queue();
   }
 }
@@ -135,7 +348,13 @@ void FetchScheduleWorker::rebuild_decoder_warmup_queue() {
   for (auto [layer_idx, expert_idx] : parsed) {
     auto gid = flatten_expert(layer_idx, expert_idx);
     if (decoder_warmup_seen.insert(gid).second) {
-      decoder_warmup_queue.push({layer_idx, expert_idx});
+      if (metas->chunk_prefetch) {
+        for (int j = 0; j < metas->num_per_expert_param; j++) {
+          decoder_warmup_queue.push({layer_idx, expert_idx, j, j + 1});
+        }
+      } else {
+        decoder_warmup_queue.push({layer_idx, expert_idx, 0, metas->num_per_expert_param});
+      }
     }
   }
 }
@@ -304,6 +523,7 @@ void FetchScheduleWorker::pop_next_task(CopyTask &task, bool &found) {
     found = true;
     return;
   }
+  drain_reclaimable_updates();
   if (!metas->enable_decoder_warmup_overlap) {
     for (int layer_idx = 0; layer_idx < metas->num_layer; layer_idx++) {
       if (per_layer_job_queues[layer_idx].empty()) {
@@ -366,18 +586,22 @@ bool FetchScheduleWorker::pop_next_decoder_warmup(CopyTask& task) {
   if (phase != kEncoderPhase || !metas->enable_decoder_warmup_overlap) {
     return false;
   }
+  drain_reclaimable_updates();
   if (!cache->has_reclaimable_encoder()) {
     return false;
   }
   while (!decoder_warmup_queue.empty()) {
-    auto [layer_idx, expert_idx] = decoder_warmup_queue.front();
+    auto entry = decoder_warmup_queue.front();
     decoder_warmup_queue.pop();
-    auto expert = model_loader->get_source(layer_idx, expert_idx);
-    if (cache->is_in_cache(expert)) {
+    auto expert = model_loader->get_source(entry.layer_idx, entry.expert_idx);
+    if (expert->num_ready >= entry.stop_mem_buf_idx) {
       continue;
     }
-    task.start_mem_buf_idx = 0;
-    task.stop_mem_buf_idx = metas->num_per_expert_param;
+    if (expert->gpu_data == nullptr && entry.start_mem_buf_idx > 0) {
+      continue;
+    }
+    task.start_mem_buf_idx = entry.start_mem_buf_idx;
+    task.stop_mem_buf_idx = entry.stop_mem_buf_idx;
     task.expert = expert;
     task.is_precise = false;
     task.generation = current_generation;
@@ -407,18 +631,50 @@ void PrefetchMngr::reset_and_load_initial_cache() {
   if (!metas->reset_cache_on_generate_start) {
     return;
   }
+  NVTX_RANGE("cache_init/reset_and_load_initial_cache");
+  Timer total_timer;
+  uint64_t clear_us = 0;
+  uint64_t reset_us = 0;
+  uint64_t load_us = 0;
+  uint64_t rebuild_us = 0;
   prefetch_generation += 1;
   fetch_schedule_thread->generation_start_task.generation = prefetch_generation;
   fetch_schedule_thread->generation_start_task.decoder_warmup_action = DecoderWarmupAction::kClear;
-  auto handler = fetch_schedule_thread->add_one_task(&fetch_schedule_thread->generation_start_task);
-  fetch_schedule_thread->wait_progress(handler);
-  while (!fetch_schedule_thread->is_idle()) {}
-  cache->reset_cache_contents();
-  cache->load_initial_plan_sync((cudaStream_t)copy_stream);
+  {
+    NVTX_RANGE("cache_init/scheduler_clear");
+    Timer timer;
+    auto handler = fetch_schedule_thread->add_one_task(&fetch_schedule_thread->generation_start_task);
+    fetch_schedule_thread->wait_progress(handler);
+    while (!fetch_schedule_thread->is_idle()) {}
+    clear_us = timer.dur_us();
+  }
+  {
+    NVTX_RANGE("cache_init/reset_cache_contents");
+    Timer timer;
+    cache->reset_cache_contents();
+    reset_us = timer.dur_us();
+  }
+  {
+    NVTX_RANGE("cache_init/load_initial_plan_sync");
+    Timer timer;
+    cache->load_initial_plan_sync((cudaStream_t)copy_stream);
+    load_us = timer.dur_us();
+  }
   fetch_schedule_thread->generation_start_task.generation = prefetch_generation;
   fetch_schedule_thread->generation_start_task.decoder_warmup_action = DecoderWarmupAction::kRebuildForGenerateStart;
-  handler = fetch_schedule_thread->add_one_task(&fetch_schedule_thread->generation_start_task);
-  fetch_schedule_thread->wait_progress(handler);
+  {
+    NVTX_RANGE("cache_init/scheduler_rebuild_for_generate_start");
+    Timer timer;
+    auto handler = fetch_schedule_thread->add_one_task(&fetch_schedule_thread->generation_start_task);
+    fetch_schedule_thread->wait_progress(handler);
+    rebuild_us = timer.dur_us();
+  }
+  LOG(INFO) << "ttft_breakdown_cache_init_us total=" << total_timer.dur_us()
+            << " scheduler_clear=" << clear_us
+            << " reset_cache_contents=" << reset_us
+            << " load_initial_plan_sync=" << load_us
+            << " scheduler_rebuild=" << rebuild_us
+            << " generation=" << prefetch_generation;
 }
 
 void PrefetchMngr::preempt_and_launch_one_layer(int layer_idx, int64_t* experts, int64_t num_expert) {
@@ -446,11 +702,14 @@ void PrefetchMngr::report_one_layer(int layer_id, int64_t* experts, int64_t num_
   LOG(INFO) << "prefetcher: consume prefetch layer progress at layer " << layer_id << " done " << progress_idx;
 
   if (metas->is_encoder_layer(layer_id)) {
-    std::unordered_set<int> needed;
+    std::vector<uint8_t> needed_mask(metas->num_expert, 0);
     for (int64_t i = 0; i < num_expert; i++) {
-      needed.insert(int(experts[i]));
+      const int expert_idx = int(experts[i]);
+      if (expert_idx >= 0 && expert_idx < metas->num_expert) {
+        needed_mask[expert_idx] = 1;
+      }
     }
-    cache->mark_layer_reclaimable_except(layer_id, needed);
+    fetch_schedule_thread->enqueue_layer_reclaimable_except(layer_id, needed_mask);
   }
   preempt_and_launch_one_layer(layer_id, experts, num_expert); // handle reorder, launch precise task, clear prefetch queue
   profiler->add(TimeProfiler::kCntActivatedExpert, num_expert);
@@ -461,7 +720,7 @@ void PrefetchMngr::one_moe_layer_done(int layer_id) {
   TRACE_EVENT_GURAD(kHook, "one_moe_layer_done");
   NVTX_RANGE("hook/one_moe_layer_done L" + std::to_string(layer_id));
   if (metas->is_encoder_layer(layer_id)) {
-    cache->mark_layer_reclaimable(layer_id);
+    fetch_schedule_thread->enqueue_layer_reclaimable(layer_id);
   }
   if (metas->early_preempt == false) {
     LOG(INFO) << "prefetcher: one moe layer done, add prefetch layer budget : " << layer_id;
@@ -518,7 +777,7 @@ void PrefetchMngr::one_expert_done(int layer_id, int expert_id) {
   NVTX_RANGE("hook/one_expert_done L" + std::to_string(layer_id) + " E" + std::to_string(expert_id));
   mark_expert_using(layer_id, expert_id);
   if (metas->is_encoder_layer(layer_id)) {
-    cache->mark_reclaimable(layer_id, expert_id);
+    fetch_schedule_thread->enqueue_expert_reclaimable(layer_id, expert_id);
   }
 }
 
@@ -846,6 +1105,7 @@ void FetchScheduleWorker::do_one_task_impl(PreemptTask *task) {
   } else {
     LOG(TRACE) << "scheduler: do PreemptTask, preempting one layer " << task->layer_idx << ", queue is empty";
   }
+  drain_reclaimable_updates();
 }
 void FetchScheduleWorker::do_one_task_impl(GenerationStartTask *task) {
   CHECK(task == &this->generation_start_task);
@@ -855,6 +1115,7 @@ void FetchScheduleWorker::do_one_task_impl(PreemptOneExpertTask *task) {
   TRACE_EVENT_GURAD(kFetchScheduler, "do preempt one expert");
   NVTX_RANGE("sched/preempt_one L" + std::to_string(task->layer_id) + " E" + std::to_string(task->expert_id));
   this->preempt_one_expert(task->layer_id, task->expert_id);
+  drain_reclaimable_updates();
 }
 
 void FetchScheduleWorker::init(ModuleMeta *metas, ModelLoader *model_loader,
@@ -868,6 +1129,10 @@ void FetchScheduleWorker::init(ModuleMeta *metas, ModelLoader *model_loader,
   this->cache_stats = cache_stats;
   this->profiler = profiler;
   per_layer_job_queues.resize(metas->num_layer);
+  pending_reclaimable_updates.assign(metas->num_layer, PendingReclaimableUpdate());
+  pending_reclaimable_layers.clear();
+  pending_reclaimable_layer_mask.assign(metas->num_layer, 0);
+  has_pending_reclaimable_updates.store(false, std::memory_order_release);
   this->add_one_task(&this->idle_task);
 }
 void FetchScheduleWorker::do_one_task_impl(FetchDoneTask *_) {

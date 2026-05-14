@@ -1,4 +1,5 @@
 #pragma once
+#include <atomic>
 #include <bitset>
 #include <unistd.h>
 #include <unordered_map>
@@ -121,8 +122,31 @@ class FetchScheduleWorker : public WorkerThread<FetchScheduleTaskBase*> {
     kDecoderPredictorPhase,
   };
   SchedulerPhase phase = kEncoderPhase;
-  std::queue<std::pair<int, int>> decoder_warmup_queue;
+  struct DecoderWarmupEntry {
+    int layer_idx = -1;
+    int expert_idx = -1;
+    int start_mem_buf_idx = 0;
+    int stop_mem_buf_idx = 0;
+  };
+  std::queue<DecoderWarmupEntry> decoder_warmup_queue;
   std::unordered_set<int64_t> decoder_warmup_seen;
+  struct PendingReclaimableUpdate {
+    enum Mode {
+      kNone = 0,
+      kSomeExperts,
+      kLayerExcept,
+      kLayerAll,
+    };
+
+    Mode mode = kNone;
+    std::vector<uint8_t> expert_mask;
+    std::vector<uint8_t> needed_mask;
+  };
+  AtomicQueueLock reclaimable_update_lock;
+  std::vector<PendingReclaimableUpdate> pending_reclaimable_updates;
+  std::vector<int> pending_reclaimable_layers;
+  std::vector<uint8_t> pending_reclaimable_layer_mask;
+  std::atomic<bool> has_pending_reclaimable_updates{false};
 
   #ifdef DEAD_CODE
   inline void lock_task_queue() { task_queue_lock.lock(); }
@@ -161,6 +185,8 @@ class FetchScheduleWorker : public WorkerThread<FetchScheduleTaskBase*> {
   bool pop_next_normal_prefetch(CopyTask& task);
   bool pop_next_decoder_warmup(CopyTask& task);
   int64_t flatten_expert(int layer_idx, int expert_idx) const;
+  void ensure_reclaimable_pending_initialized();
+  void note_pending_reclaimable_layer_locked(int layer_idx);
   bool is_idle();
 
  public:
@@ -168,6 +194,10 @@ class FetchScheduleWorker : public WorkerThread<FetchScheduleTaskBase*> {
   void add_one_layer_task(int layer_idx, int64_t *expert_idxs, size_t num_expert);
   void add_one_layer_task(int layer_idx, torch::Tensor experts);
   #endif
+  void enqueue_layer_reclaimable_except(int layer_idx, const std::vector<uint8_t>& needed_mask);
+  void enqueue_expert_reclaimable(int layer_idx, int expert_idx);
+  void enqueue_layer_reclaimable(int layer_idx);
+  void drain_reclaimable_updates(int max_updates = -1);
   void init(ModuleMeta *metas, ModelLoader *model_loader, CacheMngr *cache, FetchWorker *fetch_thread, PredictWorker *predict_thread, CacheStatistics *cache_stats, TimeProfiler* profiler);
 
 protected:

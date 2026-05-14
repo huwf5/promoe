@@ -248,7 +248,7 @@ class MoeLayerHook(ModelHook):
       report_layer_id = self._report_layer_id(module)
       # report the logits for the next moe layer
       self.prefetch_mngr.report_moe_layer_logits(report_layer_id + 1, self.extract_logits_from_output(output))
-      self.prefetch_mngr.one_moe_layer_done(report_layer_id)
+      self.prefetch_mngr.one_moe_layer_done(module._layer_id)
     return output
   # def detach_hook(self, module):
   #   return super().detach_hook(module)

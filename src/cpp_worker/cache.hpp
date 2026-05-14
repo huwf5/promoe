@@ -357,6 +357,7 @@ class CacheMngr {
   void mark_reclaimable(int layer_idx, int expert_idx);
   void mark_layer_reclaimable(int layer_idx);
   void mark_layer_reclaimable_except(int layer_idx, const std::unordered_set<int>& needed_eids);
+  void mark_layer_reclaimable_except(int layer_idx, const std::vector<uint8_t>& needed_mask);
   bool has_reclaimable_encoder() const;
 
   void update_all_priority(torch::Tensor p);

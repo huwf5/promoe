@@ -269,6 +269,7 @@ void CacheMngr::validate_initial_plan_size(const std::vector<InitialExpert>& pla
 }
 
 void CacheMngr::reset_cache_contents() {
+  NVTX_RANGE("cache/reset_cache_contents");
   CHECK(metas->per_layer_cache == false)
       << "deterministic initial cache requires global cache";
   CHECK(cache_slots->slots.size() == 1)
@@ -277,11 +278,13 @@ void CacheMngr::reset_cache_contents() {
   for (auto &pair : prefetched_experts) {
     auto expert = pair.first;
     auto status = expert->expert_status.get();
-    CHECK(status == kReady || status == kIdle)
+    CHECK(status == kReady || status == kIdle || status == kFetching)
         << "cannot reset active expert " << expert->toString()
         << " with status " << status;
     if (status == kReady) {
       expert->expert_status.transfer(kReady, kIdle);
+    } else if (status == kFetching) {
+      expert->expert_status.transfer(kFetching, kIdle);
     }
     expert->gpu_data = nullptr;
     expert->num_ready = 0;
@@ -303,33 +306,88 @@ void CacheMngr::reset_cache_contents() {
 }
 
 void CacheMngr::load_initial_plan_sync(cudaStream_t stream) {
-  auto plan = build_manual_initial_plan();
+  NVTX_RANGE("cache/load_initial_plan_sync");
+  Timer total_timer;
+  uint64_t build_plan_us = 0;
+  uint64_t miss_wait_us = 0;
+  uint64_t h2d_enqueue_us = 0;
+  uint64_t remap_us = 0;
+  uint64_t stream_sync_us = 0;
+  uint64_t status_us = 0;
+  std::vector<InitialExpert> plan;
+  {
+    NVTX_RANGE("cache/load_initial_plan/build_plan");
+    Timer timer;
+    plan = build_manual_initial_plan();
+    build_plan_us = timer.dur_us();
+  }
   for (auto [layer_idx, expert_idx] : plan) {
+    NVTX_RANGE("cache/load_initial_plan/expert");
     auto expert = model_loader->get_source(layer_idx, expert_idx);
     CHECK(!is_in_cache(expert));
-    auto waiter = miss(expert, false);
-    waiter();
-    expert->expert_status.transfer(kIdle, kFetching);
-
-    for (int mem_buf_idx = 0; mem_buf_idx < metas->num_per_expert_param; mem_buf_idx++) {
-      CUDA_CALL(cudaMemcpyAsync(
-          expert->gpu_data->ptr(mem_buf_idx),
-          expert->host_data->ptr(mem_buf_idx),
-          expert->host_data->nbytes(mem_buf_idx),
-          cudaMemcpyHostToDevice, stream));
+    {
+      NVTX_RANGE("cache/load_initial_plan/miss_and_wait");
+      Timer timer;
+      auto waiter = miss(expert, false);
+      waiter();
+      miss_wait_us += timer.dur_us();
     }
-    expert->reference_to_model_param->unmap();
-    expert->reference_to_model_param->map_to(expert->gpu_data,
-                                             model_loader->mem_mngr_ctx.get());
-    CUDA_CALL(cudaStreamSynchronize(stream));
-    expert->num_ready = metas->num_per_expert_param;
-    expert->expert_status.transfer(kFetching, kReady);
+    {
+      Timer timer;
+      expert->expert_status.transfer(kIdle, kFetching);
+      status_us += timer.dur_us();
+    }
+
+    {
+      NVTX_RANGE("cache/load_initial_plan/h2d_enqueue");
+      Timer timer;
+      for (int mem_buf_idx = 0; mem_buf_idx < metas->num_per_expert_param; mem_buf_idx++) {
+        CUDA_CALL(cudaMemcpyAsync(
+            expert->gpu_data->ptr(mem_buf_idx),
+            expert->host_data->ptr(mem_buf_idx),
+            expert->host_data->nbytes(mem_buf_idx),
+            cudaMemcpyHostToDevice, stream));
+      }
+      h2d_enqueue_us += timer.dur_us();
+    }
+    {
+      NVTX_RANGE("cache/load_initial_plan/remap_model_param");
+      Timer timer;
+      expert->reference_to_model_param->unmap();
+      expert->reference_to_model_param->map_to(expert->gpu_data,
+                                               model_loader->mem_mngr_ctx.get());
+      remap_us += timer.dur_us();
+    }
+    {
+      NVTX_RANGE("cache/load_initial_plan/stream_sync");
+      Timer timer;
+      CUDA_CALL(cudaStreamSynchronize(stream));
+      stream_sync_us += timer.dur_us();
+    }
+    {
+      Timer timer;
+      expert->num_ready = metas->num_per_expert_param;
+      expert->expert_status.transfer(kFetching, kReady);
+      status_us += timer.dur_us();
+    }
   }
-  for (auto [layer_idx, expert_idx] : plan) {
-    auto expert = model_loader->get_source(layer_idx, expert_idx);
-    CHECK(expert->num_ready == metas->num_per_expert_param);
-    CHECK(expert->expert_status.get() == kReady);
+  {
+    NVTX_RANGE("cache/load_initial_plan/verify_ready");
+    for (auto [layer_idx, expert_idx] : plan) {
+      auto expert = model_loader->get_source(layer_idx, expert_idx);
+      CHECK(expert->num_ready == metas->num_per_expert_param);
+      CHECK(expert->expert_status.get() == kReady);
+    }
   }
+  LOG(INFO) << "ttft_breakdown_load_initial_plan_us total=" << total_timer.dur_us()
+            << " build_plan=" << build_plan_us
+            << " miss_wait=" << miss_wait_us
+            << " h2d_enqueue=" << h2d_enqueue_us
+            << " remap=" << remap_us
+            << " stream_sync=" << stream_sync_us
+            << " status=" << status_us
+            << " experts=" << plan.size()
+            << " num_per_expert_param=" << metas->num_per_expert_param;
 }
 CacheMngr::~CacheMngr() {
   size_t used_mem_cnt = prefetched_experts.size();
@@ -566,6 +624,21 @@ void CacheMngr::mark_layer_reclaimable_except(
   }
   for (int expert_idx = 0; expert_idx < metas->num_expert; expert_idx++) {
     if (needed_eids.find(expert_idx) == needed_eids.end()) {
+      mark_reclaimable(layer_idx, expert_idx);
+    }
+  }
+}
+
+void CacheMngr::mark_layer_reclaimable_except(
+    int layer_idx,
+    const std::vector<uint8_t>& needed_mask) {
+  if (!metas->is_encoder_layer(layer_idx)) {
+    return;
+  }
+  for (int expert_idx = 0; expert_idx < metas->num_expert; expert_idx++) {
+    const bool needed =
+        expert_idx < static_cast<int>(needed_mask.size()) && needed_mask[expert_idx];
+    if (!needed) {
       mark_reclaimable(layer_idx, expert_idx);
     }
   }
