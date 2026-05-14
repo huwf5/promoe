@@ -161,6 +161,8 @@ class ModuleMeta {
   std::string initial_cache_policy = "";
   std::string initial_layer_budgets = "";
   std::string initial_expert_plan = "";
+  bool enable_decoder_warmup_overlap = false;
+  std::string decoder_warmup_expert_plan = "";
 
   // deprecated
   int         max_prefetch_layer_distance = -1;

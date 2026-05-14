@@ -3,18 +3,30 @@
 #include "model_loader.hpp"
 
 class CacheMngr;
+enum CacheRequestType {
+  kCacheRequestDemand = 0,
+  kCacheRequestPrefetch,
+  kCacheRequestDecoderWarmupOverlap,
+};
+
 class CachePolicy {
 
+ protected:
   CacheMngr* cache;
  public:
   CachePolicy(CacheMngr* cache) : cache(cache) {}
   virtual ~CachePolicy() = default;
   virtual ExpertHandler* select_for_evict(ExpertHandler*) { return nullptr; }
+  virtual ExpertHandler* select_for_evict(ExpertHandler* incoming, CacheRequestType) {
+    return select_for_evict(incoming);
+  }
   virtual void evict(ExpertHandler*) {}
   virtual void access_on_hit(ExpertHandler*) {}
   virtual void access_on_hit(ExpertHandler* e, bool is_precise) { return access_on_hit(e); }
   virtual void access_on_miss(ExpertHandler*) {}
   virtual void access_on_miss(ExpertHandler* e, bool is_precise) { return access_on_miss(e); }
+  virtual void mark_reclaimable(ExpertHandler*) {}
+  virtual bool has_reclaimable_encoder() const { return false; }
   virtual void update_all_priority() {}
   virtual void update_priority(ExpertHandler* e, float p) {}
   virtual void set_cur_seq(uint64_t seq_id) {}
@@ -223,6 +235,36 @@ class CachePolicyMIN: public CachePolicy {
   }
 };
 
+class CachePolicySchedulerAware : public CachePolicy {
+  using LL = DoubleLinkedList<ExpertHandler*>;
+  std::vector<LL::Node*> node_free_buffer;
+  LL global_lru;
+  LL encoder_lru;
+  LL decoder_lru;
+  LL reclaimable_encoder_lru;
+  std::unordered_map<ExpertHandler*, LL::Node*> global_map;
+  std::unordered_map<ExpertHandler*, LL::Node*> encoder_map;
+  std::unordered_map<ExpertHandler*, LL::Node*> decoder_map;
+  std::unordered_map<ExpertHandler*, LL::Node*> reclaimable_map;
+
+  LL::Node* new_node(ExpertHandler* expert);
+  void recycle_node(LL::Node* node);
+  void touch(std::unordered_map<ExpertHandler*, LL::Node*>& map, LL& list, ExpertHandler* expert);
+  ExpertHandler* first_loaded_candidate(std::unordered_map<ExpertHandler*, LL::Node*>& map, LL& list);
+
+ public:
+  using CachePolicy::CachePolicy;
+  ~CachePolicySchedulerAware();
+  ExpertHandler* select_for_evict(ExpertHandler* incoming) override;
+  ExpertHandler* select_for_evict(ExpertHandler* incoming, CacheRequestType request_type) override;
+  void evict(ExpertHandler* expert) override;
+  void access_on_hit(ExpertHandler* expert) override;
+  void access_on_miss(ExpertHandler* expert) override;
+  void mark_reclaimable(ExpertHandler* expert) override;
+  bool has_reclaimable_encoder() const override;
+  std::string toString() override;
+};
+
 class CachePolicyFactory {
   std::map<std::string, std::function<std::shared_ptr<CachePolicy>()>> registry;
   // CacheMngr* mngr;
@@ -288,6 +330,9 @@ class CacheMngr {
   bool is_in_cache(ExpertHandler* expert) {
     return prefetched_experts.find(expert) != prefetched_experts.end();
   }
+  bool is_in_cache_ptr(ExpertHandler* expert) const {
+    return prefetched_experts.find(expert) != prefetched_experts.end();
+  }
 
   // legacy methods
   bool is_in_cache(int layer_id, int expert_id) {
@@ -308,6 +353,11 @@ class CacheMngr {
   void access(ExpertHandler *expert, bool is_precise);
   void hit(ExpertHandler *expert, bool is_precise);
   CacheLineOccupancyWaiter miss(ExpertHandler *expert, bool is_precise);
+  CacheLineOccupancyWaiter miss(ExpertHandler *expert, bool is_precise, CacheRequestType request_type);
+  void mark_reclaimable(int layer_idx, int expert_idx);
+  void mark_layer_reclaimable(int layer_idx);
+  void mark_layer_reclaimable_except(int layer_idx, const std::unordered_set<int>& needed_eids);
+  bool has_reclaimable_encoder() const;
 
   void update_all_priority(torch::Tensor p);
   void update_some_priority(torch::Tensor p, int starting_layer);

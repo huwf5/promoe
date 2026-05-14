@@ -63,10 +63,16 @@ class FetchDoneTask : public FetchScheduleTaskBase {
  public:
   FetchDoneTask() : FetchScheduleTaskBase(kFetchDone) {}
 };
+enum class DecoderWarmupAction {
+  kPreserve = 0,
+  kClear,
+  kRebuildForGenerateStart,
+};
 class GenerationStartTask : public FetchScheduleTaskBase {
  public:
   GenerationStartTask() : FetchScheduleTaskBase(kGenerationStart) {}
   int64_t generation = 0;
+  DecoderWarmupAction decoder_warmup_action = DecoderWarmupAction::kPreserve;
 };
 
 class FetchScheduleWorker : public WorkerThread<FetchScheduleTaskBase*> {
@@ -80,9 +86,12 @@ class FetchScheduleWorker : public WorkerThread<FetchScheduleTaskBase*> {
     profiler->add(is_precise ? TimeProfiler::kHitCnt : TimeProfiler::kPrefetchHitCnt, 1);
     cache->hit(e, is_precise);
   }
-  CacheMngr::CacheLineOccupancyWaiter cache_miss(ExpertHandler* e, bool is_precise) {
+  CacheMngr::CacheLineOccupancyWaiter cache_miss(
+      ExpertHandler* e,
+      bool is_precise,
+      CacheRequestType request_type) {
     profiler->add(is_precise ? TimeProfiler::kMissCnt : TimeProfiler::kPrefetchMissCnt, 1);
-    return cache->miss(e, is_precise);
+    return cache->miss(e, is_precise, request_type);
   }
 
   CacheStatistics* cache_stats;
@@ -107,6 +116,13 @@ class FetchScheduleWorker : public WorkerThread<FetchScheduleTaskBase*> {
   std::vector<TaskQueue> per_layer_job_queues; // the fetching thread takes out the first task from queue, then execute it.
   /** no lock requried */
   TaskQueue precise_job_queue;
+  enum SchedulerPhase {
+    kEncoderPhase = 0,
+    kDecoderPredictorPhase,
+  };
+  SchedulerPhase phase = kEncoderPhase;
+  std::queue<std::pair<int, int>> decoder_warmup_queue;
+  std::unordered_set<int64_t> decoder_warmup_seen;
 
   #ifdef DEAD_CODE
   inline void lock_task_queue() { task_queue_lock.lock(); }
@@ -123,8 +139,8 @@ class FetchScheduleWorker : public WorkerThread<FetchScheduleTaskBase*> {
 
   void pop_next_task(CopyTask &task, bool &found);
 
-  void add_single_tasks_for_one_expert(int layer_idx, int expert_idx, TaskQueue* queue, int start_mem_buf_idx, int stop_mem_buf_idx, bool is_precise, int64_t generation);
-  void add_separate_tasks_for_one_expert(int layer_idx, int expert_idx, TaskQueue *queue, int start_mem_buf_idx, int stop_mem_buf_idx, bool is_precise, int64_t generation);
+  void add_single_tasks_for_one_expert(int layer_idx, int expert_idx, TaskQueue* queue, int start_mem_buf_idx, int stop_mem_buf_idx, bool is_precise, int64_t generation, CacheRequestType request_type);
+  void add_separate_tasks_for_one_expert(int layer_idx, int expert_idx, TaskQueue *queue, int start_mem_buf_idx, int stop_mem_buf_idx, bool is_precise, int64_t generation, CacheRequestType request_type);
 
   void reorder_experts(int layer_idx, int64_t *expert_idxs, size_t num_expert);
   #ifdef DEAD_CODE
@@ -133,11 +149,18 @@ class FetchScheduleWorker : public WorkerThread<FetchScheduleTaskBase*> {
   void preempt_one_layer_without_reorder_(int layer_idx, int64_t *expert_idxs, size_t num_expert);
   void preempt_one_expert(int layer_idx, int64_t expert_idx);
   bool is_stale_prefetch(int64_t generation, int layer_idx) const;
-  void start_generation(int64_t generation);
+  void start_generation(int64_t generation, DecoderWarmupAction decoder_warmup_action);
   void advance_actual_layer(int64_t generation, int layer_idx);
   void clear_prefetch_queues_up_to_layer(int layer_idx);
   void clear_all_prefetch_queues();
   void clear_all_job_queues();
+  void set_phase(SchedulerPhase next_phase);
+  void clear_decoder_warmup_queue();
+  void rebuild_decoder_warmup_queue();
+  bool parse_layer_expert_plan(const std::string& plan, std::vector<std::pair<int, int>>& out);
+  bool pop_next_normal_prefetch(CopyTask& task);
+  bool pop_next_decoder_warmup(CopyTask& task);
+  int64_t flatten_expert(int layer_idx, int expert_idx) const;
   bool is_idle();
 
  public:

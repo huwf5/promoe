@@ -240,6 +240,7 @@ def inject_model(
     initial_cache_policy: str | None = None,
     initial_layer_budgets: str | None = None,
     initial_hot_expert_file: str | None = None,
+    enable_decoder_warmup_overlap: bool = False,
 
     cache_device : str|int = 'cuda',
     pin_memory : bool  = True,
@@ -349,9 +350,12 @@ def inject_model(
   per_layer_cache = initial_inputs["per_layer_cache"]
 
   adapter.configure_module_meta(meta)
+  initial_plan = None
   initial_expert_plan = None
+  decoder_warmup_expert_plan = None
   if initial_hot_expert_file:
     from sparse_llm_cache.utils.hot_experts import (
+      build_decoder_warmup_overlap_plan,
       build_hot_initial_plan,
       format_initial_expert_plan,
     )
@@ -365,6 +369,15 @@ def inject_model(
       total_slots=initial_total_slots,
     )
     initial_expert_plan = format_initial_expert_plan(initial_plan)
+  if enable_decoder_warmup_overlap:
+    if not initial_hot_expert_file:
+      raise ValueError("enable_decoder_warmup_overlap requires initial_hot_expert_file")
+    decoder_warmup_plan = build_decoder_warmup_overlap_plan(
+      initial_hot_expert_file,
+      adapter,
+      initial_plan=set(initial_plan or []),
+    )
+    decoder_warmup_expert_plan = format_initial_expert_plan(decoder_warmup_plan)
 
   param_dict = {
     'model_arch_string'            : str(model_id),
@@ -393,6 +406,8 @@ def inject_model(
     'initial_cache_policy'         : str(initial_cache_policy),
     'initial_layer_budgets'        : str(initial_layer_budgets),
     'initial_expert_plan'          : str(initial_expert_plan),
+    'enable_decoder_warmup_overlap': str(enable_decoder_warmup_overlap),
+    'decoder_warmup_expert_plan'   : str(decoder_warmup_expert_plan),
   }
 
   meta.init_from_map(param_dict)

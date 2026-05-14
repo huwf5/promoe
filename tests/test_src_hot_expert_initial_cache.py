@@ -6,7 +6,11 @@ import pytest
 
 from sparse_llm_cache.model_adapters.switch import SwitchAdapter
 from sparse_llm_cache.utils import inject_model, round_like_cpp
-from sparse_llm_cache.utils.hot_experts import build_encoder_hot_initial_plan, build_hot_initial_plan
+from sparse_llm_cache.utils.hot_experts import (
+  build_decoder_warmup_overlap_plan,
+  build_encoder_hot_initial_plan,
+  build_hot_initial_plan,
+)
 from sparse_llm_cache.utils.runner_util import parse_args
 
 
@@ -242,6 +246,37 @@ def test_build_hot_initial_plan_is_available_for_inject_model_default():
   assert callable(build_hot_initial_plan)
 
 
+def test_build_decoder_warmup_overlap_plan_excludes_initial_and_interleaves_depth(tmp_path):
+  payload = {
+    "expert_usage_summary": {
+      "decoder.block.1.layer.2.mlp.router.classifier": {
+        "top_token_counts": [
+          {"eid": 1, "count": 100},
+          {"eid": 2, "count": 90},
+          {"eid": 3, "count": 80},
+        ],
+      },
+      "decoder.block.3.layer.2.mlp.router.classifier": {
+        "top_token_counts": [
+          {"eid": 4, "count": 70},
+          {"eid": 5, "count": 60},
+        ],
+      },
+    }
+  }
+  path = tmp_path / "hot.json"
+  path.write_text(json.dumps(payload))
+  adapter = SwitchAdapter(SimpleNamespace(config=_switch_config()), "google/switch-base-128")
+
+  plan = build_decoder_warmup_overlap_plan(
+    path,
+    adapter,
+    initial_plan={(2, 1), (3, 4)},
+  )
+
+  assert plan == [(2, 2), (3, 5), (2, 3)]
+
+
 def test_round_like_cpp_matches_half_away_from_zero_cache_slot_count():
   assert round_like_cpp(2.5) == 3
   assert round_like_cpp(3.5) == 4
@@ -257,5 +292,19 @@ def test_runner_util_parses_initial_hot_expert_file_arg():
   assert parsed["initial_hot_expert_file"] == "/tmp/hot.json"
 
 
+def test_runner_util_parses_decoder_warmup_overlap_and_scheduler_aware_policy():
+  parsed = parse_args([
+    "--enable_decoder_warmup_overlap", "True",
+    "--cache_policy", "scheduler_aware",
+  ])
+
+  assert parsed["enable_decoder_warmup_overlap"] is True
+  assert parsed["cache_policy"] == "scheduler_aware"
+
+
 def test_inject_model_exposes_initial_hot_expert_file_parameter():
   assert "initial_hot_expert_file" in inspect.signature(inject_model).parameters
+
+
+def test_inject_model_exposes_decoder_warmup_overlap_parameter():
+  assert "enable_decoder_warmup_overlap" in inspect.signature(inject_model).parameters

@@ -40,6 +40,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     .def_readwrite("initial_cache_policy",         &ModuleMeta::initial_cache_policy)
     .def_readwrite("initial_layer_budgets",        &ModuleMeta::initial_layer_budgets)
     .def_readwrite("initial_expert_plan",          &ModuleMeta::initial_expert_plan)
+    .def_readwrite("enable_decoder_warmup_overlap", &ModuleMeta::enable_decoder_warmup_overlap)
+    .def_readwrite("decoder_warmup_expert_plan",   &ModuleMeta::decoder_warmup_expert_plan)
     .def_readwrite("cache_only",                   &ModuleMeta::cache_only)
     .def("init_from_map", &ModuleMeta::init_from_map)
     .def("handle_uninited_configs", &ModuleMeta::handle_uninited_configs)

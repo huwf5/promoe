@@ -328,5 +328,41 @@ def build_hot_initial_plan(
   return plan
 
 
+def build_decoder_warmup_overlap_plan(
+    hot_expert_file: str | Path,
+    adapter,
+    *,
+    initial_plan: Iterable[tuple[int, int]] | None = None,
+) -> list[tuple[int, int]]:
+  payload = _read_hot_expert_payload(hot_expert_file)
+  decoder_by_layer, _decoder_token_totals = _hot_pairs_by_layer(payload, adapter, "decoder")
+  initial_seen = {
+    (int(layer_idx), int(expert_idx))
+    for layer_idx, expert_idx in (initial_plan or [])
+  }
+
+  by_stage_layer: list[list[tuple[int, int]]] = []
+  max_depth = 0
+  for stage_layer in range(int(adapter.num_decoder_sparse_layers)):
+    global_layer = adapter.global_layer_id("decoder", stage_layer)
+    layer_plan: list[tuple[int, int]] = []
+    seen_eids = set()
+    for eid, _count in decoder_by_layer.get(global_layer, []):
+      item = (global_layer, int(eid))
+      if item in initial_seen or int(eid) in seen_eids:
+        continue
+      layer_plan.append(item)
+      seen_eids.add(int(eid))
+    by_stage_layer.append(layer_plan)
+    max_depth = max(max_depth, len(layer_plan))
+
+  plan: list[tuple[int, int]] = []
+  for depth in range(max_depth):
+    for layer_plan in by_stage_layer:
+      if depth < len(layer_plan):
+        plan.append(layer_plan[depth])
+  return plan
+
+
 def format_initial_expert_plan(plan: Iterable[tuple[int, int]]) -> str:
   return ",".join(f"{int(layer_idx)}:{int(expert_idx)}" for layer_idx, expert_idx in plan)

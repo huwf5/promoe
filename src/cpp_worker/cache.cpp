@@ -371,6 +371,9 @@ CacheMngr::CacheMngr(std::shared_ptr<ModuleMeta> metas,
     ret->oracle = this->cache_oracle.get();
     return ret;
   });
+  policy_factory.register_policy("scheduler_aware", [this]() -> std::shared_ptr<CachePolicy>{
+    return std::make_shared<CachePolicySchedulerAware>(this);
+  });
 
 
   if (metas->per_layer_cache) {
@@ -447,6 +450,14 @@ void CacheMngr::hit(ExpertHandler *expert, bool is_precise) {
 }
 
 CacheMngr::CacheLineOccupancyWaiter CacheMngr::miss(ExpertHandler *incoming_e, bool is_precise) {
+  return miss(incoming_e, is_precise,
+              is_precise ? kCacheRequestDemand : kCacheRequestPrefetch);
+}
+
+CacheMngr::CacheLineOccupancyWaiter CacheMngr::miss(
+    ExpertHandler *incoming_e,
+    bool is_precise,
+    CacheRequestType request_type) {
   TRACE_EVENT_GURAD(kCache, "miss:" + incoming_e->toString());
   NVTX_RANGE("cache/miss L" + std::to_string(incoming_e->layer_idx) +
              " E" + std::to_string(incoming_e->expert_idx) +
@@ -459,14 +470,20 @@ CacheMngr::CacheLineOccupancyWaiter CacheMngr::miss(ExpertHandler *incoming_e, b
     this->priority_set_fn(incoming_e, max_priority);
   }
   CacheLineOccupancyWaiter lambda_to_wait_expert_occupancy = [](){};
-  if (cache_slot->unused_mems.size() > 0) {
+  if (cache_slot->unused_mems.size() > 0 &&
+      request_type != kCacheRequestDecoderWarmupOverlap) {
     auto gpu_data = cache_slot->unused_mems.back();
     incoming_e->gpu_data = gpu_data;
     cache_slot->unused_mems.pop_back();
     cache_slot->policy->access_on_miss(incoming_e, is_precise);
     prefetched_experts[incoming_e] = gpu_data;
   } else {
-    auto e_to_evict = cache_slot->policy->select_for_evict(incoming_e);
+    auto e_to_evict = cache_slot->policy->select_for_evict(incoming_e, request_type);
+    if (e_to_evict == nullptr) {
+      CHECK(request_type == kCacheRequestDecoderWarmupOverlap)
+          << "only decoder warmup overlap may skip eviction";
+      return [](){};
+    }
     // incoming_e->gpu_data = evict(e_to_evict, incoming_e, true);
     {
       TRACE_EVENT_GURAD(kCache, "evict " + e_to_evict->toString());
@@ -519,6 +536,189 @@ CacheMngr::CacheLineOccupancyWaiter CacheMngr::miss(ExpertHandler *incoming_e, b
     }
   }
   return lambda_to_wait_expert_occupancy;
+}
+
+void CacheMngr::mark_reclaimable(int layer_idx, int expert_idx) {
+  if (!metas->is_encoder_layer(layer_idx)) {
+    return;
+  }
+  auto expert = model_loader->get_source(layer_idx, expert_idx);
+  if (!is_in_cache(expert)) {
+    return;
+  }
+  cache_slots->to_slot(expert)->policy->mark_reclaimable(expert);
+}
+
+void CacheMngr::mark_layer_reclaimable(int layer_idx) {
+  if (!metas->is_encoder_layer(layer_idx)) {
+    return;
+  }
+  for (int expert_idx = 0; expert_idx < metas->num_expert; expert_idx++) {
+    mark_reclaimable(layer_idx, expert_idx);
+  }
+}
+
+void CacheMngr::mark_layer_reclaimable_except(
+    int layer_idx,
+    const std::unordered_set<int>& needed_eids) {
+  if (!metas->is_encoder_layer(layer_idx)) {
+    return;
+  }
+  for (int expert_idx = 0; expert_idx < metas->num_expert; expert_idx++) {
+    if (needed_eids.find(expert_idx) == needed_eids.end()) {
+      mark_reclaimable(layer_idx, expert_idx);
+    }
+  }
+}
+
+bool CacheMngr::has_reclaimable_encoder() const {
+  for (auto &slot : cache_slots->slots) {
+    if (slot.policy->has_reclaimable_encoder()) {
+      return true;
+    }
+  }
+  return false;
+}
+
+CachePolicySchedulerAware::~CachePolicySchedulerAware() {
+  while (!node_free_buffer.empty()) {
+    delete node_free_buffer.back();
+    node_free_buffer.pop_back();
+  }
+}
+
+CachePolicySchedulerAware::LL::Node* CachePolicySchedulerAware::new_node(ExpertHandler* expert) {
+  LL::Node* node = nullptr;
+  if (node_free_buffer.empty()) {
+    node = new LL::Node;
+  } else {
+    node = node_free_buffer.back();
+    node_free_buffer.pop_back();
+  }
+  node->data = expert;
+  return node;
+}
+
+void CachePolicySchedulerAware::recycle_node(LL::Node* node) {
+  node_free_buffer.push_back(node);
+}
+
+void CachePolicySchedulerAware::touch(
+    std::unordered_map<ExpertHandler*, LL::Node*>& map,
+    LL& list,
+    ExpertHandler* expert) {
+  auto it = map.find(expert);
+  if (it != map.end()) {
+    auto node = list.remove(it->second);
+    list.push_back(node);
+    return;
+  }
+  auto node = new_node(expert);
+  map[expert] = node;
+  list.push_back(node);
+}
+
+void CachePolicySchedulerAware::access_on_hit(ExpertHandler* expert) {
+  auto reclaimable_it = reclaimable_map.find(expert);
+  if (reclaimable_it != reclaimable_map.end()) {
+    auto node = reclaimable_encoder_lru.remove(reclaimable_it->second);
+    recycle_node(node);
+    reclaimable_map.erase(reclaimable_it);
+  }
+  touch(global_map, global_lru, expert);
+  if (cache->metas->is_encoder_layer(expert->layer_idx)) {
+    touch(encoder_map, encoder_lru, expert);
+  } else if (cache->metas->is_decoder_layer(expert->layer_idx)) {
+    touch(decoder_map, decoder_lru, expert);
+  }
+}
+
+void CachePolicySchedulerAware::access_on_miss(ExpertHandler* expert) {
+  access_on_hit(expert);
+}
+
+void CachePolicySchedulerAware::mark_reclaimable(ExpertHandler* expert) {
+  if (!cache->metas->is_encoder_layer(expert->layer_idx)) {
+    return;
+  }
+  if (!cache->is_in_cache_ptr(expert)) {
+    return;
+  }
+  touch(reclaimable_map, reclaimable_encoder_lru, expert);
+}
+
+void CachePolicySchedulerAware::evict(ExpertHandler* expert) {
+  auto erase_from = [this, expert](std::unordered_map<ExpertHandler*, LL::Node*>& map, LL& list) {
+    auto it = map.find(expert);
+    if (it == map.end()) {
+      return;
+    }
+    auto node = list.remove(it->second);
+    recycle_node(node);
+    map.erase(it);
+  };
+  erase_from(global_map, global_lru);
+  erase_from(encoder_map, encoder_lru);
+  erase_from(decoder_map, decoder_lru);
+  erase_from(reclaimable_map, reclaimable_encoder_lru);
+}
+
+ExpertHandler* CachePolicySchedulerAware::first_loaded_candidate(
+    std::unordered_map<ExpertHandler*, LL::Node*>& map,
+    LL& list) {
+  for (auto node = list.front(); node != &list.guard_tail; node = node->next) {
+    auto expert = node->data;
+    if (map.find(expert) != map.end() && cache->is_in_cache_ptr(expert)) {
+      return expert;
+    }
+  }
+  return nullptr;
+}
+
+bool CachePolicySchedulerAware::has_reclaimable_encoder() const {
+  for (auto& pair : reclaimable_map) {
+    if (cache->is_in_cache_ptr(pair.first)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+ExpertHandler* CachePolicySchedulerAware::select_for_evict(ExpertHandler* incoming) {
+  return select_for_evict(incoming, kCacheRequestPrefetch);
+}
+
+ExpertHandler* CachePolicySchedulerAware::select_for_evict(
+    ExpertHandler* incoming,
+    CacheRequestType request_type) {
+  if (auto victim = first_loaded_candidate(reclaimable_map, reclaimable_encoder_lru)) {
+    return victim;
+  }
+  if (request_type == kCacheRequestDecoderWarmupOverlap) {
+    return nullptr;
+  }
+  if (auto victim = first_loaded_candidate(encoder_map, encoder_lru)) {
+    return victim;
+  }
+  if (auto victim = first_loaded_candidate(decoder_map, decoder_lru)) {
+    return victim;
+  }
+  if (auto victim = first_loaded_candidate(global_map, global_lru)) {
+    return victim;
+  }
+  CHECK(false) << "scheduler_aware policy could not choose victim for incoming "
+               << incoming->toString();
+  return nullptr;
+}
+
+std::string CachePolicySchedulerAware::toString() {
+  std::stringstream ss;
+  ss << "scheduler_aware(global=" << global_map.size()
+     << ",encoder=" << encoder_map.size()
+     << ",decoder=" << decoder_map.size()
+     << ",reclaimable=" << reclaimable_map.size()
+     << ")";
+  return ss.str();
 }
 void CachePolicyFIFO::evict(ExpertHandler *e) {
   CHECK(e == select_for_evict(nullptr));

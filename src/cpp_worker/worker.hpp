@@ -154,6 +154,7 @@ class CopyTask : public BaseTask {
   int start_mem_buf_idx, stop_mem_buf_idx;
   bool is_precise = false;
   int64_t generation = 0;
+  CacheRequestType request_type = kCacheRequestPrefetch;
   ExpertHandler *expert = nullptr;
   CacheMngr::CacheLineOccupancyWaiter lambda_wait = [](){};
   std::string toString() const {
@@ -161,7 +162,8 @@ class CopyTask : public BaseTask {
     if (expert) {
       ss << expert->toString() << ".[" << start_mem_buf_idx << "," << stop_mem_buf_idx
          << "), precise " << (is_precise ? "true" : "false")
-         << ", gen " << generation;
+         << ", gen " << generation
+         << ", request_type " << request_type;
     } else {
       ss << "null";
     }
