@@ -17,6 +17,7 @@ class WorkerThreadBase {
   Queue<TASK_T> queue;
   std::thread worker_thread;
   std::atomic<bool> exit_mark_atomic{false};
+  std::atomic<bool> active{false};
   using progress_handler_t = int64_t;
   progress_handler_t queued = 0;
   std::atomic<progress_handler_t> progress{0};
@@ -26,8 +27,14 @@ class WorkerThreadBase {
   }
   virtual void do_one_task_impl(TASK_T task) {}
   inline void do_one_task(TASK_T task) {
-    do_one_task_impl(task);
-    progress.fetch_add(1);
+    try {
+      do_one_task_impl(task);
+      progress.fetch_add(1);
+      active.store(false, std::memory_order_release);
+    } catch (...) {
+      active.store(false, std::memory_order_release);
+      throw;
+    }
   }
  public:
   WorkerThreadBase() : progress(0) {}
@@ -54,6 +61,12 @@ class WorkerThreadBase {
     }
   }
   virtual progress_handler_t add_one_task(TASK_T task) = 0;
+  bool is_active() const { return active.load(std::memory_order_acquire); }
+  virtual bool queue_empty() = 0;
+  virtual void clear_pending_tasks() = 0;
+  void wait_until_idle() {
+    while (is_active() || !queue_empty()) {}
+  }
   void wait_progress(progress_handler_t handle) {
     // todo: handle overflow
     while(progress.load() <= handle) {};
@@ -85,6 +98,7 @@ class WorkerThreadMutex : public WorkerThreadBase<TASK_T> {
 
       auto current_task = this->queue.front();
       this->queue.pop();
+      this->active.store(true, std::memory_order_release);
       lock.unlock();
 
       this->do_one_task(current_task);
@@ -98,6 +112,16 @@ class WorkerThreadMutex : public WorkerThreadBase<TASK_T> {
     this->queue.push(task);
     cv.notify_one();
     return ret;
+  }
+  bool queue_empty() override {
+    std::lock_guard<std::mutex> lock(queue_mutex);
+    return this->queue.empty() && !this->active.load(std::memory_order_acquire);
+  }
+  void clear_pending_tasks() override {
+    std::lock_guard<std::mutex> lock(queue_mutex);
+    while (!this->queue.empty()) {
+      this->queue.pop();
+    }
   }
 };
 
@@ -122,6 +146,7 @@ class WorkerThreadSpin : public WorkerThreadBase<TASK_T> {
       } else {
         auto current_task = this->queue.front();
         this->queue.pop();
+        this->active.store(true, std::memory_order_release);
         queue_lock.unlock();
         this->do_one_task(current_task);
       }
@@ -135,6 +160,19 @@ class WorkerThreadSpin : public WorkerThreadBase<TASK_T> {
     this->queue.push(task);
     queue_lock.unlock();
     return ret;
+  }
+  bool queue_empty() override {
+    queue_lock.lock();
+    bool empty = this->queue.empty() && !this->active.load(std::memory_order_acquire);
+    queue_lock.unlock();
+    return empty;
+  }
+  void clear_pending_tasks() override {
+    queue_lock.lock();
+    while (!this->queue.empty()) {
+      this->queue.pop();
+    }
+    queue_lock.unlock();
   }
 };
 
@@ -153,7 +191,8 @@ class CopyTask : public BaseTask {
  public:
   int start_mem_buf_idx, stop_mem_buf_idx;
   bool is_precise = false;
-  int64_t generation = 0;
+  int64_t forward_epoch = 0;
+  int64_t generate_epoch = 0;
   CacheRequestType request_type = kCacheRequestPrefetch;
   ExpertHandler *expert = nullptr;
   CacheMngr::CacheLineOccupancyWaiter lambda_wait = [](){};
@@ -162,7 +201,8 @@ class CopyTask : public BaseTask {
     if (expert) {
       ss << expert->toString() << ".[" << start_mem_buf_idx << "," << stop_mem_buf_idx
          << "), precise " << (is_precise ? "true" : "false")
-         << ", gen " << generation
+         << ", forward_epoch=" << forward_epoch
+         << ", generate_epoch=" << generate_epoch
          << ", request_type " << request_type;
     } else {
       ss << "null";
@@ -203,10 +243,11 @@ class ExpertUnlockWorker : public WorkerThread<ExpertHandler*> {
  */
 struct PredictJob {
   int input_layer_id = 0;
-  int64_t generation = 0;
+  int64_t forward_epoch = 0;
+  int64_t generate_epoch = 0;
   PredictJob() {}
-  PredictJob(int input_layer_id, int64_t generation = 0)
-      : input_layer_id(input_layer_id), generation(generation) {}
+  PredictJob(int input_layer_id, int64_t forward_epoch = 0, int64_t generate_epoch = 0)
+      : input_layer_id(input_layer_id), forward_epoch(forward_epoch), generate_epoch(generate_epoch) {}
 };
 class AtomicQueue {
  public:
@@ -269,6 +310,10 @@ class SemQueue {
   void init(int init_val = 0) {
     sem_init(&sem_, 0, init_val);
   }
+  void reset(int init_val = 0) {
+    sem_destroy(&sem_);
+    sem_init(&sem_, 0, init_val);
+  }
   ~SemQueue() {
     sem_destroy(&sem_);
   }
@@ -295,6 +340,7 @@ class PredictWorker : public WorkerThread<PredictJob> {
   PredictorBase  * predictor;
   CacheMngr  * cache;
   ModuleMeta * metas;
+  std::atomic<int64_t> current_generate_epoch{0};
 
   PrecisionProfiler * precision_profiler;
 
@@ -319,9 +365,29 @@ class PredictWorker : public WorkerThread<PredictJob> {
   int  consume_prefetch_layer_progress() {
     return prefetch_layer_progress.pop();
   }
-  void on_one_iter_done(int64_t generation);
-  void on_moe_attn_input_logits_recorded(int layer_id, int64_t generation);
-  void on_moe_layer_logits_recorded(int layer_id, int64_t generation);
+  void release_prefetch_layer_budget_for_reset() {
+    int release_count = metas->num_layer * metas->num_layer;
+    if (release_count < 1) {
+      release_count = 1;
+    }
+    for (int i = 0; i < release_count; i++) {
+      prefetch_layer_budget.push(0);
+    }
+  }
+  void begin_reset_for_generate() {
+    clear_pending_tasks();
+    release_prefetch_layer_budget_for_reset();
+  }
+  void reset_for_generate(int64_t next_generate_epoch) {
+    wait_until_idle();
+    clear_pending_tasks();
+    prefetch_layer_budget.reset(metas->max_prefetch_layer_distance);
+    prefetch_layer_progress.reset(0);
+    current_generate_epoch.store(next_generate_epoch, std::memory_order_release);
+  }
+  void on_one_iter_done(int64_t forward_epoch, int64_t generate_epoch);
+  void on_moe_attn_input_logits_recorded(int layer_id, int64_t forward_epoch, int64_t generate_epoch);
+  void on_moe_layer_logits_recorded(int layer_id, int64_t forward_epoch, int64_t generate_epoch);
 
 protected:
   void do_one_task_impl(PredictJob job) override;

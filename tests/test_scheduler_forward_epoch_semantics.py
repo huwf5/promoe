@@ -4,6 +4,8 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PREFETCHER_CPP = REPO_ROOT / "src/cpp_worker/prefetcher.cpp"
 PREFETCHER_HPP = REPO_ROOT / "src/cpp_worker/prefetcher.hpp"
+WORKER_CPP = REPO_ROOT / "src/cpp_worker/worker.cpp"
+WORKER_HPP = REPO_ROOT / "src/cpp_worker/worker.hpp"
 
 
 def _read(path: Path) -> str:
@@ -31,16 +33,38 @@ def _function_body(source: str, signature: str) -> str:
     raise AssertionError(f"could not find end of function body for {signature!r}")
 
 
-def test_generation_start_task_uses_explicit_decoder_warmup_action():
+def test_forward_epoch_start_task_uses_explicit_decoder_warmup_action():
     hpp = _read(PREFETCHER_HPP)
 
     assert "DecoderWarmupAction" in hpp
     assert "bool rebuild_decoder_warmup" not in hpp
 
 
+def test_forward_epoch_names_the_forward_boundary_not_generate_call():
+    sources = {
+        "prefetcher.hpp": _read(PREFETCHER_HPP),
+        "prefetcher.cpp": _read(PREFETCHER_CPP),
+        "worker.hpp": _read(WORKER_HPP),
+        "worker.cpp": _read(WORKER_CPP),
+    }
+
+    combined = "\n".join(sources.values())
+    assert "forward_epoch" in combined
+    assert "ForwardEpochStartTask" in combined
+    assert "prefetch_generation" not in combined
+    assert "current_generation" not in combined
+    assert "GenerationStartTask" not in combined
+    assert "kGenerationStart" not in combined
+    assert "start_generation" not in combined
+    assert ".generation" not in combined
+    assert "current_forward_epoch" in combined
+    assert "kForwardEpochStart" in combined
+    assert "start_forward_epoch" in combined
+
+
 def test_preserve_forward_epoch_does_not_touch_decoder_warmup_state():
     cpp = _read(PREFETCHER_CPP)
-    body = _function_body(cpp, "void FetchScheduleWorker::start_generation")
+    body = _function_body(cpp, "void FetchScheduleWorker::start_forward_epoch")
     preserve_case = _text_between(
         body,
         "case DecoderWarmupAction::kPreserve",
@@ -72,7 +96,7 @@ def test_actual_decoder_layer_clears_decoder_warmup_queue():
     assert "clear_decoder_warmup_queue()" in set_phase_body
 
 
-def test_last_layer_generation_boundary_preserves_decoder_warmup_overlap():
+def test_last_layer_forward_epoch_boundary_preserves_decoder_warmup_overlap():
     cpp = _read(PREFETCHER_CPP)
     body = _text_between(
         cpp,
@@ -97,7 +121,9 @@ def test_forward_boundary_logits_reports_do_not_unconditionally_rebuild_decoder_
 
 
 def test_reset_and_load_initial_cache_still_rebuilds_for_generate_start():
+    hpp = _read(PREFETCHER_HPP)
     cpp = _read(PREFETCHER_CPP)
-    body = _function_body(cpp, "void PrefetchMngr::reset_and_load_initial_cache")
+    body = _function_body(cpp, "void PrefetchMngr::reset_for_generate")
 
+    assert "void reset_and_load_initial_cache() { reset_for_generate(); }" in hpp
     assert "DecoderWarmupAction::kRebuildForGenerateStart" in body

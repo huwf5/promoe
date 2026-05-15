@@ -9,31 +9,39 @@ from sparse_llm_cache.utils import inject_model, wrap_generate_with_initial_cach
 
 
 class DummyPrefetchMngr:
-  def __init__(self):
+  def __init__(self, events=None):
     self.calls = 0
+    self.events = events
 
-  def reset_and_load_initial_cache(self):
+  def reset_for_generate(self):
     self.calls += 1
+    if self.events is not None:
+      self.events.append("reset_for_generate")
 
 
 class DummyModel:
-  def __init__(self):
+  def __init__(self, events=None):
     self.generate_calls = 0
+    self.events = events
 
   def generate(self, *args, **kwargs):
     self.generate_calls += 1
+    if self.events is not None:
+      self.events.append("generate")
     return {"args": args, "kwargs": kwargs}
 
 
 def test_generate_wrapper_resets_before_generate():
-  model = DummyModel()
-  mngr = DummyPrefetchMngr()
+  events = []
+  model = DummyModel(events)
+  mngr = DummyPrefetchMngr(events)
 
   wrap_generate_with_initial_cache(model, mngr)
   result = model.generate(1, x=2)
 
   assert mngr.calls == 1
   assert model.generate_calls == 1
+  assert events == ["reset_for_generate", "generate"]
   assert result == {"args": (1,), "kwargs": {"x": 2}}
 
 

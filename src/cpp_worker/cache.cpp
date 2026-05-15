@@ -8,6 +8,11 @@
 
 namespace {
 
+std::vector<std::shared_ptr<CachePolicy>>& retired_scheduler_aware_policies() {
+  static auto* policies = new std::vector<std::shared_ptr<CachePolicy>>();
+  return *policies;
+}
+
 int parse_initial_plan_int(const std::string &value,
                            const std::string &entry,
                            const std::string &initial_plan_config) {
@@ -275,34 +280,81 @@ void CacheMngr::reset_cache_contents() {
   CHECK(cache_slots->slots.size() == 1)
       << "deterministic initial cache requires global cache";
 
+  LOG(INFO) << "cache/reset_cache_contents: begin prefetched_experts="
+            << prefetched_experts.size()
+            << " slots=" << cache_slots->slots.size();
+  size_t reset_idx = 0;
+  size_t ready_count = 0;
+  size_t idle_count = 0;
+  size_t fetching_count = 0;
   for (auto &pair : prefetched_experts) {
     auto expert = pair.first;
+    CHECK(expert != nullptr) << "prefetched_experts contains null expert";
     auto status = expert->expert_status.get();
+    if ((reset_idx % 64) == 0) {
+      LOG(INFO) << "cache/reset_cache_contents: resetting entry idx="
+                << reset_idx
+                << " expert=" << expert->layer_idx << "." << expert->expert_idx
+                << " status=" << status
+                << " num_ready=" << expert->num_ready
+                << " gpu_ptr=" << pair.second;
+    }
     CHECK(status == kReady || status == kIdle || status == kFetching)
         << "cannot reset active expert " << expert->toString()
         << " with status " << status;
     if (status == kReady) {
       expert->expert_status.transfer(kReady, kIdle);
+      ready_count += 1;
     } else if (status == kFetching) {
       expert->expert_status.transfer(kFetching, kIdle);
+      fetching_count += 1;
+    } else {
+      idle_count += 1;
     }
     expert->gpu_data = nullptr;
     expert->num_ready = 0;
+    reset_idx += 1;
   }
+  LOG(INFO) << "cache/reset_cache_contents: reset entries done total="
+            << reset_idx
+            << " ready=" << ready_count
+            << " idle=" << idle_count
+            << " fetching=" << fetching_count;
+  LOG(INFO) << "cache/reset_cache_contents: clear prefetched_experts begin";
   prefetched_experts.clear();
+  LOG(INFO) << "cache/reset_cache_contents: clear prefetched_experts done";
   for (auto &cache_slot : cache_slots->slots) {
+    LOG(INFO) << "cache/reset_cache_contents: reset slot begin all_mems="
+              << cache_slot.all_mems.size()
+              << " unused_before=" << cache_slot.unused_mems.size();
     cache_slot.unused_mems = cache_slot.all_mems;
-    cache_slot.policy = policy_factory.create_policy(metas->cache_policy);
+    LOG(INFO) << "cache/reset_cache_contents: reset slot unused_mems done";
+    if (metas->cache_policy == "scheduler_aware" &&
+        cache_slot.policy != nullptr) {
+      retired_scheduler_aware_policies().push_back(cache_slot.policy);
+      cache_slot.policy = policy_factory.create_policy(metas->cache_policy);
+      LOG(INFO) << "cache/reset_cache_contents: reset slot policy retired";
+    } else {
+      cache_slot.policy = policy_factory.create_policy(metas->cache_policy);
+      LOG(INFO) << "cache/reset_cache_contents: reset slot policy recreated";
+    }
   }
+  LOG(INFO) << "cache/reset_cache_contents: reset slots done";
   max_priority = std::numeric_limits<float>::min();
+  LOG(INFO) << "cache/reset_cache_contents: max priority reset done";
   if (metas->cache_policy == "nn") {
     priority.zero_();
   }
+  LOG(INFO) << "cache/reset_cache_contents: priority tensor reset done";
 
+  LOG(INFO) << "cache/reset_cache_contents: final unused_mems="
+            << cache_slots->slots[0].unused_mems.size()
+            << " cache_len=" << cache_len;
   CHECK(cache_slots->slots[0].unused_mems.size() == cache_len)
       << "cache reset did not restore all cache lines: restored="
       << cache_slots->slots[0].unused_mems.size()
       << ", cache_len=" << cache_len;
+  LOG(INFO) << "cache/reset_cache_contents: final check done";
 }
 
 void CacheMngr::load_initial_plan_sync(cudaStream_t stream) {
@@ -397,6 +449,10 @@ CacheMngr::~CacheMngr() {
   size_t unused_mem_cnt = 0;
   for (auto &l : cache_slots->slots) {
     unused_mem_cnt += l.unused_mems.size();
+    if (metas->cache_policy == "scheduler_aware" && l.policy != nullptr) {
+      retired_scheduler_aware_policies().push_back(l.policy);
+      l.policy.reset();
+    }
   }
   LOG(ERROR) << unused_mem_cnt << "+" << used_mem_cnt << "=" << unused_mem_cnt + used_mem_cnt;
 }
@@ -654,10 +710,44 @@ bool CacheMngr::has_reclaimable_encoder() const {
 }
 
 CachePolicySchedulerAware::~CachePolicySchedulerAware() {
-  while (!node_free_buffer.empty()) {
-    delete node_free_buffer.back();
-    node_free_buffer.pop_back();
-  }
+  global_map.clear();
+  encoder_map.clear();
+  decoder_map.clear();
+  reclaimable_map.clear();
+  node_free_buffer.clear();
+
+  auto reset_list = [](LL& list) {
+    list.guard_head.prev = nullptr;
+    list.guard_head.next = &list.guard_tail;
+    list.guard_tail.prev = &list.guard_head;
+    list.guard_tail.next = nullptr;
+    list.len = 0;
+  };
+  reset_list(global_lru);
+  reset_list(encoder_lru);
+  reset_list(decoder_lru);
+  reset_list(reclaimable_encoder_lru);
+}
+
+bool CachePolicySchedulerAware::reset_for_cache_reset() {
+  global_map.clear();
+  encoder_map.clear();
+  decoder_map.clear();
+  reclaimable_map.clear();
+  node_free_buffer.clear();
+
+  auto reset_list = [](LL& list) {
+    list.guard_head.prev = nullptr;
+    list.guard_head.next = &list.guard_tail;
+    list.guard_tail.prev = &list.guard_head;
+    list.guard_tail.next = nullptr;
+    list.len = 0;
+  };
+  reset_list(global_lru);
+  reset_list(encoder_lru);
+  reset_list(decoder_lru);
+  reset_list(reclaimable_encoder_lru);
+  return true;
 }
 
 CachePolicySchedulerAware::LL::Node* CachePolicySchedulerAware::new_node(ExpertHandler* expert) {

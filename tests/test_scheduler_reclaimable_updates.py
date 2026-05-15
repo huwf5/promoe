@@ -139,6 +139,45 @@ def test_cache_reset_discards_partial_chunk_prefetch_entries_but_not_active_expe
     assert "status == kUsing" not in body
 
 
+def test_cache_reset_retires_scheduler_aware_policy_instead_of_destroying_it():
+    cpp = _text(CACHE_CPP)
+    body = _function_body(cpp, "void CacheMngr::reset_cache_contents")
+
+    assert 'metas->cache_policy == "scheduler_aware"' in body
+    assert "retired_scheduler_aware_policies().push_back(cache_slot.policy)" in body
+    assert "reset slot policy retired" in body
+    assert "policy_factory.create_policy(metas->cache_policy)" in body
+
+
+def test_cache_manager_destructor_retires_scheduler_aware_policy():
+    cpp = _text(CACHE_CPP)
+    body = _function_body(cpp, "CacheMngr::~CacheMngr()")
+
+    assert 'metas->cache_policy == "scheduler_aware"' in body
+    assert "retired_scheduler_aware_policies().push_back(l.policy)" in body
+    assert "l.policy.reset()" in body
+
+
+def test_scheduler_aware_reset_does_not_depend_on_list_traversal_or_destruction():
+    cpp = _text(CACHE_CPP)
+    hpp = _text(CACHE_HPP)
+    body = _function_body(cpp, "bool CachePolicySchedulerAware::reset_for_cache_reset()")
+
+    assert "virtual bool reset_for_cache_reset()" in hpp
+    assert "bool reset_for_cache_reset() override" in hpp
+    assert "global_map.clear()" in body
+    assert "encoder_map.clear()" in body
+    assert "decoder_map.clear()" in body
+    assert "reclaimable_map.clear()" in body
+    assert "node_free_buffer.clear()" in body
+    assert "reset_list(global_lru)" in body
+    assert "reset_list(encoder_lru)" in body
+    assert "reset_list(decoder_lru)" in body
+    assert "reset_list(reclaimable_encoder_lru)" in body
+    assert "delete pop_front()" not in body
+    assert "delete " not in body
+
+
 def test_preempt_one_expert_drains_after_demand_preempt():
     cpp = _text(PREFETCHER_CPP)
     body = _function_body(cpp, "void FetchScheduleWorker::do_one_task_impl(PreemptOneExpertTask *task)")
@@ -155,6 +194,55 @@ def test_preempt_task_drains_after_layer_preempt_and_queue_cleanup():
     drain_pos = body.index("drain_reclaimable_updates")
     assert advance_pos < drain_pos
     assert queue_cleanup_pos < drain_pos
+
+
+def test_preempt_layer_deduplicates_experts_before_launch_transition():
+    cpp = _text(PREFETCHER_CPP)
+    body = _function_body(cpp, "void FetchScheduleWorker::preempt_one_layer_without_reorder_")
+    compact_body = _compact(body)
+
+    assert "std::unordered_set<int64_t> seen_demand_experts" in body
+    assert "flatten_expert(layer_idx, e->expert_idx)" in body
+    assert "seen_demand_experts.insert" in body
+    assert "duplicate demand expert" in body
+    assert re.search(
+        r"if\s*\(\s*!seen_demand_experts\.insert\s*\([^)]*\)\.second\s*\)\s*"
+        r"\{[^{}]*duplicate demand expert[^{}]*continue\s*;",
+        compact_body,
+    )
+    dedupe_pos = body.index("seen_demand_experts.insert")
+    for later in (
+        "cache->is_in_cache(e)",
+        "add_single_tasks_for_one_expert",
+        "e->expert_status.transfer(kReady, kLaunching, false)",
+        "cache_hit(e, true)",
+        "current_task.is_precise",
+    ):
+        assert dedupe_pos < body.index(later)
+
+
+def test_ready_expert_launch_transition_is_idempotent_for_redundant_demands():
+    cpp = _text(PREFETCHER_CPP)
+
+    for signature in [
+        "void FetchScheduleWorker::preempt_one_expert",
+        "void FetchScheduleWorker::preempt_one_layer_without_reorder_",
+    ]:
+        body = _function_body(cpp, signature)
+        compact_body = _compact(body)
+        assert "transfer(kReady, kLaunching, false)" in body
+        assert "launch_status == kReady" in body
+        assert "launch_status == kLaunching" in body
+        assert re.search(
+            r"if\s*\(\s*launch_status\s*==\s*kReady\s*\)\s*\{[^{}]*cache_hit\(e,\s*true\);",
+            compact_body,
+        )
+        assert re.search(
+            r"else\s+if\s*\(\s*launch_status\s*==\s*kLaunching\s*\)",
+            compact_body,
+        )
+        assert "CHECK(launch_status == kReady || launch_status == kLaunching)" in body
+        assert "e->expert_status.transfer(kReady, kLaunching);" not in body
 
 
 def test_coalescing_rules_are_encoded_in_enqueue_methods():
@@ -251,4 +339,57 @@ def test_new_prefetcher_path_uses_vector_mask_for_layer_except():
         r"enqueue_layer_reclaimable_except\s*\(\s*layer_id\s*,\s*needed_mask\s*\)",
         body,
         re.MULTILINE,
+    )
+
+
+def test_encoder_report_one_layer_does_not_wait_for_predictor_progress():
+    cpp = _text(PREFETCHER_CPP)
+    body = _function_body(
+        cpp,
+        "void PrefetchMngr::report_one_layer(int layer_id, int64_t* experts, int64_t num_expert)",
+    )
+    compact_body = _compact(body)
+
+    assert "consume_prefetch_layer_progress" in body
+    assert re.search(
+        r"if\s*\(\s*metas->is_decoder_layer\s*\(\s*layer_id\s*\)\s*\)\s*"
+        r"\{[^{}]*consume_prefetch_layer_progress\s*\(",
+        compact_body,
+    )
+
+
+def test_idle_task_does_not_overwrite_inflight_fetch_task():
+    cpp = _text(PREFETCHER_CPP)
+    body = _function_body(cpp, "void FetchScheduleWorker::do_one_task_impl(IdleTask *idle_task)")
+    compact_body = _compact(body)
+
+    assert re.search(
+        r"current_task\.expert\s*!=\s*nullptr.*"
+        r"add_one_task\s*\(\s*&this->idle_task\s*\).*"
+        r"return\s*;",
+        compact_body,
+    )
+    guard_idx = body.index("current_task.expert != nullptr")
+    pop_idx = body.index("pop_next_task")
+    assert guard_idx < pop_idx
+
+
+def test_stale_partial_task_restarts_only_for_precise_demand():
+    cpp = _text(PREFETCHER_CPP)
+    body = _function_body(cpp, "bool FetchScheduleWorker::send_one_job(CopyTask *task)")
+    compact_body = _compact(body)
+
+    assert "task->expert->num_ready > task->start_mem_buf_idx" in body
+    assert "task->expert->num_ready < task->start_mem_buf_idx" in body
+    assert re.search(
+        r"task->expert->num_ready\s*<\s*task->start_mem_buf_idx.*"
+        r"if\s*\(\s*task->is_precise\s*\).*"
+        r"task->start_mem_buf_idx\s*=\s*task->expert->num_ready",
+        compact_body,
+    )
+    assert re.search(
+        r"task->expert->num_ready\s*<\s*task->start_mem_buf_idx.*"
+        r"if\s*\(\s*task->is_precise\s*\).*"
+        r"else\s*\{[^{}]*return false\s*;",
+        compact_body,
     )

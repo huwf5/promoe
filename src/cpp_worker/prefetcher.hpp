@@ -28,7 +28,8 @@ class FetchScheduleTaskBase {
     kFetchDone,
     kPrefetchLayer,
     kPreemptOneExpert,
-    kGenerationStart,
+    kForwardEpochStart,
+    kReset,
   };
   TaskType task_type;
   FetchScheduleTaskBase(TaskType task_type) : task_type(task_type) {}
@@ -42,7 +43,8 @@ class PreemptTask : public FetchScheduleTaskBase {
  public:
   PreemptTask() : FetchScheduleTaskBase(kPreempt) {}
   int layer_idx;
-  int64_t generation = 0;
+  int64_t forward_epoch = 0;
+  int64_t generate_epoch = 0;
   int64_t* expert_idxs;
   size_t num_expert;
 };
@@ -50,13 +52,15 @@ class PreemptOneExpertTask : public FetchScheduleTaskBase {
  public:
   PreemptOneExpertTask() : FetchScheduleTaskBase(kPreemptOneExpert) {}
   int layer_id;
+  int64_t generate_epoch = 0;
   int64_t expert_id;
 };
 class PrefetchLayerTask : public FetchScheduleTaskBase {
  public:
   PrefetchLayerTask() : FetchScheduleTaskBase(kPrefetchLayer) {}
   int layer_idx;
-  int64_t generation = 0;
+  int64_t forward_epoch = 0;
+  int64_t generate_epoch = 0;
   int64_t* expert_idxs;
   size_t num_expert;
 };
@@ -69,11 +73,19 @@ enum class DecoderWarmupAction {
   kClear,
   kRebuildForGenerateStart,
 };
-class GenerationStartTask : public FetchScheduleTaskBase {
+class ForwardEpochStartTask : public FetchScheduleTaskBase {
  public:
-  GenerationStartTask() : FetchScheduleTaskBase(kGenerationStart) {}
-  int64_t generation = 0;
+  ForwardEpochStartTask() : FetchScheduleTaskBase(kForwardEpochStart) {}
+  int64_t forward_epoch = 0;
+  int64_t generate_epoch = 0;
   DecoderWarmupAction decoder_warmup_action = DecoderWarmupAction::kPreserve;
+};
+class ResetTask : public FetchScheduleTaskBase {
+ public:
+  ResetTask() : FetchScheduleTaskBase(kReset) {}
+  int64_t next_generate_epoch = 0;
+  int64_t next_forward_epoch = 0;
+  DecoderWarmupAction action = DecoderWarmupAction::kClear;
 };
 
 class FetchScheduleWorker : public WorkerThread<FetchScheduleTaskBase*> {
@@ -100,7 +112,8 @@ class FetchScheduleWorker : public WorkerThread<FetchScheduleTaskBase*> {
 
   FetchWorker*         fetch_thread;
   PredictWorker*       predict_thread;
-  int64_t current_generation = 0;
+  int64_t current_forward_epoch = 0;
+  int64_t current_generate_epoch = 0;
   int current_layer = -1;
 
   IdleTask idle_task;
@@ -108,7 +121,9 @@ class FetchScheduleWorker : public WorkerThread<FetchScheduleTaskBase*> {
   friend class FetchWorker;
   friend class PrefetchMngr;
   FetchDoneTask copy_done_task;
-  GenerationStartTask generation_start_task;
+  ForwardEpochStartTask forward_epoch_start_task;
+  ResetTask reset_task;
+  std::atomic<bool> reset_requested{false};
 
   #ifdef DEAD_CODE
   /** protected by queue_lock */
@@ -159,12 +174,13 @@ class FetchScheduleWorker : public WorkerThread<FetchScheduleTaskBase*> {
   void do_one_task_impl(PreemptOneExpertTask *task);
   void do_one_task_impl(FetchDoneTask *task);
   void do_one_task_impl(PrefetchLayerTask *task);
-  void do_one_task_impl(GenerationStartTask *task);
+  void do_one_task_impl(ForwardEpochStartTask *task);
+  void do_one_task_impl(ResetTask *task);
 
   void pop_next_task(CopyTask &task, bool &found);
 
-  void add_single_tasks_for_one_expert(int layer_idx, int expert_idx, TaskQueue* queue, int start_mem_buf_idx, int stop_mem_buf_idx, bool is_precise, int64_t generation, CacheRequestType request_type);
-  void add_separate_tasks_for_one_expert(int layer_idx, int expert_idx, TaskQueue *queue, int start_mem_buf_idx, int stop_mem_buf_idx, bool is_precise, int64_t generation, CacheRequestType request_type);
+  void add_single_tasks_for_one_expert(int layer_idx, int expert_idx, TaskQueue* queue, int start_mem_buf_idx, int stop_mem_buf_idx, bool is_precise, int64_t forward_epoch, CacheRequestType request_type);
+  void add_separate_tasks_for_one_expert(int layer_idx, int expert_idx, TaskQueue *queue, int start_mem_buf_idx, int stop_mem_buf_idx, bool is_precise, int64_t forward_epoch, CacheRequestType request_type);
 
   void reorder_experts(int layer_idx, int64_t *expert_idxs, size_t num_expert);
   #ifdef DEAD_CODE
@@ -172,9 +188,9 @@ class FetchScheduleWorker : public WorkerThread<FetchScheduleTaskBase*> {
   #endif
   void preempt_one_layer_without_reorder_(int layer_idx, int64_t *expert_idxs, size_t num_expert);
   void preempt_one_expert(int layer_idx, int64_t expert_idx);
-  bool is_stale_prefetch(int64_t generation, int layer_idx) const;
-  void start_generation(int64_t generation, DecoderWarmupAction decoder_warmup_action);
-  void advance_actual_layer(int64_t generation, int layer_idx);
+  bool is_stale_prefetch(int64_t forward_epoch, int layer_idx) const;
+  void start_forward_epoch(int64_t forward_epoch, DecoderWarmupAction decoder_warmup_action);
+  void advance_actual_layer(int64_t forward_epoch, int layer_idx);
   void clear_prefetch_queues_up_to_layer(int layer_idx);
   void clear_all_prefetch_queues();
   void clear_all_job_queues();
@@ -186,6 +202,7 @@ class FetchScheduleWorker : public WorkerThread<FetchScheduleTaskBase*> {
   bool pop_next_decoder_warmup(CopyTask& task);
   int64_t flatten_expert(int layer_idx, int expert_idx) const;
   void ensure_reclaimable_pending_initialized();
+  void reset_pending_reclaimable_updates();
   void note_pending_reclaimable_layer_locked(int layer_idx);
   bool is_idle();
 
@@ -199,6 +216,10 @@ class FetchScheduleWorker : public WorkerThread<FetchScheduleTaskBase*> {
   void enqueue_layer_reclaimable(int layer_idx);
   void drain_reclaimable_updates(int max_updates = -1);
   void init(ModuleMeta *metas, ModelLoader *model_loader, CacheMngr *cache, FetchWorker *fetch_thread, PredictWorker *predict_thread, CacheStatistics *cache_stats, TimeProfiler* profiler);
+  void begin_reset_for_generate() {
+    reset_requested.store(true, std::memory_order_release);
+  }
+  void reset_for_generate(int64_t next_generate_epoch, int64_t next_forward_epoch, DecoderWarmupAction action);
 
 protected:
   void do_one_task_impl(FetchScheduleTaskBase *task);
@@ -235,7 +256,9 @@ public:
   std::shared_ptr<PrecisionProfiler> precision_profiler;
 
   int64_t compute_stream = 0, copy_stream = 0;
-  int64_t prefetch_generation = 0;
+  int64_t forward_epoch = 0;
+  int64_t generate_epoch = 0;
+  std::atomic<bool> reset_in_progress{false};
   // cudaStream_t compute_stream = nullptr, copy_stream = nullptr;
   // at::cuda::CUDAStream compute_stream, copy_stream;
 
@@ -247,7 +270,8 @@ public:
                TimeProfiler* profiler = nullptr);
   ~PrefetchMngr();
   void init_gpu_mem_buffer();
-  void reset_and_load_initial_cache();
+  void reset_for_generate();
+  void reset_and_load_initial_cache() { reset_for_generate(); }
 
   void report_one_layer(int layer_id, torch::Tensor experts);
   void report_one_layer(int layer_id, int64_t* experts, int64_t num_expert);

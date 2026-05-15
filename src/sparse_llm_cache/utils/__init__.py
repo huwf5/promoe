@@ -157,7 +157,7 @@ def wrap_generate_with_initial_cache(model, prefetch_mngr):
   model._sparse_cache_old_generate = model.generate
 
   def generate_with_initial_cache(*args, **kwargs):
-    prefetch_mngr.reset_and_load_initial_cache()
+    prefetch_mngr.reset_for_generate()
     return model._sparse_cache_old_generate(*args, **kwargs)
 
   model.generate = generate_with_initial_cache

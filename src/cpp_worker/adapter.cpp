@@ -92,6 +92,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     .def("build_timer",             &PrefetchMngr::build_timer)
     .def("temp_move_expert_to_gpu", &PrefetchMngr::temp_move_expert_to_gpu)
     .def("temp_move_expert_back_to_host", &PrefetchMngr::temp_move_expert_back_to_host)
+    .def("reset_for_generate", &PrefetchMngr::reset_for_generate)
     .def("reset_and_load_initial_cache", &PrefetchMngr::reset_and_load_initial_cache)
     .def_readwrite("metas",         &PrefetchMngr::metas)
     .def_readwrite("model_loader",  &PrefetchMngr::model_loader)

@@ -355,6 +355,19 @@ bool LegacyPredictor::layer_predict_enabled(int layer_id) {
 void LegacyPredictor::add_one_layer(int layer_id, torch::Tensor experts) {
   add_one_layer(layer_id, experts.data_ptr<int64_t>(), experts.numel());
 }
+void LegacyPredictor::reset_sequence_state() {
+  for (int layer_id = 0; layer_id <= metas->num_layer; layer_id++) {
+    if (logits_record_event[layer_id] != 0) {
+      CUDA_CALL(cudaEventSynchronize(logits_record_event[layer_id]));
+    }
+  }
+  if (expert_access_buffer.defined()) expert_access_buffer.zero_();
+  if (last_use_distance_buffer.defined()) last_use_distance_buffer.zero_();
+  if (weighted_access_freq_sum_buffer.defined()) weighted_access_freq_sum_buffer.zero_();
+  first_moe_attn_input_logits_buffer = torch::empty({0});
+  moe_attn_input_logits_buffer_list.clear();
+  moe_layer_logits_buffer_list.clear();
+}
 void LegacyPredictor::start_of_new_sequence() {
   LOG(DEBUG) << "predictor, start_of_new_sequence";
   switch (metas->predict_input_mode) {
@@ -725,6 +738,14 @@ SepPredictor::SepPredictor(std::shared_ptr<ModuleMeta> metas) : PredictorBase(me
     logits_record_event[l] = 0;
     CUDA_CALL(cudaEventCreateWithFlags(&logits_record_event[l], cudaEventDisableTiming));
   }
+}
+void SepPredictor::reset_sequence_state() {
+  for (int layer_id = 0; layer_id <= metas->predictor_num_layer; layer_id++) {
+    if (logits_record_event[layer_id] != 0) {
+      CUDA_CALL(cudaEventSynchronize(logits_record_event[layer_id]));
+    }
+  }
+  moe_layer_logits_buffer_list.clear();
 }
 void SepPredictor::slice_predict_output_layer(PredictOutput &output) {
   // const auto & p_m_metas = predict_models[output.input_layer_id];

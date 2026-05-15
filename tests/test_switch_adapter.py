@@ -2,6 +2,9 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from torch import nn
+from transformers.models.switch_transformers.configuration_switch_transformers import SwitchTransformersConfig
+from transformers.models.switch_transformers.modeling_switch_transformers import SwitchTransformersSparseMLP
 
 from sparse_llm_cache.model_adapters import get_model_adapter
 from sparse_llm_cache.model_adapters.switch import SwitchAdapter
@@ -21,6 +24,22 @@ def _switch_config(**overrides):
     }
     values.update(overrides)
     return SimpleNamespace(**values)
+
+
+def _tiny_transformers_switch_config(**overrides):
+    values = {
+        "num_experts": 4,
+        "d_model": 2,
+        "d_ff": 4,
+        "dropout_rate": 0.0,
+        "expert_capacity": 4,
+        "router_bias": False,
+        "router_jitter_noise": 0.0,
+        "router_ignore_padding_tokens": False,
+        "router_dtype": "float32",
+    }
+    values.update(overrides)
+    return SwitchTransformersConfig(**values)
 
 
 def test_get_model_adapter_returns_switch_adapter_for_switch_config():
@@ -131,6 +150,63 @@ def test_switch_adapter_can_skip_report_experts_patch_for_modules_without_method
     module._layer_id = 0
 
     assert adapter.should_patch_report_experts(module) is False
+
+
+def test_switch_sparse_mlp_exposes_report_experts_for_adapter_patch():
+    adapter = SwitchAdapter(SimpleNamespace(config=_switch_config(num_experts=4)), "google/switch-base-4")
+    module = SwitchTransformersSparseMLP(_tiny_transformers_switch_config())
+
+    experts = torch.tensor([0, 2], dtype=torch.int64)
+
+    assert module.report_experts(experts) is experts
+    assert adapter.should_patch_report_experts(module) is True
+
+
+class FixedSwitchRouter(nn.Module):
+    def forward(self, hidden_states):
+        batch_size, seq_len, _ = hidden_states.shape
+        router_mask = torch.zeros(batch_size, seq_len, 4, dtype=torch.int64)
+        for token_idx in range(seq_len):
+            router_mask[:, token_idx, token_idx] = 1
+        router_probs = torch.ones(batch_size, seq_len, 1, dtype=hidden_states.dtype)
+        router_logits = torch.zeros(batch_size, seq_len, 4, dtype=hidden_states.dtype)
+        return router_mask, router_probs, router_logits
+
+
+class RecordingSwitchExpert(nn.Module):
+    def __init__(self, expert_id, calls):
+        super().__init__()
+        self.expert_id = expert_id
+        self.calls = calls
+
+    def forward(self, hidden_states):
+        self.calls.append(self.expert_id)
+        return hidden_states
+
+
+def test_switch_sparse_mlp_forward_uses_report_experts_returned_order():
+    module = SwitchTransformersSparseMLP(_tiny_transformers_switch_config())
+    module.router = FixedSwitchRouter()
+    calls = []
+    for expert_id in range(4):
+        module.experts[f"expert_{expert_id}"] = RecordingSwitchExpert(expert_id, calls)
+    reported = []
+
+    def reverse_report_experts(experts):
+        reported.append(experts)
+        return torch.flip(experts, dims=[0])
+
+    module.report_experts = reverse_report_experts
+
+    output = module(torch.ones(1, 4, 2))
+
+    assert reported
+    assert reported[0].dtype == torch.int64
+    assert reported[0].device.type == "cpu"
+    assert reported[0].tolist() == [0, 1, 2, 3]
+    assert calls == [3, 2, 1, 0]
+    assert isinstance(output, tuple)
+    assert output[0].shape == (1, 4, 2)
 
 
 def test_switch_configures_decoder_stage_local_predictor_meta():

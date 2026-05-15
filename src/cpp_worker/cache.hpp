@@ -27,6 +27,7 @@ class CachePolicy {
   virtual void access_on_miss(ExpertHandler* e, bool is_precise) { return access_on_miss(e); }
   virtual void mark_reclaimable(ExpertHandler*) {}
   virtual bool has_reclaimable_encoder() const { return false; }
+  virtual bool reset_for_cache_reset() { return false; }
   virtual void update_all_priority() {}
   virtual void update_priority(ExpertHandler* e, float p) {}
   virtual void set_cur_seq(uint64_t seq_id) {}
@@ -262,6 +263,7 @@ class CachePolicySchedulerAware : public CachePolicy {
   void access_on_miss(ExpertHandler* expert) override;
   void mark_reclaimable(ExpertHandler* expert) override;
   bool has_reclaimable_encoder() const override;
+  bool reset_for_cache_reset() override;
   std::string toString() override;
 };
 

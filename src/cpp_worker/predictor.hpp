@@ -54,6 +54,7 @@ class PredictorBase {
   virtual void record_moe_layer_logits(int layer_id, torch::Tensor layer_logits) {};
   virtual void end_of_one_token_prediction() {};
   virtual void start_of_new_sequence() {};
+  virtual void reset_sequence_state() {}
   virtual void slice_predict_output_layer(PredictOutput &output) = 0;
   virtual bool layer_predict_enabled(int layer_id) = 0;
   virtual ~PredictorBase() = default;
@@ -131,6 +132,7 @@ class LegacyPredictor : public PredictorBase {
   void record_moe_layer_logits(int layer_id, torch::Tensor layer_logits) override;
   void end_of_one_token_prediction() override;
   void start_of_new_sequence() override;
+  void reset_sequence_state() override;
   bool layer_predict_enabled(int layer_id) override;
   void slice_predict_output_layer(PredictOutput &output) override;
 
@@ -164,6 +166,7 @@ class SepPredictor : public PredictorBase {
   PredictOutput predict(int input_layer_id) override;
 
   void record_moe_layer_logits(int layer_id, torch::Tensor layer_logits) override;
+  void reset_sequence_state() override;
   bool layer_predict_enabled(int layer_id) override { return predict_models[layer_id].enabled_output_layers.size() > 0; }
   void slice_predict_output_layer(PredictOutput &output) override;
 

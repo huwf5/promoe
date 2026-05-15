@@ -97,11 +97,11 @@ void FetchScheduleWorker::reorder_experts(int layer_idx, int64_t *expert_idxs, s
   });
 }
 
-bool FetchScheduleWorker::is_stale_prefetch(int64_t generation, int layer_idx) const {
-  if (generation < current_generation) {
+bool FetchScheduleWorker::is_stale_prefetch(int64_t forward_epoch, int layer_idx) const {
+  if (forward_epoch < current_forward_epoch) {
     return true;
   }
-  if (generation == current_generation && layer_idx <= current_layer) {
+  if (forward_epoch == current_forward_epoch && layer_idx <= current_layer) {
     return true;
   }
   return false;
@@ -144,6 +144,14 @@ void FetchScheduleWorker::ensure_reclaimable_pending_initialized() {
   if (pending_reclaimable_layer_mask.size() != static_cast<size_t>(metas->num_layer)) {
     pending_reclaimable_layer_mask.assign(metas->num_layer, 0);
   }
+}
+
+void FetchScheduleWorker::reset_pending_reclaimable_updates() {
+  AtomicQueueLockGuard guard(reclaimable_update_lock);
+  pending_reclaimable_updates.assign(metas->num_layer, PendingReclaimableUpdate());
+  pending_reclaimable_layers.clear();
+  pending_reclaimable_layer_mask.assign(metas->num_layer, 0);
+  has_pending_reclaimable_updates.store(false, std::memory_order_release);
 }
 
 void FetchScheduleWorker::note_pending_reclaimable_layer_locked(int layer_idx) {
@@ -313,6 +321,17 @@ void FetchScheduleWorker::clear_decoder_warmup_queue() {
   decoder_warmup_seen.clear();
 }
 
+void FetchScheduleWorker::reset_for_generate(
+    int64_t next_generate_epoch,
+    int64_t next_forward_epoch,
+    DecoderWarmupAction action) {
+  reset_task.next_generate_epoch = next_generate_epoch;
+  reset_task.next_forward_epoch = next_forward_epoch;
+  reset_task.action = action;
+  auto handle = WorkerThread<FetchScheduleTaskBase*>::add_one_task(&reset_task);
+  WorkerThread<FetchScheduleTaskBase*>::wait_progress(handle);
+}
+
 bool FetchScheduleWorker::parse_layer_expert_plan(
     const std::string& plan,
     std::vector<std::pair<int, int>>& out) {
@@ -369,11 +388,11 @@ void FetchScheduleWorker::clear_prefetch_queues_up_to_layer(int layer_idx) {
   }
 }
 
-void FetchScheduleWorker::start_generation(
-    int64_t generation,
+void FetchScheduleWorker::start_forward_epoch(
+    int64_t forward_epoch,
     DecoderWarmupAction decoder_warmup_action) {
-  if (generation > current_generation) {
-    current_generation = generation;
+  if (forward_epoch > current_forward_epoch) {
+    current_forward_epoch = forward_epoch;
     current_layer = -1;
     clear_all_job_queues();
   }
@@ -393,13 +412,13 @@ void FetchScheduleWorker::start_generation(
   }
 }
 
-void FetchScheduleWorker::advance_actual_layer(int64_t generation, int layer_idx) {
-  if (generation > current_generation) {
-    current_generation = generation;
+void FetchScheduleWorker::advance_actual_layer(int64_t forward_epoch, int layer_idx) {
+  if (forward_epoch > current_forward_epoch) {
+    current_forward_epoch = forward_epoch;
     current_layer = -1;
     clear_all_prefetch_queues();
   }
-  if (generation == current_generation && layer_idx > current_layer) {
+  if (forward_epoch == current_forward_epoch && layer_idx > current_layer) {
     current_layer = layer_idx;
   }
   if (metas->is_decoder_layer(layer_idx)) {
@@ -412,15 +431,22 @@ void FetchScheduleWorker::preempt_one_expert(int layer_idx, int64_t expert_idx) 
   TRACE_EVENT_GURAD(kFetchScheduler, "preemot_one_expert");
 
   auto e = model_loader->get_source(layer_idx, expert_idx);
-  auto cur_status = e->expert_status.get();
 
   if (cache->is_in_cache(e) == false) {
     // a completely missed expert
-    add_single_tasks_for_one_expert(layer_idx, e->expert_idx, &precise_job_queue, 0, metas->num_per_expert_param, true, current_generation, kCacheRequestDemand);
+    add_single_tasks_for_one_expert(layer_idx, e->expert_idx, &precise_job_queue, 0, metas->num_per_expert_param, true, current_forward_epoch, kCacheRequestDemand);
   } else if (e->num_ready == metas->num_per_expert_param) {
     // bypass a fully fetched expert, no need to add task
-    e->expert_status.transfer(kReady, kLaunching);
-    cache_hit(e, true);
+    auto launch_status = e->expert_status.transfer(kReady, kLaunching, false);
+    if (launch_status == kReady) {
+      cache_hit(e, true);
+    } else if (launch_status == kLaunching) {
+      LOG(TRACE) << "scheduler: skip redundant launch for " << e->toString();
+    } else {
+      CHECK(launch_status == kReady || launch_status == kLaunching)
+          << "launch ready expert " << e->toString()
+          << " but current status is " << launch_status;
+    }
   } else if (e == current_task.expert) {
     current_task.is_precise = true;
     if (current_task.stop_mem_buf_idx == metas->num_per_expert_param) {
@@ -428,11 +454,11 @@ void FetchScheduleWorker::preempt_one_expert(int layer_idx, int64_t expert_idx) 
       // note there will be corresponding fetchdone for this task.
       cache_hit(e, true);
     } else {
-      add_single_tasks_for_one_expert(layer_idx, e->expert_idx, &precise_job_queue, current_task.stop_mem_buf_idx, metas->num_per_expert_param, true, current_generation, kCacheRequestDemand);
+      add_single_tasks_for_one_expert(layer_idx, e->expert_idx, &precise_job_queue, current_task.stop_mem_buf_idx, metas->num_per_expert_param, true, current_forward_epoch, kCacheRequestDemand);
     }
   } else {
     // partial expert
-    add_single_tasks_for_one_expert(layer_idx, e->expert_idx, &precise_job_queue, e->num_ready, metas->num_per_expert_param, true, current_generation, kCacheRequestDemand);
+    add_single_tasks_for_one_expert(layer_idx, e->expert_idx, &precise_job_queue, e->num_ready, metas->num_per_expert_param, true, current_forward_epoch, kCacheRequestDemand);
   }
 }
 
@@ -443,6 +469,7 @@ void FetchScheduleWorker::preempt_one_layer_without_reorder_(int layer_idx, int6
   });
 
   bool preceeding_experts_in_cache = true;
+  std::unordered_set<int64_t> seen_demand_experts;
 
   // examine expert status, classify them, and bypass experts that is already fetched.
   // for ready expert, we need to let cache know we access it and update it's priority
@@ -452,25 +479,37 @@ void FetchScheduleWorker::preempt_one_layer_without_reorder_(int layer_idx, int6
   // ready, current, partial, miss
   for (int i = 0; i < num_expert; i++) {
     auto e = model_loader->get_source(layer_idx, expert_idxs[i]);
-    auto cur_status = e->expert_status.get();
+    auto demand_gid = flatten_expert(layer_idx, e->expert_idx);
+    if (!seen_demand_experts.insert(demand_gid).second) {
+      LOG(TRACE) << "scheduler: skip duplicate demand expert " << e->toString();
+      continue;
+    }
 
     // a completely missed expert
     if (cache->is_in_cache(e) == false) {
       preceeding_experts_in_cache = false;
-      add_single_tasks_for_one_expert(layer_idx, e->expert_idx, &precise_job_queue, 0, metas->num_per_expert_param, true, current_generation, kCacheRequestDemand);
+      add_single_tasks_for_one_expert(layer_idx, e->expert_idx, &precise_job_queue, 0, metas->num_per_expert_param, true, current_forward_epoch, kCacheRequestDemand);
       continue;
     }
 
     // an expert fully/partially in cache, but it may be evicted by preceeding miss expert, so we need to add redundant task for it
     if (preceeding_experts_in_cache == false) {
-      add_single_tasks_for_one_expert(layer_idx, e->expert_idx, &precise_job_queue, 0, metas->num_per_expert_param, true, current_generation, kCacheRequestDemand);
+      add_single_tasks_for_one_expert(layer_idx, e->expert_idx, &precise_job_queue, 0, metas->num_per_expert_param, true, current_forward_epoch, kCacheRequestDemand);
       continue;
     }
 
     // bypass a fully fetched expert, no need to add task
     if (e->num_ready == metas->num_per_expert_param) {
-      e->expert_status.transfer(kReady, kLaunching);
-      cache_hit(e, true);
+      auto launch_status = e->expert_status.transfer(kReady, kLaunching, false);
+      if (launch_status == kReady) {
+        cache_hit(e, true);
+      } else if (launch_status == kLaunching) {
+        LOG(TRACE) << "scheduler: skip redundant launch for " << e->toString();
+      } else {
+        CHECK(launch_status == kReady || launch_status == kLaunching)
+            << "launch ready expert " << e->toString()
+            << " but current status is " << launch_status;
+      }
       continue;
     }
 
@@ -481,37 +520,38 @@ void FetchScheduleWorker::preempt_one_layer_without_reorder_(int layer_idx, int6
         // note there will be corresponding fetchdone for this task.
         cache_hit(e, true);
       } else {
-        add_single_tasks_for_one_expert(layer_idx, e->expert_idx, &precise_job_queue, current_task.stop_mem_buf_idx, metas->num_per_expert_param, true, current_generation, kCacheRequestDemand);
+        add_single_tasks_for_one_expert(layer_idx, e->expert_idx, &precise_job_queue, current_task.stop_mem_buf_idx, metas->num_per_expert_param, true, current_forward_epoch, kCacheRequestDemand);
       }
       continue;
     }
 
     // partial expert
-    add_single_tasks_for_one_expert(layer_idx, e->expert_idx, &precise_job_queue, e->num_ready, metas->num_per_expert_param, true, current_generation, kCacheRequestDemand);
+    add_single_tasks_for_one_expert(layer_idx, e->expert_idx, &precise_job_queue, e->num_ready, metas->num_per_expert_param, true, current_forward_epoch, kCacheRequestDemand);
   }
 }
-void FetchScheduleWorker::add_single_tasks_for_one_expert(int layer_idx, int expert_idx, TaskQueue* queue, int starting_mem_buffer, int stop_mem_buffer, bool is_precise, int64_t generation, CacheRequestType request_type) {
+void FetchScheduleWorker::add_single_tasks_for_one_expert(int layer_idx, int expert_idx, TaskQueue* queue, int starting_mem_buffer, int stop_mem_buffer, bool is_precise, int64_t forward_epoch, CacheRequestType request_type) {
   auto expert_handler = model_loader->get_source(layer_idx, expert_idx);
   NVTX_RANGE(std::string(is_precise ? "submit/demand_io " : "submit/prefetch_io ") +
              "L" + std::to_string(layer_idx) +
              " E" + std::to_string(expert_idx) +
              " P" + std::to_string(starting_mem_buffer) +
              "-" + std::to_string(stop_mem_buffer) +
-             " G" + std::to_string(generation));
+             " forward_epoch=" + std::to_string(forward_epoch));
   CopyTask task;
   task.start_mem_buf_idx = starting_mem_buffer;
   task.stop_mem_buf_idx = stop_mem_buffer;
   task.expert = expert_handler;
   task.is_precise = is_precise;
-  task.generation = generation;
+  task.forward_epoch = forward_epoch;
+  task.generate_epoch = current_generate_epoch;
   task.request_type = request_type;
   LOG(TRACE) << "scheduler: add prefetch task for one param " << task.toString();
   queue->push(task);
 }
 
-void FetchScheduleWorker::add_separate_tasks_for_one_expert(int layer_idx, int expert_idx, TaskQueue *queue, int start_mem_buf_idx, int stop_mem_buf_idx, bool is_precise, int64_t generation, CacheRequestType request_type) {
+void FetchScheduleWorker::add_separate_tasks_for_one_expert(int layer_idx, int expert_idx, TaskQueue *queue, int start_mem_buf_idx, int stop_mem_buf_idx, bool is_precise, int64_t forward_epoch, CacheRequestType request_type) {
   for (int j = start_mem_buf_idx; j < stop_mem_buf_idx; j++) {
-    add_single_tasks_for_one_expert(layer_idx, expert_idx, queue, j, j+1, is_precise, generation, request_type);
+    add_single_tasks_for_one_expert(layer_idx, expert_idx, queue, j, j+1, is_precise, forward_epoch, request_type);
   }
 }
 
@@ -604,7 +644,8 @@ bool FetchScheduleWorker::pop_next_decoder_warmup(CopyTask& task) {
     task.stop_mem_buf_idx = entry.stop_mem_buf_idx;
     task.expert = expert;
     task.is_precise = false;
-    task.generation = current_generation;
+    task.forward_epoch = current_forward_epoch;
+    task.generate_epoch = current_generate_epoch;
     task.request_type = kCacheRequestDecoderWarmupOverlap;
     return true;
   }
@@ -627,60 +668,99 @@ void PrefetchMngr::init_gpu_mem_buffer() {
   model_loader->mem_mngr_ctx->dummy_physical = cache->cache_slots->slots.front().unused_mems.front();
 }
 
-void PrefetchMngr::reset_and_load_initial_cache() {
+void PrefetchMngr::reset_for_generate() {
   if (!metas->reset_cache_on_generate_start) {
     return;
   }
-  NVTX_RANGE("cache_init/reset_and_load_initial_cache");
+  CHECK(!reset_in_progress.exchange(true));
+  bool reset_finished = false;
+  struct ResetInProgressGuard {
+    std::atomic<bool>& reset_in_progress;
+    bool& reset_finished;
+    ~ResetInProgressGuard() {
+      if (!reset_finished) {
+        reset_in_progress.store(false, std::memory_order_release);
+      }
+    }
+  } reset_guard{reset_in_progress, reset_finished};
+
+  NVTX_RANGE("cache_init/reset_for_generate");
   Timer total_timer;
-  uint64_t clear_us = 0;
   uint64_t reset_us = 0;
   uint64_t load_us = 0;
   uint64_t rebuild_us = 0;
-  prefetch_generation += 1;
-  fetch_schedule_thread->generation_start_task.generation = prefetch_generation;
-  fetch_schedule_thread->generation_start_task.decoder_warmup_action = DecoderWarmupAction::kClear;
-  {
-    NVTX_RANGE("cache_init/scheduler_clear");
-    Timer timer;
-    auto handler = fetch_schedule_thread->add_one_task(&fetch_schedule_thread->generation_start_task);
-    fetch_schedule_thread->wait_progress(handler);
-    while (!fetch_schedule_thread->is_idle()) {}
-    clear_us = timer.dur_us();
-  }
+  generate_epoch += 1;
+  forward_epoch += 1;
+  LOG(INFO) << "reset_for_generate: begin generate_epoch=" << generate_epoch
+            << " forward_epoch=" << forward_epoch;
+  LOG(INFO) << "reset_for_generate: begin predict reset barrier";
+  predict_thread->begin_reset_for_generate();
+  predict_thread->wait_until_idle();
+  LOG(INFO) << "reset_for_generate: predict reset barrier done";
+  LOG(INFO) << "reset_for_generate: begin fetch scheduler barrier";
+  fetch_schedule_thread->begin_reset_for_generate();
+  fetch_schedule_thread->wait_until_idle();
+  LOG(INFO) << "reset_for_generate: fetch scheduler barrier done";
+  LOG(INFO) << "reset_for_generate: begin fetch worker barrier";
+  fetch_thread->wait_until_idle();
+  LOG(INFO) << "reset_for_generate: fetch worker barrier done";
+  // Wait for FetchDoneTask to consume current_task before ResetTask clears it.
+  while (!fetch_schedule_thread->is_idle()) {}
+  LOG(INFO) << "reset_for_generate: fetch done barrier done";
+  // Wait for compute events to release experts before cache slots are reset/reloaded.
+  expert_unlocker_thread->wait_until_idle();
+  LOG(INFO) << "reset_for_generate: expert unlocker barrier done";
+  // Reset rewrites cache slots for the next sequence; no previous CUDA work may
+  // still reference the old slot contents at that point.
+  CUDA_CALL(cudaDeviceSynchronize());
+  LOG(INFO) << "reset_for_generate: device synchronize done";
+  predict_thread->reset_for_generate(generate_epoch);
+  LOG(INFO) << "reset_for_generate: predict worker reset done";
+  predictor->reset_sequence_state();
+  LOG(INFO) << "reset_for_generate: predictor sequence reset done";
+  fetch_schedule_thread->reset_for_generate(
+      generate_epoch, forward_epoch, DecoderWarmupAction::kClear);
+  LOG(INFO) << "reset_for_generate: scheduler clear reset done";
   {
     NVTX_RANGE("cache_init/reset_cache_contents");
     Timer timer;
+    LOG(INFO) << "reset_for_generate: reset cache contents begin";
     cache->reset_cache_contents();
     reset_us = timer.dur_us();
+    LOG(INFO) << "reset_for_generate: reset cache contents done";
   }
   {
     NVTX_RANGE("cache_init/load_initial_plan_sync");
     Timer timer;
+    LOG(INFO) << "reset_for_generate: load initial plan begin";
     cache->load_initial_plan_sync((cudaStream_t)copy_stream);
     load_us = timer.dur_us();
+    LOG(INFO) << "reset_for_generate: load initial plan done";
   }
-  fetch_schedule_thread->generation_start_task.generation = prefetch_generation;
-  fetch_schedule_thread->generation_start_task.decoder_warmup_action = DecoderWarmupAction::kRebuildForGenerateStart;
   {
     NVTX_RANGE("cache_init/scheduler_rebuild_for_generate_start");
     Timer timer;
-    auto handler = fetch_schedule_thread->add_one_task(&fetch_schedule_thread->generation_start_task);
-    fetch_schedule_thread->wait_progress(handler);
+    LOG(INFO) << "reset_for_generate: scheduler rebuild begin";
+    fetch_schedule_thread->reset_for_generate(
+        generate_epoch, forward_epoch, DecoderWarmupAction::kRebuildForGenerateStart);
     rebuild_us = timer.dur_us();
+    LOG(INFO) << "reset_for_generate: scheduler rebuild done";
   }
   LOG(INFO) << "ttft_breakdown_cache_init_us total=" << total_timer.dur_us()
-            << " scheduler_clear=" << clear_us
             << " reset_cache_contents=" << reset_us
             << " load_initial_plan_sync=" << load_us
             << " scheduler_rebuild=" << rebuild_us
-            << " generation=" << prefetch_generation;
+            << " generate_epoch=" << generate_epoch
+            << " forward_epoch=" << forward_epoch;
+  reset_in_progress.store(false, std::memory_order_release);
+  reset_finished = true;
 }
 
 void PrefetchMngr::preempt_and_launch_one_layer(int layer_idx, int64_t* experts, int64_t num_expert) {
   PreemptTask preempt_task;
   preempt_task.layer_idx = layer_idx;
-  preempt_task.generation = prefetch_generation;
+  preempt_task.forward_epoch = forward_epoch;
+  preempt_task.generate_epoch = generate_epoch;
   preempt_task.expert_idxs = experts;
   preempt_task.num_expert = num_expert;
   auto handler = fetch_schedule_thread->add_one_task(&preempt_task);
@@ -697,9 +777,11 @@ void PrefetchMngr::report_one_layer(int layer_id, int64_t* experts, int64_t num_
   NVTX_DETAIL_MARK("demand/layer_experts L" + std::to_string(layer_id) +
                    " experts=[" + array_to_str(experts, num_expert) + "]");
   cache_stats->forward();
-  LOG(INFO) << "prefetcher: consume prefetch layer progress at layer " << layer_id;
-  int progress_idx = predict_thread->consume_prefetch_layer_progress();
-  LOG(INFO) << "prefetcher: consume prefetch layer progress at layer " << layer_id << " done " << progress_idx;
+  if (metas->is_decoder_layer(layer_id)) {
+    LOG(INFO) << "prefetcher: consume prefetch layer progress at layer " << layer_id;
+    int progress_idx = predict_thread->consume_prefetch_layer_progress();
+    LOG(INFO) << "prefetcher: consume prefetch layer progress at layer " << layer_id << " done " << progress_idx;
+  }
 
   if (metas->is_encoder_layer(layer_id)) {
     std::vector<uint8_t> needed_mask(metas->num_expert, 0);
@@ -743,16 +825,17 @@ void PrefetchMngr::one_moe_layer_done(int layer_id) {
       case kDecodeCumsum:
       case kLastUseDistance:
       case kWeighedDecodeCumsum: {
-        prefetch_generation += 1;
-        fetch_schedule_thread->generation_start_task.generation = prefetch_generation;
-        fetch_schedule_thread->generation_start_task.decoder_warmup_action = DecoderWarmupAction::kPreserve;
-        auto handler = fetch_schedule_thread->add_one_task(&fetch_schedule_thread->generation_start_task);
+        forward_epoch += 1;
+        fetch_schedule_thread->forward_epoch_start_task.forward_epoch = forward_epoch;
+        fetch_schedule_thread->forward_epoch_start_task.generate_epoch = generate_epoch;
+        fetch_schedule_thread->forward_epoch_start_task.decoder_warmup_action = DecoderWarmupAction::kPreserve;
+        auto handler = fetch_schedule_thread->add_one_task(&fetch_schedule_thread->forward_epoch_start_task);
         fetch_schedule_thread->wait_progress(handler);
         break;
       }
       default: { break; }
     }
-    predict_thread->on_one_iter_done(prefetch_generation);
+    predict_thread->on_one_iter_done(forward_epoch, generate_epoch);
     // predict_thread->add_one_task();
   }
 }
@@ -766,6 +849,7 @@ void PrefetchMngr::report_one_expert(int layer_id, int expert_id) {
   if (metas->early_preempt == false || current_status != kLaunching) {
     PreemptOneExpertTask task;
     task.layer_id = layer_id;
+    task.generate_epoch = generate_epoch;
     task.expert_id = expert_id;
     auto handler = fetch_schedule_thread->add_one_task(&task);
     fetch_schedule_thread->wait_progress(handler);
@@ -812,8 +896,8 @@ void PrefetchMngr::mark_expert_using(int layer_id, int expert_id) {
 
 void PrefetchMngr::launch_thread() {
   this->reload_env();
-  predict_thread->on_one_iter_done(prefetch_generation);
-  predict_thread->on_moe_layer_logits_recorded(metas->num_layer, prefetch_generation);
+  predict_thread->on_one_iter_done(forward_epoch, generate_epoch);
+  predict_thread->on_moe_layer_logits_recorded(metas->num_layer, forward_epoch, generate_epoch);
 
   fetch_schedule_thread->launch();
   predict_thread->launch();
@@ -985,33 +1069,35 @@ void PrefetchMngr::report_moe_attn_logits(int layer_id, torch::Tensor attn_logit
   if (layer_id == 0 &&
       (metas->predict_input_mode == kFirstMoeAttnInputLogits ||
        metas->predict_input_mode == kMoeAttnInputLogits)) {
-    prefetch_generation += 1;
-    fetch_schedule_thread->generation_start_task.generation = prefetch_generation;
-    fetch_schedule_thread->generation_start_task.decoder_warmup_action = DecoderWarmupAction::kPreserve;
-    auto handler = fetch_schedule_thread->add_one_task(&fetch_schedule_thread->generation_start_task);
+    forward_epoch += 1;
+    fetch_schedule_thread->forward_epoch_start_task.forward_epoch = forward_epoch;
+    fetch_schedule_thread->forward_epoch_start_task.generate_epoch = generate_epoch;
+    fetch_schedule_thread->forward_epoch_start_task.decoder_warmup_action = DecoderWarmupAction::kPreserve;
+    auto handler = fetch_schedule_thread->add_one_task(&fetch_schedule_thread->forward_epoch_start_task);
     fetch_schedule_thread->wait_progress(handler);
   }
   LOG_BLOCK(DEBUG, logger, {
     logger << "prefetch mngr, report_moe_attn_logits " << layer_id << ", " << attn_logits.sizes();
   });
   predictor->record_moe_attn_logits(layer_id, attn_logits);
-  predict_thread->on_moe_attn_input_logits_recorded(layer_id, prefetch_generation);
+  predict_thread->on_moe_attn_input_logits_recorded(layer_id, forward_epoch, generate_epoch);
 }
 
 void PrefetchMngr::report_moe_layer_logits(int layer_id, torch::Tensor layer_logits) {
   NVTX_RANGE("hook/report_moe_layer_logits L" + std::to_string(layer_id));
   if (layer_id == 0 && metas->predict_input_mode == kMoeLayerLogits) {
-    prefetch_generation += 1;
-    fetch_schedule_thread->generation_start_task.generation = prefetch_generation;
-    fetch_schedule_thread->generation_start_task.decoder_warmup_action = DecoderWarmupAction::kPreserve;
-    auto handler = fetch_schedule_thread->add_one_task(&fetch_schedule_thread->generation_start_task);
+    forward_epoch += 1;
+    fetch_schedule_thread->forward_epoch_start_task.forward_epoch = forward_epoch;
+    fetch_schedule_thread->forward_epoch_start_task.generate_epoch = generate_epoch;
+    fetch_schedule_thread->forward_epoch_start_task.decoder_warmup_action = DecoderWarmupAction::kPreserve;
+    auto handler = fetch_schedule_thread->add_one_task(&fetch_schedule_thread->forward_epoch_start_task);
     fetch_schedule_thread->wait_progress(handler);
   }
   LOG_BLOCK(INFO, logger, {
     logger << "prefetch mngr, report_moe_layer_logits " << layer_id << ", " << layer_logits.sizes();
   });
   predictor->record_moe_layer_logits(layer_id, layer_logits);
-  predict_thread->on_moe_layer_logits_recorded(layer_id, prefetch_generation);
+  predict_thread->on_moe_layer_logits_recorded(layer_id, forward_epoch, generate_epoch);
   if (layer_id == 0) {
     auto seq_len = layer_logits.size(1);
     profiler->push(TimeProfiler::kSeqLen, seq_len);
@@ -1062,8 +1148,8 @@ void FetchScheduleWorker::do_one_task_impl(FetchScheduleTaskBase *task) {
       do_one_task_impl(dynamic_cast<PreemptTask *>(task));
       break;
     }
-    case FetchScheduleTaskBase::kGenerationStart: {
-      do_one_task_impl(dynamic_cast<GenerationStartTask *>(task));
+    case FetchScheduleTaskBase::kForwardEpochStart: {
+      do_one_task_impl(dynamic_cast<ForwardEpochStartTask *>(task));
       break;
     }
     case FetchScheduleTaskBase::kFetchDone: {
@@ -1082,15 +1168,22 @@ void FetchScheduleWorker::do_one_task_impl(FetchScheduleTaskBase *task) {
       do_one_task_impl(dynamic_cast<PreemptOneExpertTask*>(task));
       break;
     }
+    case FetchScheduleTaskBase::kReset: {
+      do_one_task_impl(dynamic_cast<ResetTask*>(task));
+      break;
+    }
     default: {
       CHECK(false) << "unknown task type " << task->task_type;
     }
   }
 }
 void FetchScheduleWorker::do_one_task_impl(PreemptTask *task) {
+  CHECK(!(task->generate_epoch != current_generate_epoch))
+      << "stale generate task: task_generate_epoch=" << task->generate_epoch
+      << ", current_generate_epoch=" << current_generate_epoch;
   TRACE_EVENT_GURAD(kFetchScheduler, "do preempt");
   NVTX_RANGE("sched/preempt_layer L" + std::to_string(task->layer_idx) + " N" + std::to_string(task->num_expert));
-  advance_actual_layer(task->generation, task->layer_idx);
+  advance_actual_layer(task->forward_epoch, task->layer_idx);
   if (metas->reorder_experts) {
     this->reorder_experts(task->layer_idx, task->expert_idxs, task->num_expert);
   }
@@ -1107,11 +1200,32 @@ void FetchScheduleWorker::do_one_task_impl(PreemptTask *task) {
   }
   drain_reclaimable_updates();
 }
-void FetchScheduleWorker::do_one_task_impl(GenerationStartTask *task) {
-  CHECK(task == &this->generation_start_task);
-  start_generation(task->generation, task->decoder_warmup_action);
+void FetchScheduleWorker::do_one_task_impl(ForwardEpochStartTask *task) {
+  CHECK(task == &this->forward_epoch_start_task);
+  current_generate_epoch = task->generate_epoch;
+  start_forward_epoch(task->forward_epoch, task->decoder_warmup_action);
+}
+void FetchScheduleWorker::do_one_task_impl(ResetTask *task) {
+  CHECK(task == &this->reset_task);
+  reset_requested.store(true, std::memory_order_release);
+  current_task.expert = nullptr;
+  clear_all_job_queues();
+  clear_decoder_warmup_queue();
+  reset_pending_reclaimable_updates();
+  current_layer = -1;
+  current_forward_epoch = task->next_forward_epoch;
+  current_generate_epoch = task->next_generate_epoch;
+  set_phase(kEncoderPhase);
+  if (task->action == DecoderWarmupAction::kRebuildForGenerateStart) {
+    rebuild_decoder_warmup_queue();
+    reset_requested.store(false, std::memory_order_release);
+    add_one_task(&idle_task);
+  }
 }
 void FetchScheduleWorker::do_one_task_impl(PreemptOneExpertTask *task) {
+  CHECK(!(task->generate_epoch != current_generate_epoch))
+      << "stale generate task: task_generate_epoch=" << task->generate_epoch
+      << ", current_generate_epoch=" << current_generate_epoch;
   TRACE_EVENT_GURAD(kFetchScheduler, "do preempt one expert");
   NVTX_RANGE("sched/preempt_one L" + std::to_string(task->layer_id) + " E" + std::to_string(task->expert_id));
   this->preempt_one_expert(task->layer_id, task->expert_id);
@@ -1136,6 +1250,9 @@ void FetchScheduleWorker::init(ModuleMeta *metas, ModelLoader *model_loader,
   this->add_one_task(&this->idle_task);
 }
 void FetchScheduleWorker::do_one_task_impl(FetchDoneTask *_) {
+  CHECK(!(current_task.generate_epoch != current_generate_epoch))
+      << "stale generate task: task_generate_epoch=" << current_task.generate_epoch
+      << ", current_generate_epoch=" << current_generate_epoch;
   TRACE_EVENT_GURAD(kFetchScheduler, "one fetch done " + current_task.toString());
   LOG(TRACE) << "scheduler: received one fetch job done " << current_task.toString();
   current_task.expert->num_ready = current_task.stop_mem_buf_idx;
@@ -1152,6 +1269,13 @@ void FetchScheduleWorker::do_one_task_impl(FetchDoneTask *_) {
 }
 void FetchScheduleWorker::do_one_task_impl(IdleTask *idle_task) {
   CHECK(idle_task == &this->idle_task);
+  if (reset_requested.load(std::memory_order_acquire)) {
+    return;
+  }
+  if (current_task.expert != nullptr) {
+    this->add_one_task(&this->idle_task);
+    return;
+  }
   bool found = false, sent = false;
   pop_next_task(current_task, found);
   if (found) {
@@ -1165,23 +1289,26 @@ void FetchScheduleWorker::do_one_task_impl(IdleTask *idle_task) {
 }
 
 void FetchScheduleWorker::do_one_task_impl(PrefetchLayerTask *task) {
+  CHECK(!(task->generate_epoch != current_generate_epoch))
+      << "stale generate task: task_generate_epoch=" << task->generate_epoch
+      << ", current_generate_epoch=" << current_generate_epoch;
   TRACE_EVENT_GURAD(kFetchScheduler, "add task for layer " + std::to_string(task->layer_idx) + "[" + array_to_str(task->expert_idxs, task->num_expert) + "]");
   NVTX_RANGE("sched/prefetch_layer L" + std::to_string(task->layer_idx) +
              " N" + std::to_string(task->num_expert) +
-             " G" + std::to_string(task->generation));
+             " forward_epoch=" + std::to_string(task->forward_epoch));
   LOG(TRACE) << "scheduler: do PrefetchLayerTask, add prefetch task for layer " << task->layer_idx;
-  if (is_stale_prefetch(task->generation, task->layer_idx)) {
+  if (is_stale_prefetch(task->forward_epoch, task->layer_idx)) {
     LOG(TRACE) << "scheduler: drop stale prefetch layer " << task->layer_idx
-               << ", task generation " << task->generation
-               << ", current generation " << current_generation
+               << ", task forward_epoch " << task->forward_epoch
+               << ", current forward_epoch " << current_forward_epoch
                << ", current layer " << current_layer;
     return;
   }
 
   if (per_layer_job_queues[task->layer_idx].empty() == false) {
     LOG(TRACE) << "scheduler: replace queued prefetch layer " << task->layer_idx
-               << ", task generation " << task->generation
-               << ", current generation " << current_generation
+               << ", task forward_epoch " << task->forward_epoch
+               << ", current forward_epoch " << current_forward_epoch
                << ", current layer " << current_layer;
     per_layer_job_queues[task->layer_idx].clear();
   }
@@ -1201,14 +1328,17 @@ void FetchScheduleWorker::do_one_task_impl(PrefetchLayerTask *task) {
     //   continue;
     // }
     if (metas->chunk_prefetch) {
-      add_separate_tasks_for_one_expert(task->layer_idx, task->expert_idxs[i], &per_layer_job_queues[task->layer_idx], 0, metas->num_per_expert_param, false, task->generation, kCacheRequestPrefetch);
+      add_separate_tasks_for_one_expert(task->layer_idx, task->expert_idxs[i], &per_layer_job_queues[task->layer_idx], 0, metas->num_per_expert_param, false, task->forward_epoch, kCacheRequestPrefetch);
     } else {
-      add_single_tasks_for_one_expert(task->layer_idx, task->expert_idxs[i], &per_layer_job_queues[task->layer_idx], 0, metas->num_per_expert_param, false, task->generation, kCacheRequestPrefetch);
+      add_single_tasks_for_one_expert(task->layer_idx, task->expert_idxs[i], &per_layer_job_queues[task->layer_idx], 0, metas->num_per_expert_param, false, task->forward_epoch, kCacheRequestPrefetch);
     }
   }
 }
 
 bool FetchScheduleWorker::send_one_job(CopyTask *task) {
+  CHECK(!(task->generate_epoch != current_generate_epoch))
+      << "stale generate task: task_generate_epoch=" << task->generate_epoch
+      << ", current_generate_epoch=" << current_generate_epoch;
   TRACE_EVENT_GURAD(kFetchScheduler, "send:" + task->toString());
   NVTX_RANGE("sched/send L" + std::to_string(task->expert->layer_idx) +
              " E" + std::to_string(task->expert->expert_idx) +
@@ -1220,13 +1350,13 @@ bool FetchScheduleWorker::send_one_job(CopyTask *task) {
              " E" + std::to_string(task->expert->expert_idx) +
              " P" + std::to_string(task->start_mem_buf_idx) +
              "-" + std::to_string(task->stop_mem_buf_idx) +
-             " G" + std::to_string(task->generation));
+             " forward_epoch=" + std::to_string(task->forward_epoch));
   LOG(TRACE) << "scheduler: send one prefetch task " << task->toString();
 
   if (task->is_precise == false && task->expert != nullptr &&
-      is_stale_prefetch(task->generation, task->expert->layer_idx)) {
+      is_stale_prefetch(task->forward_epoch, task->expert->layer_idx)) {
     LOG(TRACE) << "scheduler: skip stale prefetch copy " << task->toString()
-               << ", current generation " << current_generation
+               << ", current forward_epoch " << current_forward_epoch
                << ", current layer " << current_layer;
     return false;
   }
@@ -1266,6 +1396,13 @@ bool FetchScheduleWorker::send_one_job(CopyTask *task) {
     } else if (task->expert->num_ready > task->start_mem_buf_idx) {
       LOG(TRACE) << "scheduler: a duplicated task is partially done, skip duplicated part: " << task->toString();
       task->start_mem_buf_idx = task->expert->num_ready;
+    } else if (task->expert->num_ready < task->start_mem_buf_idx) {
+      LOG(TRACE) << "scheduler: a stale partial task was reset before launch: " << task->toString();
+      if (task->is_precise) {
+        task->start_mem_buf_idx = task->expert->num_ready;
+      } else {
+        return false;
+      }
     } else {
       CHECK(task->expert->num_ready == task->start_mem_buf_idx);
     }

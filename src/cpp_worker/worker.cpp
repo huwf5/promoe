@@ -5,6 +5,10 @@
 #include "nvtx_utils.hpp"
 
 void PredictWorker::do_one_task_impl(PredictJob job) {
+  const int64_t current_generate_epoch = this->current_generate_epoch.load(std::memory_order_acquire);
+  CHECK(!(job.generate_epoch != current_generate_epoch))
+      << "stale generate task: task_generate_epoch=" << job.generate_epoch
+      << ", current_generate_epoch=" << current_generate_epoch;
   TRACE_EVENT_GURAD(kPredictor, "predict thread " + std::to_string(job.input_layer_id));
   NVTX_RANGE("predict/thread L" + std::to_string(job.input_layer_id));
 
@@ -57,7 +61,8 @@ void PredictWorker::do_one_task_impl(PredictJob job) {
         LOG(INFO) << "predict worker: add layer task now " << layer_idx;
         PrefetchLayerTask task;
         task.layer_idx   = layer_idx;
-        task.generation  = job.generation;
+        task.forward_epoch = job.forward_epoch;
+        task.generate_epoch = job.generate_epoch;
         task.expert_idxs = pred_result.top_experts(inner_l);
         if (layer_idx == 0 && metas->limit_layer_0_num_predict != -1) {
           task.num_expert = std::min<int>(per_layer_num_expert, metas->limit_layer_0_num_predict);
@@ -67,7 +72,7 @@ void PredictWorker::do_one_task_impl(PredictJob job) {
         std::string nvtx_range_name = "predict/submit_prefetch_layer inL" + std::to_string(job.input_layer_id) +
                                       " outL" + std::to_string(layer_idx) +
                                       " N" + std::to_string(task.num_expert) +
-                                      " G" + std::to_string(job.generation);
+                                      " forward_epoch=" + std::to_string(job.forward_epoch);
         if (NvtxDetailEnabled()) {
           nvtx_range_name += " experts=[" + array_to_str(task.expert_idxs, task.num_expert) + "]";
         }
@@ -148,23 +153,25 @@ void PredictWorker::add_prefetch_layer_budget() {
   LOG(DEBUG) << "predict worker: add prefetch layer budget";
   prefetch_layer_budget.push(0);
 }
-void PredictWorker::on_one_iter_done(int64_t generation) {
+void PredictWorker::on_one_iter_done(int64_t forward_epoch, int64_t generate_epoch) {
   LOG(DEBUG) << "predict workers, one iter done";
+  current_generate_epoch.store(generate_epoch, std::memory_order_release);
   switch (metas->predict_input_mode) {
     // case kNoPredict:               { break; }
-    case kNoPredict:                { add_one_task(PredictJob(0, generation)); break; }
-    case kOneToken:                { add_one_task(PredictJob(0, generation)); break; }
-    case kDecodeCumsum:            { add_one_task(PredictJob(0, generation)); break; }
-    case kLastUseDistance:         { add_one_task(PredictJob(0, generation)); break; }
-    case kWeighedDecodeCumsum:     { add_one_task(PredictJob(0, generation)); break; }
+    case kNoPredict:                { add_one_task(PredictJob(0, forward_epoch, generate_epoch)); break; }
+    case kOneToken:                { add_one_task(PredictJob(0, forward_epoch, generate_epoch)); break; }
+    case kDecodeCumsum:            { add_one_task(PredictJob(0, forward_epoch, generate_epoch)); break; }
+    case kLastUseDistance:         { add_one_task(PredictJob(0, forward_epoch, generate_epoch)); break; }
+    case kWeighedDecodeCumsum:     { add_one_task(PredictJob(0, forward_epoch, generate_epoch)); break; }
     case kFirstMoeAttnInputLogits: { break; }
     case kMoeAttnInputLogits:      { break; }
     case kMoeLayerLogits:          { break; }
     default: { CHECK(false) << "Unknown predict input mode"; }
   }
 }
-void PredictWorker::on_moe_attn_input_logits_recorded(int layer_id, int64_t generation) {
+void PredictWorker::on_moe_attn_input_logits_recorded(int layer_id, int64_t forward_epoch, int64_t generate_epoch) {
   LOG(DEBUG) << "predict workers, on_moe_attn_input_logits_recorded " << layer_id;
+  current_generate_epoch.store(generate_epoch, std::memory_order_release);
   switch (metas->predict_input_mode) {
     case kNoPredict:               { break; }
     case kOneToken:                { break;}
@@ -172,13 +179,13 @@ void PredictWorker::on_moe_attn_input_logits_recorded(int layer_id, int64_t gene
     case kLastUseDistance:         { break;}
     case kWeighedDecodeCumsum:     { break;}
     case kFirstMoeAttnInputLogits: {
-      if (layer_id == 0) { add_one_task(PredictJob(0, generation)); }
+      if (layer_id == 0) { add_one_task(PredictJob(0, forward_epoch, generate_epoch)); }
       break;
     }
     case kMoeAttnInputLogits:      {
       if (predictor->layer_predict_enabled(layer_id)) {
       // if (layer_id % metas->layer_predict_interval == 0) {
-        add_one_task(PredictJob(layer_id, generation));
+        add_one_task(PredictJob(layer_id, forward_epoch, generate_epoch));
       }
       break;
     }
@@ -186,8 +193,9 @@ void PredictWorker::on_moe_attn_input_logits_recorded(int layer_id, int64_t gene
     default: { CHECK(false) << "Unknown predict input mode"; }
   }
 }
-void PredictWorker::on_moe_layer_logits_recorded(int layer_id, int64_t generation) {
+void PredictWorker::on_moe_layer_logits_recorded(int layer_id, int64_t forward_epoch, int64_t generate_epoch) {
   LOG(DEBUG) << "predict workers, on_moe_layer_logits_recorded " << layer_id;
+  current_generate_epoch.store(generate_epoch, std::memory_order_release);
   switch (metas->predict_input_mode) {
     case kNoPredict:               { break; }
     case kOneToken:                { break;}
@@ -198,7 +206,7 @@ void PredictWorker::on_moe_layer_logits_recorded(int layer_id, int64_t generatio
     case kMoeAttnInputLogits:      { break;}
     case kMoeLayerLogits:          {
       if (predictor->layer_predict_enabled(layer_id)) {
-        add_one_task(PredictJob(layer_id, generation));
+        add_one_task(PredictJob(layer_id, forward_epoch, generate_epoch));
       }
       break;
     }
