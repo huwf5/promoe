@@ -897,7 +897,6 @@ void PrefetchMngr::mark_expert_using(int layer_id, int expert_id) {
 void PrefetchMngr::launch_thread() {
   this->reload_env();
   predict_thread->on_one_iter_done(forward_epoch, generate_epoch);
-  predict_thread->on_moe_layer_logits_recorded(metas->num_layer, forward_epoch, generate_epoch);
 
   fetch_schedule_thread->launch();
   predict_thread->launch();
@@ -1066,7 +1065,7 @@ void PrefetchMngr::set_compute_stream(int64_t stream) {
 
 void PrefetchMngr::report_moe_attn_logits(int layer_id, torch::Tensor attn_logits) {
   NVTX_RANGE("hook/report_moe_attn_logits L" + std::to_string(layer_id));
-  if (layer_id == 0 &&
+  if (layer_id == metas->first_decoder_layer() &&
       (metas->predict_input_mode == kFirstMoeAttnInputLogits ||
        metas->predict_input_mode == kMoeAttnInputLogits)) {
     forward_epoch += 1;
@@ -1085,7 +1084,7 @@ void PrefetchMngr::report_moe_attn_logits(int layer_id, torch::Tensor attn_logit
 
 void PrefetchMngr::report_moe_layer_logits(int layer_id, torch::Tensor layer_logits) {
   NVTX_RANGE("hook/report_moe_layer_logits L" + std::to_string(layer_id));
-  if (layer_id == 0 && metas->predict_input_mode == kMoeLayerLogits) {
+  if (layer_id == metas->first_decoder_layer() && metas->predict_input_mode == kMoeLayerLogits) {
     forward_epoch += 1;
     fetch_schedule_thread->forward_epoch_start_task.forward_epoch = forward_epoch;
     fetch_schedule_thread->forward_epoch_start_task.generate_epoch = generate_epoch;
@@ -1098,7 +1097,7 @@ void PrefetchMngr::report_moe_layer_logits(int layer_id, torch::Tensor layer_log
   });
   predictor->record_moe_layer_logits(layer_id, layer_logits);
   predict_thread->on_moe_layer_logits_recorded(layer_id, forward_epoch, generate_epoch);
-  if (layer_id == 0) {
+  if (layer_id == metas->first_decoder_layer()) {
     auto seq_len = layer_logits.size(1);
     profiler->push(TimeProfiler::kSeqLen, seq_len);
   }

@@ -23,7 +23,7 @@ void PredictWorker::do_one_task_impl(PredictJob job) {
     auto num_predicted_layers = pred_result.num_output_layer();
     CHECK(pred_result.num_output_expert() == metas->num_expert || pred_result.num_output_expert() == 0);
     if (metas->cache_policy == "nn" && pred_result.num_output_expert() > 0) {
-      cache->update_priority(pred_result.prob, pred_result.start_output_layer_id);
+      cache->update_priority(pred_result.prob, pred_result.global_start_output_layer_id());
     }
     pred_result.rank_experts(metas->num_predict_expert_per_layer);
 
@@ -32,7 +32,7 @@ void PredictWorker::do_one_task_impl(PredictJob job) {
     });
     LOG_BLOCK(DEBUG, logger, {
       for (int l_in_slice = 0; l_in_slice < num_predicted_layers; l_in_slice++) {
-        int layer_idx = pred_result.start_output_layer_id + l_in_slice;
+        int layer_idx = pred_result.inner_l_to_outer_l(l_in_slice);
         logger << "predicted expert" << layer_idx << ":" << tensor_to_str(pred_result.experts[l_in_slice]) << "\n";
       }
     });
@@ -42,10 +42,14 @@ void PredictWorker::do_one_task_impl(PredictJob job) {
       size_t per_layer_num_expert = pred_result.num_top_experts();
       for (int inner_l = 0; inner_l < num_predicted_layers; inner_l++) {
         int layer_idx = pred_result.inner_l_to_outer_l(inner_l);
+        CHECK(layer_idx >= 0 && layer_idx < metas->num_layer)
+            << "predicted output layer out of global cache range: " << layer_idx;
         precision_profiler->record_predicted_experts(layer_idx, pred_result.top_experts(inner_l), per_layer_num_expert);
       }
       for (int inner_l = 0; inner_l < num_predicted_layers; inner_l++) {
         int layer_idx = pred_result.inner_l_to_outer_l(inner_l);
+        CHECK(layer_idx >= 0 && layer_idx < metas->num_layer)
+            << "predicted output layer out of global cache range: " << layer_idx;
         {
           LOG(INFO) << "predict worker: add layer task " << layer_idx << ", wait for budget";
           TRACE_EVENT_GURAD(kPredictor, "wait for budget " + std::to_string(layer_idx));
@@ -64,7 +68,7 @@ void PredictWorker::do_one_task_impl(PredictJob job) {
         task.forward_epoch = job.forward_epoch;
         task.generate_epoch = job.generate_epoch;
         task.expert_idxs = pred_result.top_experts(inner_l);
-        if (layer_idx == 0 && metas->limit_layer_0_num_predict != -1) {
+        if (layer_idx == metas->first_decoder_layer() && metas->limit_layer_0_num_predict != -1) {
           task.num_expert = std::min<int>(per_layer_num_expert, metas->limit_layer_0_num_predict);
         } else {
           task.num_expert  = per_layer_num_expert;
@@ -85,7 +89,7 @@ void PredictWorker::do_one_task_impl(PredictJob job) {
         }
       }
     }
-    if (pred_result.inner_l_to_outer_l(num_predicted_layers) == metas->num_layer) {
+    if (pred_result.global_stop_output_layer_id() == metas->num_layer) {
       predictor->end_of_one_token_prediction();
     }
   }

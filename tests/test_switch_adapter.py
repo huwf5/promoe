@@ -48,7 +48,7 @@ def test_get_model_adapter_returns_switch_adapter_for_switch_config():
     assert isinstance(adapter, SwitchAdapter)
 
 
-def test_switch_layer_mapping_uses_global_cache_layers_and_stage_local_predictor_layers():
+def test_switch_layer_mapping_uses_global_cache_and_predictor_layers():
     adapter = SwitchAdapter(SimpleNamespace(config=_switch_config()), "google/switch-base-128")
 
     assert adapter.encoder_sparse_layer_ids == [1, 3, 5, 7, 9, 11]
@@ -57,8 +57,8 @@ def test_switch_layer_mapping_uses_global_cache_layers_and_stage_local_predictor
     assert adapter.global_layer_id("encoder", 5) == 5
     assert adapter.global_layer_id("decoder", 0) == 6
     assert adapter.global_layer_id("decoder", 5) == 11
-    assert adapter.predictor_layer_id("decoder", 6) == 0
-    assert adapter.predictor_layer_id("decoder", 11) == 5
+    assert adapter.predictor_input_id_before_layer("decoder", 6) == 6
+    assert adapter.predictor_input_id_after_layer("decoder", 11) == 12
 
 
 def test_switch_layer_mapping_is_config_driven_for_other_expert_counts():
@@ -134,13 +134,16 @@ def test_default_and_switch_adapters_expose_required_inject_fields():
     assert adapter.expert_meta_parser("decoder.block.1.layer.2.mlp.experts.expert_0") == (6, 0)
 
 
-def test_switch_predictor_reporting_skips_encoder_and_maps_decoder_layer():
+def test_switch_predictor_reporting_skips_encoder_and_uses_global_decoder_layer():
     adapter = SwitchAdapter(SimpleNamespace(config=_switch_config()), "google/switch-base-128")
 
     assert adapter.should_report_moe_layer_to_predictor("encoder", 0) is False
     assert adapter.should_report_moe_layer_to_predictor("decoder", 6) is True
-    assert adapter.report_layer_id_for_predictor("decoder", 6) == 0
-    assert adapter.report_layer_id_for_predictor("decoder", 11) == 5
+    assert adapter.should_report_predictor_pre_forward("decoder", 6) is True
+    assert adapter.should_report_predictor_pre_forward("decoder", 7) is False
+    assert adapter.predictor_input_id_before_layer("decoder", 6) == 6
+    assert adapter.predictor_input_id_after_layer("decoder", 6) == 7
+    assert adapter.predictor_input_id_after_layer("decoder", 11) == 12
 
 
 def test_switch_adapter_can_skip_report_experts_patch_for_modules_without_method():
@@ -209,13 +212,12 @@ def test_switch_sparse_mlp_forward_uses_report_experts_returned_order():
     assert output[0].shape == (1, 4, 2)
 
 
-def test_switch_configures_decoder_stage_local_predictor_meta():
+def test_switch_configures_global_predictor_meta():
     adapter = SwitchAdapter(SimpleNamespace(config=_switch_config()), "google/switch-base-128")
     meta = SimpleNamespace(
         num_encoder_moe_layer=0,
         num_decoder_moe_layer=-1,
         predictor_num_layer=-1,
-        predictor_layer_offset=0,
         layer_predict_replace_first_input_with_last_output=True,
     )
 
@@ -223,8 +225,7 @@ def test_switch_configures_decoder_stage_local_predictor_meta():
 
     assert meta.num_encoder_moe_layer == 6
     assert meta.num_decoder_moe_layer == 6
-    assert meta.predictor_num_layer == 6
-    assert meta.predictor_layer_offset == 6
+    assert meta.predictor_num_layer == 12
     assert meta.layer_predict_replace_first_input_with_last_output is False
 
 

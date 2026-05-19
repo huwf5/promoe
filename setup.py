@@ -1,7 +1,11 @@
+import multiprocessing
 import os
 
 from setuptools import setup
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
+
+# Default to all logical CPUs unless MAX_JOBS is already set externally.
+os.environ.setdefault("MAX_JOBS", str(multiprocessing.cpu_count()))
 
 _REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 

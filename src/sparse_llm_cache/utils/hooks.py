@@ -225,29 +225,49 @@ class MoeLayerHook(ModelHook):
   def _should_report(self, module):
     if self.adapter is None:
       return True
+    # check if is in decoder stage
     return self.adapter.should_report_moe_layer_to_predictor(
       getattr(module, "_stage", None),
       module._layer_id,
     )
 
-  # _report_layer_id is used to get the layer id for the moe layer.
-  def _report_layer_id(self, module):
+  def _should_report_pre_forward(self, module):
+    if self.adapter is None:
+      return module._layer_id == 0
+    return self.adapter.should_report_predictor_pre_forward(
+      getattr(module, "_stage", None),
+      module._layer_id,
+    )
+
+  def _input_id_before_layer(self, module):
     if self.adapter is None:
       return module._layer_id
-    return self.adapter.report_layer_id_for_predictor(
+    return self.adapter.predictor_input_id_before_layer(
+      getattr(module, "_stage", None),
+      module._layer_id,
+    )
+
+  def _input_id_after_layer(self, module):
+    if self.adapter is None:
+      return module._layer_id + 1
+    return self.adapter.predictor_input_id_after_layer(
       getattr(module, "_stage", None),
       module._layer_id,
     )
 
   def pre_forward(self, module, *args, **kwargs):
-    if self._should_report(module) and self._report_layer_id(module) == 0:
-      self.prefetch_mngr.report_moe_layer_logits(0, self.extract_logits_from_input(*args, **kwargs))
+    if self._should_report(module) and self._should_report_pre_forward(module):
+      self.prefetch_mngr.report_moe_layer_logits(
+        self._input_id_before_layer(module),
+        self.extract_logits_from_input(*args, **kwargs),
+      )
     return args, kwargs
   def post_forward(self, module, output):
     if self._should_report(module):
-      report_layer_id = self._report_layer_id(module)
-      # report the logits for the next moe layer
-      self.prefetch_mngr.report_moe_layer_logits(report_layer_id + 1, self.extract_logits_from_output(output))
+      self.prefetch_mngr.report_moe_layer_logits(
+        self._input_id_after_layer(module),
+        self.extract_logits_from_output(output),
+      )
       self.prefetch_mngr.one_moe_layer_done(module._layer_id)
     return output
   # def detach_hook(self, module):

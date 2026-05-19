@@ -6,41 +6,49 @@
 #include "utils.hpp"
 #include "nvtx_utils.hpp"
 
+nlohmann::json load_global_predictor_outputs(const std::string &model_path) {
+  const std::string metas_path = model_path + "/metas.json";
+  std::ifstream meta_file(metas_path);
+  CHECK(meta_file.good()) << "Predictor directory must contain global v2 metas.json: " << metas_path;
+  nlohmann::json predictor_meta = nlohmann::json::parse(meta_file);
+  meta_file.close();
+  CHECK(predictor_meta.value("schema_version", 1) == 2)
+      << "Predictor metas.json must use schema_version 2 global ids";
+  CHECK(predictor_meta.value("id_space", std::string("")) == "global")
+      << "Predictor metas.json must use global id_space";
+  CHECK(predictor_meta.contains("outputs") && predictor_meta["outputs"].is_object())
+      << "Predictor metas.json missing global outputs";
+  return predictor_meta["outputs"];
+}
+
+
 std::vector<std::pair<int, int>> build_predict_layer_mapping(ModuleMeta * metas) {
-  std::vector<int> layers_to_predict;
-  for (int l = 0; l < metas->predictor_num_layer; l+= metas->layer_predict_interval) {
-    layers_to_predict.push_back(l);
-  }
+  std::vector<std::pair<int, int>> ret(metas->num_layer + 1, {0, 0});
+  const int first_decoder = metas->first_decoder_layer();
 
-  std::vector<int> predict_layers(metas->predictor_num_layer + 1, 0);
+  for (int src = 0; src <= metas->num_layer; src++) {
+    if (src < first_decoder) {
+      ret[src] = {0, 0};
+      continue;
+    }
 
-  int stop_l = 0;
-  for (auto l : layers_to_predict) {
-    auto window = metas->layer_predict_max_window;
-    if (l == 0 && metas->limit_layer_0_window != -1) {
+    bool enabled = true;
+    if (src < metas->num_layer) {
+      enabled = ((src - first_decoder) % metas->layer_predict_interval) == 0;
+    }
+    if (!enabled) {
+      ret[src] = {0, 0};
+      continue;
+    }
+
+    // if src is the last layer, the start is the first decoder layer, otherwise it is src
+    const int start = (src == metas->num_layer) ? first_decoder : src;
+    int window = metas->layer_predict_max_window;
+    if (src == first_decoder && metas->limit_layer_0_window != -1) {
       window = metas->limit_layer_0_window;
     }
-    predict_layers[l] = stop_l;
-    predict_layers[l + 1] = (l % metas->predictor_num_layer) + window;
-    predict_layers[l + 1] = std::min(predict_layers[l + 1], metas->predictor_num_layer);
-    stop_l = predict_layers[l + 1];
-  }
-
-  for (int l = 1; l <= metas->predictor_num_layer; l++) {
-    if (predict_layers[l] < predict_layers[l - 1]) {
-      predict_layers[l] = predict_layers[l - 1];
-    }
-  }
-
-  std::vector<std::pair<int, int>> ret(metas->predictor_num_layer + 1, {0, 0});
-  for (int l = 0; l < metas->predictor_num_layer; l++) {
-    ret[l] = {predict_layers[l], predict_layers[l + 1]};
-  }
-
-  if (metas->layer_predict_replace_first_input_with_last_output) {
-    CHECK(metas->predict_input_mode == kMoeLayerLogits);
-    ret[metas->predictor_num_layer] = ret[0];
-    ret[0] = {0, 0};
+    const int stop = std::min(start + window, metas->num_layer);
+    ret[src] = {start, stop};
   }
 
   return ret;
@@ -277,66 +285,70 @@ void LegacyPredictor::load_model_from(std::string model_path) {
   }
   struct stat path_stat;
   auto stat_ret = stat(model_path.c_str(), &path_stat);
-  CHECK(stat_ret == 0) << "Model file not found: " << model_path;
-  if (S_ISREG(path_stat.st_mode)) {
-    load_one_model(model_path, 0);
-    CHECK(predict_models.size() == 1);
-    predict_models[0] = PredictModel();
-    predict_models[0].orig_output_start_layer = 0;
-    predict_models[0].orig_output_stop_layer = metas->num_layer;
-  } else if (S_ISDIR(path_stat.st_mode)) {
-    DIR *dir = opendir(model_path.c_str());
-    CHECK(dir != nullptr) << "Failed to open directory: " << model_path;
-    struct dirent *entry;
-    while ((entry = readdir(dir)) != nullptr) {
-      if (entry->d_name == std::string(".") || entry->d_name == std::string("..") || entry->d_name == std::string("train_log")) {
-        continue;
-      }
-      std::string name(entry->d_name);
-      std::string file_name_without_ext = std::string(entry->d_name).substr(0, name.find_last_of("."));
-      std::string file_ext = std::string(entry->d_name).substr(name.find_last_of(".") + 1);
-      if (file_ext == "pt") {
-        LOG(TRACE) << "Loading model: " << name << " " << file_name_without_ext;
-        uint64_t model_id = std::stoull(file_name_without_ext);
-        if (predict_models.find(model_id) == predict_models.end()) {
-          predict_models[model_id] = PredictModel();
-        }
-        load_one_model(model_path + "/" + name, model_id);
-      } else if (file_ext == "json") {
-        LOG(ERROR) << "Loading json: " << name;
-        std::ifstream trace_file(model_path + "/" + name);
-        nlohmann::json output_layers_list = nlohmann::json::parse(trace_file);
-        trace_file.close();
-        for (auto &el : output_layers_list.items()) {
-          uint64_t model_id = std::stoull(el.key());
-          if (predict_models.find(model_id) == predict_models.end()) {
-            predict_models[model_id] = PredictModel();
-          }
-          predict_models[model_id].orig_output_start_layer = el.value()[0].get<int>();
-          predict_models[model_id].orig_output_stop_layer  = el.value()[1].get<int>();
-        }
-      }
+  CHECK(stat_ret == 0) << "Model path not found: " << model_path;
+  CHECK(S_ISDIR(path_stat.st_mode))
+      << "Predictor model path must be a directory with global v2 metas.json: " << model_path;
+
+  auto output_layers = load_global_predictor_outputs(model_path);
+
+  DIR *dir = opendir(model_path.c_str());
+  CHECK(dir != nullptr) << "Failed to open directory: " << model_path;
+  struct dirent *entry;
+  while ((entry = readdir(dir)) != nullptr) {
+    if (entry->d_name == std::string(".") || entry->d_name == std::string("..") || entry->d_name == std::string("train_log")) {
+      continue;
     }
-    closedir(dir);
-  } else {
-    CHECK(false) << "Model path is not a regular file or directory: "
-                 << model_path;
+    std::string name(entry->d_name);
+    std::string file_name_without_ext = std::string(entry->d_name).substr(0, name.find_last_of("."));
+    std::string file_ext = std::string(entry->d_name).substr(name.find_last_of(".") + 1);
+    if (file_ext == "pt") {
+      LOG(TRACE) << "Loading model: " << name << " " << file_name_without_ext;
+      uint64_t model_id = std::stoull(file_name_without_ext);
+      if (predict_models.find(model_id) == predict_models.end()) {
+        predict_models[model_id] = PredictModel();
+      }
+      load_one_model(model_path + "/" + name, model_id);
+    }
+  }
+  closedir(dir);
+
+  for (auto &el : output_layers.items()) {
+    uint64_t model_id = std::stoull(el.key());
+    int start_l = el.value()[0].get<int>();
+    int stop_l = el.value()[1].get<int>();
+    if (start_l == stop_l && predict_models.find(model_id) == predict_models.end()) {
+      predict_models[model_id] = PredictModel();
+    } else {
+      CHECK(predict_models.find(model_id) != predict_models.end())
+          << "No legacy predictor model file for global source layer " << model_id;
+    }
+    predict_models[model_id].orig_output_start_layer = start_l;
+    predict_models[model_id].orig_output_stop_layer  = stop_l;
   }
 
-  auto predict_layers = build_predict_layer_mapping(metas.get());
+  auto runtime_predict_layers = build_predict_layer_mapping(metas.get());
 
-  for (int l = 0; l < metas->predictor_num_layer + 1; l++) {
-    CHECK(predict_models.find(l) != predict_models.end()) << "No model meta for layer " << l;
+  for (int l = 0; l <= metas->num_layer; l++) {
+    CHECK(runtime_predict_layers[l].first <= runtime_predict_layers[l].second)
+        << "Invalid predict layer range: " << runtime_predict_layers[l].first << " " << runtime_predict_layers[l].second;
+    if (predict_models.find(l) == predict_models.end()) {
+      predict_models[l] = PredictModel();
+      predict_models[l].orig_output_start_layer = runtime_predict_layers[l].first;
+      predict_models[l].orig_output_stop_layer = runtime_predict_layers[l].first;
+    }
     auto &model = predict_models[l];
-    CHECK(predict_layers[l].first <= predict_layers[l].second) << "Invalid predict layer range: " << predict_layers[l].first << " " << predict_layers[l].second;
-    if (predict_layers[l].first == predict_layers[l].second) {
+    const int slice_start_layer = std::max(model.orig_output_start_layer, runtime_predict_layers[l].first);
+    const int slice_stop_layer = std::min(model.orig_output_stop_layer, runtime_predict_layers[l].second);
+    if (slice_start_layer >= slice_stop_layer) {
       model.slice_start = 0;
       model.slice_stop = 0;
     } else {
-      CHECK(model.orig_output_start_layer <= predict_layers[l].first) << "Invalid predict layer range: " << predict_layers[l].first << " " << predict_layers[l].second;
-      CHECK(model.orig_output_stop_layer >= predict_layers[l].second) << "Invalid predict layer range: " << predict_layers[l].first << " " << predict_layers[l].second;
-      model.slice_start = predict_layers[l].first - model.orig_output_start_layer;
-      model.slice_stop = predict_layers[l].second - model.orig_output_start_layer;
+      CHECK(model.orig_output_start_layer <= slice_start_layer)
+          << "Invalid predict layer range: " << slice_start_layer << " " << slice_stop_layer;
+      CHECK(model.orig_output_stop_layer >= slice_stop_layer)
+          << "Invalid predict layer range: " << slice_start_layer << " " << slice_stop_layer;
+      model.slice_start = slice_start_layer - model.orig_output_start_layer;
+      model.slice_stop = slice_stop_layer - model.orig_output_start_layer;
     }
     LOG(ERROR) << "predict model " << l << ", "
                << "orig [" << model.orig_output_start_layer << ":" << model.orig_output_stop_layer << "], "
@@ -344,8 +356,10 @@ void LegacyPredictor::load_model_from(std::string model_path) {
                << "into [" << model.output_layer_start() << ":" << model.output_layer_stop() << "]";
   }
 }
-
 bool LegacyPredictor::layer_predict_enabled(int layer_id) {
+  if (layer_id < 0 || layer_id > metas->num_layer) {
+    return false;
+  }
   if (predict_models.find(layer_id) == predict_models.end()) {
     return false;
   }
@@ -430,7 +444,13 @@ void LegacyPredictor::record_moe_attn_logits(int layer_id, torch::Tensor attn_lo
     case kMoeAttnInputLogits: {
       CHECK(attn_logits.dim() == 3) << "input logits must be in shape [num_batch, seq_len, num_expert]";
       CHECK(attn_logits.size(0) == 1) << "batch > 1 not supported";
-      if (layer_id % metas->layer_predict_interval != 0) {
+      const int first_decoder = metas->first_decoder_layer();
+      if (layer_id < first_decoder || layer_id > metas->num_layer) {
+        LOG(DEBUG) << "predictor, skip record due to non-decoder boundary";
+        moe_attn_input_logits_buffer_list[layer_id] = torch::empty({0});
+        break;
+      }
+      if (layer_id < metas->num_layer && ((layer_id - first_decoder) % metas->layer_predict_interval != 0)) {
         LOG(DEBUG) << "predictor, skip record due to interval";
         moe_attn_input_logits_buffer_list[layer_id] = torch::empty({0});
         break;
@@ -469,7 +489,7 @@ void LegacyPredictor::record_moe_layer_logits(int layer_id, torch::Tensor layer_
     case kFirstMoeAttnInputLogits: { break; }
     case kMoeAttnInputLogits:      { break; }
     case kMoeLayerLogits: {
-      CHECK(layer_logits.dim() == 3) << "input logits must be in shape [num_batch, seq_len, num_expert], but found " << layer_logits.sizes();
+      CHECK(layer_logits.dim() == 3) << "moe layer predictor input must be in shape [num_batch, seq_len, feature_dim], but found " << layer_logits.sizes();
       // CHECK(layer_logits.size(0) == 1) << "batch > 1 not supported";
       if (layer_logits.size(1) == 0) {
         LOG(ERROR) << "predictor, skip record due to empty";
@@ -481,17 +501,23 @@ void LegacyPredictor::record_moe_layer_logits(int layer_id, torch::Tensor layer_
         moe_layer_logits_buffer_list[layer_id] = torch::empty({0});
         break;
       }
-      if ((layer_id % metas->num_layer) % metas->layer_predict_interval != 0) {
+      const int first_decoder = metas->first_decoder_layer();
+      if (layer_id < first_decoder || layer_id > metas->num_layer) {
+        LOG(DEBUG) << "predictor, skip record due to non-decoder boundary";
+        moe_layer_logits_buffer_list[layer_id] = torch::empty({0});
+        break;
+      }
+      if (layer_id < metas->num_layer && ((layer_id - first_decoder) % metas->layer_predict_interval != 0)) {
         LOG(DEBUG) << "predictor, skip record due to interval";
         moe_layer_logits_buffer_list[layer_id] = torch::empty({0});
         break;
       }
-      if (metas->layer_predict_replace_first_input_with_last_output && layer_id == 0) {
+      if (metas->layer_predict_replace_first_input_with_last_output && layer_id == metas->first_decoder_layer()) {
         LOG(DEBUG) << "predictor, skip record due to replace_first_input_with_last_output";
         moe_layer_logits_buffer_list[layer_id] = torch::empty({0});
         break;
       }
-      LOG(DEBUG) << "predictor, record attn logits";
+      LOG(DEBUG) << "predictor, record moe layer logits";
       moe_layer_logits_buffer_list[layer_id] = torch::empty_like(layer_logits, layer_logits.options().device(torch::kCPU).pinned_memory(true));
       {
         NVTX_RANGE("logits/layer_d2h L" + std::to_string(layer_id) + " bytes=" + std::to_string(layer_logits.nbytes()));
@@ -519,7 +545,7 @@ void LegacyPredictor::slice_predict_output_layer(PredictOutput &output) {
     logger << "predict worker: predict " << output.input_layer_id << " " << output.prob.sizes() << ", slice it with [" << p_m_metas.slice_start << ":" << p_m_metas.slice_stop << "]";
   });
   output.slice_layer(p_m_metas.slice_start, p_m_metas.slice_stop);
-  CHECK(output.start_output_layer_id == p_m_metas.output_layer_start());
+  CHECK(output.predictor_start_output_layer_id() == p_m_metas.output_layer_start());
 }
 
 PredictOutput SepPredictor::predict(int input_layer_id) {
@@ -539,15 +565,16 @@ PredictOutput SepPredictor::predict(int input_layer_id) {
       return PredictOutput::empty(metas->num_layer, input_layer_id, -1);
     }
     case kMoeLayerLogits: {
-      input = this->moe_layer_logits_buffer_list[input_layer_id];
-      if (input.numel() == 0) {
-        LOG(DEBUG) << "skip prediction due to prefill";
-        return PredictOutput::empty(predict_models[input_layer_id].num_output_layer(), input_layer_id, predict_models[input_layer_id].enabled_output_layers[0]);
+      auto logits_it = this->moe_layer_logits_buffer_list.find(input_layer_id);
+      if (logits_it == this->moe_layer_logits_buffer_list.end() || !logits_it->second.defined() || logits_it->second.numel() == 0) {
+        LOG(DEBUG) << "skip prediction due to missing or empty logits";
+        return PredictOutput::empty(
+          predict_models[input_layer_id].num_output_layer(),
+          input_layer_id,
+          predict_models[input_layer_id].enabled_output_layers[0]
+        );
       }
-      if (predict_models[input_layer_id].num_output_layer() == 0) {
-        LOG(ERROR) << "skip prediction due to empty output layers";
-        return PredictOutput::empty(predict_models[input_layer_id].num_output_layer(), input_layer_id, predict_models[input_layer_id].enabled_output_layers[0]);
-      }
+      input = logits_it->second;
       LOG_BLOCK(DEBUG, logger, {
         logger << "predictor, predict with input shape " << input.sizes() << " " << input.numel();
       });
@@ -607,18 +634,19 @@ PredictOutput SepPredictor::predict_one_job(int input_layer_id, int job_idx) {
       return PredictOutput::empty(1, input_layer_id, -1);
     }
     case kMoeLayerLogits: {
-      if (this->moe_layer_logits_buffer_list[input_layer_id].dtype() != torch::kFloat32) {
-        this->moe_layer_logits_buffer_list[input_layer_id] = this->moe_layer_logits_buffer_list[input_layer_id].to(torch::kFloat32);
-      }
-      input = this->moe_layer_logits_buffer_list[input_layer_id];
-      if (input.numel() == 0) {
-        LOG(DEBUG) << "skip prediction due to prefill";
+      auto logits_it = this->moe_layer_logits_buffer_list.find(input_layer_id);
+      if (logits_it == this->moe_layer_logits_buffer_list.end() || !logits_it->second.defined() || logits_it->second.numel() == 0) {
+        LOG(DEBUG) << "skip prediction due to missing or empty logits";
         return PredictOutput::empty(
           1,
           input_layer_id,
-          predict_models[input_layer_id].enabled_output_layers[job_idx] + metas->predictor_layer_offset
+          predict_models[input_layer_id].enabled_output_layers[job_idx]
         );
       }
+      if (logits_it->second.dtype() != torch::kFloat32) {
+        logits_it->second = logits_it->second.to(torch::kFloat32);
+      }
+      input = logits_it->second;
       CHECK(predict_models[input_layer_id].num_output_layer() > 0);
       LOG_BLOCK(DEBUG, logger, {
         logger << "predictor, predict with input shape " << input.sizes() << " " << input.numel();
@@ -651,7 +679,7 @@ PredictOutput SepPredictor::predict_one_job(int input_layer_id, int job_idx) {
   return PredictOutput(
     output,
     input_layer_id,
-    predict_models[input_layer_id].enabled_output_layers[job_idx] + metas->predictor_layer_offset
+    predict_models[input_layer_id].enabled_output_layers[job_idx]
   );
 }
 
@@ -659,17 +687,27 @@ PredictOutput SepPredictor::predict_one_job(int input_layer_id, int job_idx) {
 void SepPredictor::load_model_from(std::string model_path) {
   struct stat path_stat;
   auto stat_ret = stat(model_path.c_str(), &path_stat);
-  CHECK(stat_ret == 0) << "Model file not found: " << model_path;
-  CHECK(S_ISDIR(path_stat.st_mode)) << "Model file is not a directory: " << model_path;
-  // fixme: meta json?
+  CHECK(stat_ret == 0) << "Model path not found: " << model_path;
+  CHECK(S_ISDIR(path_stat.st_mode))
+      << "Predictor model path must be a directory with global v2 metas.json: " << model_path;
 
-  for (int l = 0; l < metas->predictor_num_layer + 1; l++) {
+  for (int l = 0; l <= metas->num_layer; l++) {
     predict_models[l] = PredictSepModel();
   }
   c10::Device cpu_device(c10::DeviceType::CPU);
-  auto predict_layers = build_predict_layer_mapping(metas.get());
-  for (int src_l = 0; src_l < metas->predictor_num_layer + 1; src_l++) {
-    for (int dst_l = predict_layers[src_l].first; dst_l < predict_layers[src_l].second; dst_l++) {
+  auto output_layers = load_global_predictor_outputs(model_path);
+  auto runtime_predict_layers = build_predict_layer_mapping(metas.get());
+  for (auto &el : output_layers.items()) {
+    int src_l = std::stoi(el.key());
+    CHECK(src_l >= 0 && src_l <= metas->num_layer)
+        << "Predictor source layer outside global boundary range: " << src_l;
+    int start_l = el.value()[0].get<int>();
+    int stop_l = el.value()[1].get<int>();
+    CHECK(start_l >= 0 && start_l <= stop_l && stop_l <= metas->num_layer)
+        << "Predictor output range outside global layer range: [" << start_l << ":" << stop_l << ")";
+    const int enabled_start_l = std::max(start_l, runtime_predict_layers[src_l].first);
+    const int enabled_stop_l = std::min(stop_l, runtime_predict_layers[src_l].second);
+    for (int dst_l = enabled_start_l; dst_l < enabled_stop_l; dst_l++) {
       predict_models[src_l].models[dst_l] = torch::jit::load(model_path + "/" + std::to_string(src_l) + "-" + std::to_string(dst_l) + ".pt", cpu_device);
       predict_models[src_l].models[dst_l].eval();
       predict_models[src_l].enabled_output_layers.push_back(dst_l);
@@ -677,7 +715,7 @@ void SepPredictor::load_model_from(std::string model_path) {
     }
 
     LOG(ERROR) << "predict model " << src_l << ", "
-               << " predicts [" << predict_layers[src_l].first << ":" << predict_layers[src_l].second << ")";
+               << " predicts [" << enabled_start_l << ":" << enabled_stop_l << ")";
     // if (predict_models[src_l].enabled_output_layers.size() > 0) {
     //   predict_models[src_l].dtype = get_jit_model_dtype(predict_models[src_l].models[predict_models[src_l].enabled_output_layers[0]]);
     // }
@@ -696,7 +734,7 @@ void SepPredictor::record_moe_layer_logits(int layer_id, torch::Tensor layer_log
     case kFirstMoeAttnInputLogits: { break; }
     case kMoeAttnInputLogits:      { break; }
     case kMoeLayerLogits: {
-      CHECK(layer_logits.dim() == 3) << "input logits must be in shape [num_batch, seq_len, num_expert], but found " << layer_logits.sizes();
+      CHECK(layer_logits.dim() == 3) << "moe layer predictor input must be in shape [num_batch, seq_len, feature_dim], but found " << layer_logits.sizes();
       // CHECK(layer_logits.size(0) == 1) << "batch > 1 not supported";
       if (layer_logits.size(1) == 0) {
         LOG(ERROR) << "predictor, skip record due to empty";
@@ -708,17 +746,23 @@ void SepPredictor::record_moe_layer_logits(int layer_id, torch::Tensor layer_log
         moe_layer_logits_buffer_list[layer_id] = torch::empty({0});
         break;
       }
-      if ((layer_id % metas->predictor_num_layer) % metas->layer_predict_interval != 0) {
+      const int first_decoder = metas->first_decoder_layer();
+      if (layer_id < first_decoder || layer_id > metas->num_layer) {
+        LOG(DEBUG) << "predictor, skip record due to non-decoder boundary";
+        moe_layer_logits_buffer_list[layer_id] = torch::empty({0});
+        break;
+      }
+      if (layer_id < metas->num_layer && ((layer_id - first_decoder) % metas->layer_predict_interval != 0)) {
         LOG(DEBUG) << "predictor, skip record due to interval";
         moe_layer_logits_buffer_list[layer_id] = torch::empty({0});
         break;
       }
-      if (metas->layer_predict_replace_first_input_with_last_output && layer_id == 0) {
+      if (metas->layer_predict_replace_first_input_with_last_output && layer_id == metas->first_decoder_layer()) {
         LOG(DEBUG) << "predictor, skip record due to replace_first_input_with_last_output";
         moe_layer_logits_buffer_list[layer_id] = torch::empty({0});
         break;
       }
-      LOG(DEBUG) << "predictor, record attn logits";
+      LOG(DEBUG) << "predictor, record moe layer logits";
       moe_layer_logits_buffer_list[layer_id] = torch::empty_like(layer_logits, layer_logits.options().device(torch::kCPU).pinned_memory(true));
       {
         NVTX_RANGE("logits/layer_d2h L" + std::to_string(layer_id) + " bytes=" + std::to_string(layer_logits.nbytes()));
@@ -734,13 +778,13 @@ void SepPredictor::record_moe_layer_logits(int layer_id, torch::Tensor layer_log
   }
 }
 SepPredictor::SepPredictor(std::shared_ptr<ModuleMeta> metas) : PredictorBase(metas) {
-  for (int l = 0; l <= metas->predictor_num_layer; l++) {
+  for (int l = 0; l <= metas->num_layer; l++) {
     logits_record_event[l] = 0;
     CUDA_CALL(cudaEventCreateWithFlags(&logits_record_event[l], cudaEventDisableTiming));
   }
 }
 void SepPredictor::reset_sequence_state() {
-  for (int layer_id = 0; layer_id <= metas->predictor_num_layer; layer_id++) {
+  for (int layer_id = 0; layer_id <= metas->num_layer; layer_id++) {
     if (logits_record_event[layer_id] != 0) {
       CUDA_CALL(cudaEventSynchronize(logits_record_event[layer_id]));
     }

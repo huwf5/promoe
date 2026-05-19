@@ -30,7 +30,10 @@ struct PredictOutput {
   int num_output_layer() const { return prob.size(0); }
   int num_output_expert() const { return prob.size(1); }
   int num_top_experts() const { return experts.size(1); }
+  int predictor_start_output_layer_id() const { return start_output_layer_id; }
   int inner_l_to_outer_l(int inner_l) const { return start_output_layer_id + inner_l; }
+  int global_start_output_layer_id() const { return inner_l_to_outer_l(0); }
+  int global_stop_output_layer_id() const { return inner_l_to_outer_l(num_output_layer()); }
   int64_t * top_experts(int inner_l) const { return experts[inner_l].data_ptr<int64_t>(); }
 
   static PredictOutput empty(long num_output_layer, int input_layer_id, int start_output_layer_id) {

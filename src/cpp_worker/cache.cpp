@@ -158,8 +158,8 @@ void CacheMngr::init_gpu_mem_buffer(size_t num_buffers) {
       total_nbytes += cache_line->get_allocation_nbytes();
     }
   }
-  LOG(ERROR) << "cache allocated " << total_nbytes / 1024.0 / 1024.0 << " MiB";
-  LOG(ERROR) << "changing num_predict from " << metas->num_predict_expert_per_layer << " to min(" << metas->num_predict_expert_per_layer << ", " << query_per_layer_cache_len() << ")";
+  LOG(INFO) << "cache allocated " << total_nbytes / 1024.0 / 1024.0 << " MiB";
+  LOG(INFO) << "changing num_predict from " << metas->num_predict_expert_per_layer << " to min(" << metas->num_predict_expert_per_layer << ", " << query_per_layer_cache_len() << ")";
   metas->num_predict_expert_per_layer = std::min<int>(metas->num_predict_expert_per_layer, query_per_layer_cache_len());
 }
 

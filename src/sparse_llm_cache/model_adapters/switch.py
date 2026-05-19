@@ -128,12 +128,21 @@ class SwitchAdapter(ModelAdapter):
 
   def predictor_layer_id(self, stage: str, global_layer_id: int) -> int:
     if stage != "decoder":
-      raise ValueError("encoder predictor is not implemented in this phase")
-    first_decoder_layer = self.num_encoder_sparse_layers
-    last_decoder_layer = first_decoder_layer + self.num_decoder_sparse_layers - 1
-    if global_layer_id < first_decoder_layer or global_layer_id > last_decoder_layer:
-      raise ValueError(f"decoder global layer id must be in [{first_decoder_layer}, {last_decoder_layer}]")
-    return global_layer_id - first_decoder_layer
+      raise ValueError("encoder predictor is not implemented")
+    return global_layer_id
+
+  def should_report_predictor_pre_forward(self, stage: str | None, global_layer_id: int) -> bool:
+    return stage == "decoder" and global_layer_id == self.num_encoder_sparse_layers
+
+  def predictor_input_id_before_layer(self, stage: str | None, global_layer_id: int) -> int:
+    if stage != "decoder":
+      raise ValueError("encoder predictor is not implemented")
+    return global_layer_id
+
+  def predictor_input_id_after_layer(self, stage: str | None, global_layer_id: int) -> int:
+    if stage != "decoder":
+      raise ValueError("encoder predictor is not implemented")
+    return global_layer_id + 1
 
   def parse_expert_meta_from_name(self, name: str) -> tuple[int, int] | None:
     match = re.match(self._EXPERT_NAME_PATTERN, name)
@@ -191,25 +200,48 @@ class SwitchAdapter(ModelAdapter):
       raise FileNotFoundError(f"decoder predictor metas.json does not exist: {metas_path}")
     with metas_path.open() as f:
       metas = json.load(f)
-    required_layers = {str(i) for i in range(self.num_decoder_sparse_layers)}
-    missing = sorted(required_layers - set(metas.keys()), key=int)
+    if not isinstance(metas, dict) or int(metas.get("schema_version", 1)) != 2 or metas.get("id_space") != "global":
+      raise ValueError("Switch decoder predictor requires global v2 metas.json; retrain predictor with global ids")
+    outputs = metas.get("outputs")
+    if not isinstance(outputs, dict):
+      raise ValueError("global v2 predictor metas.json missing outputs")
+
+    first_decoder = self.num_encoder_sparse_layers
+    num_layer = self.num_moe_layer
+    required_sources = {str(i) for i in range(first_decoder, num_layer + 1)}
+    missing = sorted(required_sources - set(outputs.keys()), key=int)
     if missing:
-      raise ValueError(f"decoder predictor metas.json missing stage-local layers: {missing}")
-    global_like_layers = {str(i) for i in range(self.num_encoder_sparse_layers, self.num_moe_layer)}
-    if global_like_layers.issubset(set(metas.keys())):
-      raise ValueError("decoder predictor appears to use global layer ids; expected stage-local ids 0..D-1")
+      raise ValueError(f"global predictor metas.json missing decoder source layers: {missing}")
+
     use_legacy_files = predictor_type == "legacy"
-    for src_layer, span in metas.items():
+    for src_layer, span in outputs.items():
       src_layer_id = int(src_layer)
-      if src_layer_id >= self.num_decoder_sparse_layers:
-        continue
+      if src_layer_id < first_decoder or src_layer_id > num_layer:
+        raise ValueError(
+          f"predictor source id {src_layer_id} outside decoder global boundary range "
+          f"[{first_decoder}, {num_layer}]"
+        )
+      if not isinstance(span, (list, tuple)) or len(span) != 2:
+        raise ValueError(f"global predictor output range for source {src_layer_id} must be [start, stop]")
+      start_layer, stop_layer = int(span[0]), int(span[1])
+      if start_layer < first_decoder or start_layer > stop_layer or stop_layer > num_layer:
+        raise ValueError(
+          f"predictor output range [{start_layer}, {stop_layer}) outside decoder global range "
+          f"[{first_decoder}, {num_layer})"
+        )
+      if start_layer == num_layer and start_layer != stop_layer:
+        raise ValueError(
+          f"predictor output range [{start_layer}, {stop_layer}) outside decoder global range "
+          f"[{first_decoder}, {num_layer})"
+        )
       if use_legacy_files:
+        if start_layer == stop_layer:
+          continue
         model_file = path / f"{src_layer_id}.pt"
         if not model_file.exists():
           raise FileNotFoundError(f"decoder predictor model file does not exist: {model_file}")
         continue
-      start_layer, stop_layer = span
-      for dst_layer_id in range(int(start_layer), int(stop_layer)):
+      for dst_layer_id in range(start_layer, stop_layer):
         model_file = path / f"{src_layer_id}-{dst_layer_id}.pt"
         if not model_file.exists():
           raise FileNotFoundError(f"decoder predictor model file does not exist: {model_file}")
@@ -217,15 +249,14 @@ class SwitchAdapter(ModelAdapter):
   def configure_module_meta(self, meta) -> None:
     meta.num_encoder_moe_layer = self.num_encoder_sparse_layers
     meta.num_decoder_moe_layer = self.num_decoder_sparse_layers
-    meta.predictor_num_layer = self.num_decoder_sparse_layers
-    meta.predictor_layer_offset = self.num_encoder_sparse_layers
+    meta.predictor_num_layer = self.num_moe_layer
     meta.layer_predict_replace_first_input_with_last_output = False
 
   def should_report_moe_layer_to_predictor(self, stage: str | None, global_layer_id: int) -> bool:
     return stage == "decoder"
 
   def report_layer_id_for_predictor(self, stage: str | None, global_layer_id: int) -> int:
-    return self.predictor_layer_id(stage, global_layer_id)
+    return self.predictor_input_id_before_layer(stage, global_layer_id)
 
   def extract_moe_layer_input_for_predictor(self, *args, **kwargs):
     return args[0]

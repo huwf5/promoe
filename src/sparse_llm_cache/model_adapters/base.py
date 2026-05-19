@@ -76,6 +76,15 @@ class ModelAdapter:
   def should_report_moe_layer_to_predictor(self, stage: str | None, global_layer_id: int) -> bool:
     return True
 
+  def should_report_predictor_pre_forward(self, stage: str | None, global_layer_id: int) -> bool:
+    return global_layer_id == 0
+
+  def predictor_input_id_before_layer(self, stage: str | None, global_layer_id: int) -> int:
+    return global_layer_id
+
+  def predictor_input_id_after_layer(self, stage: str | None, global_layer_id: int) -> int:
+    return global_layer_id + 1
+
   def report_layer_id_for_predictor(self, stage: str | None, global_layer_id: int) -> int:
     return global_layer_id
 

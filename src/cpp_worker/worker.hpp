@@ -258,6 +258,15 @@ class AtomicQueue {
       queue_.push(i);
     }
   }
+  void reset(int init_val = 0) {
+    lock();
+    std::queue<int> empty;
+    std::swap(queue_, empty);
+    for (int i = 0; i < init_val; i++) {
+      queue_.push(i);
+    }
+    unlock();
+  }
   void lock() {
     lock_.lock();
   }
@@ -345,9 +354,8 @@ class PredictWorker : public WorkerThread<PredictJob> {
   PrecisionProfiler * precision_profiler;
 
   SemQueue    prefetch_layer_budget;
-  SemQueue    prefetch_layer_progress;
+  AtomicQueue prefetch_layer_progress;
   // AtomicQueue prefetch_layer_budget;
-  // AtomicQueue prefetch_layer_progress;
 
   friend class PrefetchMngr;
  public:

@@ -120,7 +120,6 @@ void ModuleMeta::init_from_map(std::unordered_map<std::string, std::string> conf
 
   predictor_model_path     = optional_str("predictor_model_path", predictor_model_path);
   predictor_num_layer      = optional_int("predictor_num_layer", predictor_num_layer);
-  predictor_layer_offset   = optional_int("predictor_layer_offset", predictor_layer_offset);
   layer_predict_interval   = optional_int("layer_predict_interval",   layer_predict_interval);
   layer_predict_max_window = optional_int("layer_predict_max_window", layer_predict_max_window);
   layer_predict_replace_first_input_with_last_output = optional_bool("layer_predict_replace_first_input_with_last_output", layer_predict_replace_first_input_with_last_output);
@@ -205,7 +204,6 @@ void ModuleMeta::log_configs() {
 
   LOG_CONFIG(predictor_model_path);
   LOG_CONFIG(predictor_num_layer);
-  LOG_CONFIG(predictor_layer_offset);
   LOG_CONFIG(layer_predict_interval);
   LOG_CONFIG(layer_predict_max_window);
   LOG_CONFIG_NAME_BOOL("cross_token_pred", layer_predict_replace_first_input_with_last_output);
