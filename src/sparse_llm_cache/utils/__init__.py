@@ -171,11 +171,15 @@ def _resolve_initial_cache_inputs(
     initial_hot_expert_file,
     per_layer_cache,
 ):
+  hot_policies = ("hot_expert", "hot_encoder_coverage")
   if initial_cache_policy is None:
     if initial_layer_budgets:
       raise ValueError("initial_layer_budgets requires initial_cache_policy=manual")
     if initial_hot_expert_file:
-      raise ValueError("initial_hot_expert_file requires initial_cache_policy=hot_expert")
+      raise ValueError(
+        "initial_hot_expert_file requires initial_cache_policy=hot_expert "
+        "or hot_encoder_coverage"
+      )
     return {
       "initial_cache_policy": None,
       "initial_layer_budgets": None,
@@ -189,19 +193,23 @@ def _resolve_initial_cache_inputs(
       raise ValueError("manual initial cache requires initial_layer_budgets")
     if initial_hot_expert_file:
       raise ValueError("manual initial cache does not use initial_hot_expert_file")
-  elif initial_cache_policy == "hot_expert":
+  elif initial_cache_policy in hot_policies:
     if not initial_hot_expert_file:
-      raise ValueError("hot_expert initial cache requires initial_hot_expert_file")
+      raise ValueError(
+        f"{initial_cache_policy} initial cache requires initial_hot_expert_file"
+      )
     if initial_layer_budgets:
-      raise ValueError("hot_expert initial cache does not use initial_layer_budgets")
+      raise ValueError(
+        f"{initial_cache_policy} initial cache does not use initial_layer_budgets"
+      )
   else:
     raise ValueError(f"unsupported initial_cache_policy={initial_cache_policy!r}")
 
   return {
-    # "hot_expert" is also use "manual" into cpp
+    # Hot policies also use manual initial plan loading in cpp.
     "initial_cache_policy": "manual",
     "initial_layer_budgets": initial_layer_budgets if initial_cache_policy == "manual" else None,
-    "initial_hot_expert_file": initial_hot_expert_file if initial_cache_policy == "hot_expert" else None,
+    "initial_hot_expert_file": initial_hot_expert_file if initial_cache_policy in hot_policies else None,
     "reset_cache_on_generate_start": True,
     "per_layer_cache": False,
   }
@@ -337,6 +345,7 @@ def inject_model(
   print(param_key_list)
   meta.init_param_list(param_key_list)
 
+  requested_initial_cache_policy = initial_cache_policy
   initial_inputs = _resolve_initial_cache_inputs(
     initial_cache_policy,
     initial_layer_budgets,
@@ -356,6 +365,7 @@ def inject_model(
   if initial_hot_expert_file:
     from sparse_llm_cache.utils.hot_experts import (
       build_decoder_warmup_overlap_plan,
+      build_encoder_coverage_initial_plan,
       build_hot_initial_plan,
       format_initial_expert_plan,
     )
@@ -363,11 +373,26 @@ def inject_model(
     initial_total_slots = round_like_cpp(
       effective_cache_rate * int(num_moe_layer) * int(num_expert_per_layer)
     )
-    initial_plan = build_hot_initial_plan(
-      initial_hot_expert_file,
-      adapter,
-      total_slots=initial_total_slots,
-    )
+    if requested_initial_cache_policy == "hot_encoder_coverage":
+      initial_result = build_encoder_coverage_initial_plan(
+        initial_hot_expert_file,
+        adapter,
+        total_slots=initial_total_slots,
+        allow_sequential_fallback=True,
+      )
+      initial_plan = initial_result.plan
+      print(
+        "hot_encoder_coverage initial cache: "
+        f"coverage={initial_result.coverage:.4f}, "
+        f"coverage_slots={initial_result.coverage_slots}, "
+        f"total_slots={len(initial_plan)}"
+      )
+    else:
+      initial_plan = build_hot_initial_plan(
+        initial_hot_expert_file,
+        adapter,
+        total_slots=initial_total_slots,
+      )
     initial_expert_plan = format_initial_expert_plan(initial_plan)
   if enable_decoder_warmup_overlap:
     if not initial_hot_expert_file:

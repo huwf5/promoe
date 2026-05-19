@@ -3,10 +3,16 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, NamedTuple
 
 
 _ROUTER_PATTERN = re.compile(r".*(encoder|decoder)\.block\.(\d+)\.")
+
+
+class EncoderCoverageInitialPlan(NamedTuple):
+  plan: list[tuple[int, int]]
+  coverage: float
+  coverage_slots: int
 
 
 def _router_stage_block(router_key: str) -> tuple[str, int] | None:
@@ -142,6 +148,27 @@ def _encoder_k_coverage_plan(
   return plan
 
 
+def _layer_prefix_for_coverage(
+    pairs: list[tuple[int, int]],
+    token_total: int,
+    coverage: float,
+) -> list[tuple[int, int]]:
+  if coverage <= 0.0:
+    return []
+  if token_total <= 0:
+    token_total = sum(count for _eid, count in pairs)
+  if token_total <= 0:
+    return pairs[:1] if pairs else []
+  selected: list[tuple[int, int]] = []
+  covered = 0
+  for eid, count in pairs:
+    selected.append((eid, count))
+    covered += int(count)
+    if covered / token_total >= coverage:
+      break
+  return selected
+
+
 def _decoder_even_plan(
     by_layer: dict[int, list[tuple[int, int]]],
     adapter,
@@ -229,6 +256,109 @@ def _order_initial_plan_for_encoder_lru(plan: list[tuple[int, int]], adapter) ->
 
   ordered = sorted(indexed, key=sort_key)
   return [(layer_idx, expert_idx) for _idx, layer_idx, expert_idx in ordered]
+
+
+def build_encoder_coverage_initial_plan(
+    hot_expert_file: str | Path,
+    adapter,
+    *,
+    total_slots: int,
+    coverage_step: float = 0.01,
+    allow_sequential_fallback: bool = False,
+) -> EncoderCoverageInitialPlan:
+  total_slots = max(0, int(total_slots))
+  coverage_step = float(coverage_step)
+  if coverage_step <= 0.0 or coverage_step > 1.0:
+    raise ValueError(f"coverage_step must be in (0, 1], got {coverage_step}")
+
+  payload = _read_hot_expert_payload(hot_expert_file)
+  by_layer, token_totals = _hot_pairs_by_layer(payload, adapter, "encoder")
+  if not by_layer:
+    raise ValueError(f"hot expert snapshot has no encoder expert entries: {hot_expert_file}")
+
+  if total_slots <= 0:
+    return EncoderCoverageInitialPlan([], 0.0, 0)
+
+  encoder_capacity = int(adapter.num_encoder_sparse_layers) * int(adapter.num_expert_per_layer)
+  if total_slots > encoder_capacity:
+    raise ValueError(
+      f"encoder capacity {encoder_capacity} is smaller than initial slots {total_slots}"
+    )
+
+  best_coverage = 0.0
+  best_plan: list[tuple[int, int]] = []
+  steps = int(1.0 / coverage_step)
+  coverages = [round(i * coverage_step, 10) for i in range(steps + 1)]
+  if coverages[-1] < 1.0:
+    coverages.append(1.0)
+
+  encoder_layers = [
+    adapter.global_layer_id("encoder", stage_layer)
+    for stage_layer in range(int(adapter.num_encoder_sparse_layers))
+  ]
+
+  for coverage in coverages:
+    candidate: list[tuple[int, int]] = []
+    coverage_possible = True
+    for layer_idx in encoder_layers:
+      prefix = _layer_prefix_for_coverage(
+        by_layer.get(layer_idx, []),
+        int(token_totals.get(layer_idx, 0)),
+        coverage,
+      )
+      if coverage > 0.0 and not prefix:
+        coverage_possible = False
+        break
+      candidate.extend((layer_idx, eid) for eid, _count in prefix)
+    if not coverage_possible:
+      break
+    if len(candidate) <= total_slots:
+      best_coverage = coverage
+      best_plan = candidate
+    else:
+      break
+
+  plan = list(best_plan)
+  seen = set(plan)
+  candidates: list[tuple[int, int, int, int]] = []
+  for layer_idx, pairs in by_layer.items():
+    for rank, (eid, count) in enumerate(pairs):
+      if (layer_idx, eid) in seen:
+        continue
+      candidates.append((int(count), int(layer_idx), int(rank), int(eid)))
+  candidates.sort(key=lambda item: (-item[0], item[1], item[2], item[3]))
+
+  for _count, layer_idx, _rank, eid in candidates:
+    if len(plan) >= total_slots:
+      break
+    item = (layer_idx, eid)
+    if item in seen:
+      continue
+    plan.append(item)
+    seen.add(item)
+
+  if len(plan) < total_slots and allow_sequential_fallback:
+    for stage_layer in range(int(adapter.num_encoder_sparse_layers)):
+      layer_idx = adapter.global_layer_id("encoder", stage_layer)
+      for eid in range(int(adapter.num_expert_per_layer)):
+        if len(plan) >= total_slots:
+          break
+        item = (layer_idx, eid)
+        if item in seen:
+          continue
+        plan.append(item)
+        seen.add(item)
+
+  if len(plan) != total_slots:
+    raise ValueError(
+      f"encoder coverage initial plan has {len(plan)} entries, expected {total_slots}; "
+      "reduce cache_rate or pass allow_sequential_fallback=True"
+    )
+  return EncoderCoverageInitialPlan(
+    _order_initial_plan_for_encoder_lru(plan, adapter),
+    best_coverage,
+    len(best_plan),
+  )
 
 
 def build_encoder_hot_initial_plan(
