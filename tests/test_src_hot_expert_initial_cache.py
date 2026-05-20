@@ -8,6 +8,7 @@ from sparse_llm_cache.model_adapters.switch import SwitchAdapter
 from sparse_llm_cache.utils import inject_model, round_like_cpp
 from sparse_llm_cache.utils.hot_experts import (
   build_decoder_warmup_overlap_plan,
+  build_encoder_balanced_hot_initial_plan,
   build_encoder_coverage_initial_plan,
   build_encoder_hot_initial_plan,
   build_hot_initial_plan,
@@ -255,6 +256,86 @@ def test_build_encoder_coverage_initial_plan_rejects_slots_above_encoder_capacit
   with pytest.raises(ValueError, match="encoder capacity 4 is smaller than initial slots 5"):
     build_encoder_coverage_initial_plan(path, adapter, total_slots=5)
 
+def test_build_encoder_balanced_hot_initial_plan_spreads_slots_by_layer_then_hot_rank(tmp_path):
+  payload = {
+    "expert_usage_summary": {
+      "encoder.block.1.layer.1.mlp.router.classifier": {
+        "top_token_counts": [
+          {"eid": 10, "count": 100},
+          {"eid": 11, "count": 90},
+          {"eid": 12, "count": 80},
+        ],
+      },
+      "encoder.block.3.layer.1.mlp.router.classifier": {
+        "top_token_counts": [
+          {"eid": 20, "count": 1000},
+          {"eid": 21, "count": 10},
+          {"eid": 22, "count": 1},
+        ],
+      },
+    },
+  }
+  path = tmp_path / "hot.json"
+  path.write_text(json.dumps(payload))
+  adapter = SwitchAdapter(SimpleNamespace(config=_switch_config()), "google/switch-base-128")
+
+  plan = build_encoder_balanced_hot_initial_plan(path, adapter, total_slots=4)
+
+  assert plan == [(1, 20), (1, 21), (0, 10), (0, 11)]
+
+
+def test_build_encoder_balanced_hot_initial_plan_assigns_remainder_by_marginal_count(tmp_path):
+  payload = {
+    "expert_usage_summary": {
+      "encoder.block.1.layer.1.mlp.router.classifier": {
+        "top_token_counts": [
+          {"eid": 10, "count": 100},
+          {"eid": 11, "count": 90},
+          {"eid": 12, "count": 80},
+        ],
+      },
+      "encoder.block.3.layer.1.mlp.router.classifier": {
+        "top_token_counts": [
+          {"eid": 20, "count": 1000},
+          {"eid": 21, "count": 10},
+          {"eid": 22, "count": 1},
+        ],
+      },
+    },
+  }
+  path = tmp_path / "hot.json"
+  path.write_text(json.dumps(payload))
+  adapter = SwitchAdapter(SimpleNamespace(config=_switch_config()), "google/switch-base-128")
+
+  plan = build_encoder_balanced_hot_initial_plan(path, adapter, total_slots=5)
+
+  assert plan == [(1, 20), (1, 21), (0, 10), (0, 11), (0, 12)]
+
+
+def test_build_encoder_balanced_hot_initial_plan_can_fill_missing_slots_sequentially(tmp_path):
+  payload = {
+    "expert_usage_summary": {
+      "encoder.block.1.layer.1.mlp.router.classifier": {
+        "top_token_counts": [{"eid": 2, "count": 10}],
+      },
+      "encoder.block.3.layer.1.mlp.router.classifier": {
+        "top_token_counts": [{"eid": 3, "count": 10}],
+      },
+    },
+  }
+  path = tmp_path / "hot.json"
+  path.write_text(json.dumps(payload))
+  adapter = SwitchAdapter(SimpleNamespace(config=_switch_config(num_experts=4)), "google/switch-base-128")
+
+  plan = build_encoder_balanced_hot_initial_plan(
+    path,
+    adapter,
+    total_slots=6,
+    allow_sequential_fallback=True,
+  )
+
+  assert plan == [(1, 3), (1, 0), (1, 1), (0, 2), (0, 0), (0, 1)]
+
 def test_build_hot_initial_plan_uses_encoder_k90_then_even_decoder_slots(tmp_path):
   payload = {
     "expert_usage_summary": {
@@ -439,6 +520,16 @@ def test_runner_util_parses_hot_encoder_coverage_policy():
   ])
 
   assert parsed["initial_cache_policy"] == "hot_encoder_coverage"
+  assert parsed["initial_hot_expert_file"] == "/tmp/hot.json"
+
+
+def test_runner_util_parses_hot_encoder_balanced_coverage_policy():
+  parsed = parse_args([
+    "--initial_cache_policy", "hot_encoder_balanced_coverage",
+    "--initial_hot_expert_file", "/tmp/hot.json",
+  ])
+
+  assert parsed["initial_cache_policy"] == "hot_encoder_balanced_coverage"
   assert parsed["initial_hot_expert_file"] == "/tmp/hot.json"
 
 def test_runner_util_parses_decoder_warmup_overlap_and_scheduler_aware_policy():

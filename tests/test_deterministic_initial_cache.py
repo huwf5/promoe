@@ -148,6 +148,14 @@ def test_resolve_initial_cache_inputs_accepts_hot_encoder_coverage():
   assert "initial_hot_expert_policy" not in hot
   assert hot["per_layer_cache"] is False
 
+def test_resolve_initial_cache_inputs_accepts_hot_encoder_balanced_coverage():
+  hot = _resolve_initial_cache_inputs("hot_encoder_balanced_coverage", None, "/tmp/hot.json", None)
+
+  assert hot["initial_cache_policy"] == "manual"
+  assert hot["initial_hot_expert_file"] == "/tmp/hot.json"
+  assert "initial_hot_expert_policy" not in hot
+  assert hot["per_layer_cache"] is False
+
 def test_adapter_pybind_does_not_expose_internal_initial_cache_knobs():
   adapter_cpp = Path(__file__).resolve().parents[1] / "src" / "cpp_worker" / "adapter.cpp"
   contents = adapter_cpp.read_text()

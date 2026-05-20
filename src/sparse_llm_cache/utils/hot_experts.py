@@ -361,6 +361,138 @@ def build_encoder_coverage_initial_plan(
   )
 
 
+
+
+def _select_hot_prefix_with_fallback(
+    *,
+    layer_idx: int,
+    pairs: list[tuple[int, int]],
+    quota: int,
+    num_experts: int,
+    allow_sequential_fallback: bool,
+) -> list[tuple[int, int]]:
+  selected: list[tuple[int, int]] = []
+  seen_eids = set()
+  for eid, _count in pairs:
+    if len(selected) >= quota:
+      break
+    eid = int(eid)
+    if eid in seen_eids:
+      continue
+    selected.append((int(layer_idx), eid))
+    seen_eids.add(eid)
+  if len(selected) < quota and allow_sequential_fallback:
+    for eid in range(int(num_experts)):
+      if len(selected) >= quota:
+        break
+      if eid in seen_eids:
+        continue
+      selected.append((int(layer_idx), eid))
+      seen_eids.add(eid)
+  return selected
+
+
+def build_encoder_balanced_hot_initial_plan(
+    hot_expert_file: str | Path,
+    adapter,
+    *,
+    total_slots: int,
+    allow_sequential_fallback: bool = False,
+) -> list[tuple[int, int]]:
+  """Build an encoder-only plan with layer-balanced quotas and per-layer hot order.
+
+  This policy spreads the initial cache budget across encoder layers first, then
+  uses the hot ranking inside each layer. Any slots left after equal quotas are
+  assigned by the next marginal token count across layers.
+  """
+  total_slots = max(0, int(total_slots))
+  if total_slots <= 0:
+    return []
+
+  payload = _read_hot_expert_payload(hot_expert_file)
+  by_layer = _encoder_hot_pairs_by_layer(payload, adapter)
+  if not by_layer:
+    raise ValueError(f"hot expert snapshot has no encoder expert entries: {hot_expert_file}")
+
+  encoder_layers = [
+    adapter.global_layer_id("encoder", stage_layer)
+    for stage_layer in range(int(adapter.num_encoder_sparse_layers))
+  ]
+  num_encoder_layers = len(encoder_layers)
+  if num_encoder_layers <= 0:
+    raise ValueError("adapter has no encoder sparse layers")
+  encoder_capacity = num_encoder_layers * int(adapter.num_expert_per_layer)
+  if total_slots > encoder_capacity:
+    raise ValueError(
+      f"encoder capacity {encoder_capacity} is smaller than initial slots {total_slots}"
+    )
+
+  base_quota, extra_slots = divmod(total_slots, num_encoder_layers)
+  plan: list[tuple[int, int]] = []
+  seen = set()
+  selected_per_layer: dict[int, int] = {}
+
+  for layer_idx in encoder_layers:
+    selected = _select_hot_prefix_with_fallback(
+      layer_idx=layer_idx,
+      pairs=by_layer.get(layer_idx, []),
+      quota=base_quota,
+      num_experts=int(adapter.num_expert_per_layer),
+      allow_sequential_fallback=allow_sequential_fallback,
+    )
+    if len(selected) != base_quota:
+      raise ValueError(
+        f"balanced hot initial plan layer {layer_idx} has {len(selected)} entries, "
+        f"expected base quota {base_quota}; pass allow_sequential_fallback=True"
+      )
+    for item in selected:
+      plan.append(item)
+      seen.add(item)
+    selected_per_layer[layer_idx] = len(selected)
+
+  candidates: list[tuple[int, int, int, int]] = []
+  for layer_idx in encoder_layers:
+    pairs = by_layer.get(layer_idx, [])
+    for rank, (eid, count) in enumerate(pairs):
+      item = (layer_idx, int(eid))
+      if item in seen:
+        continue
+      candidates.append((int(count), int(layer_idx), int(rank), int(eid)))
+  candidates.sort(key=lambda item: (-item[0], item[1], item[2], item[3]))
+
+  for _count, layer_idx, _rank, eid in candidates:
+    if extra_slots <= 0:
+      break
+    item = (layer_idx, eid)
+    if item in seen:
+      continue
+    plan.append(item)
+    seen.add(item)
+    selected_per_layer[layer_idx] = selected_per_layer.get(layer_idx, 0) + 1
+    extra_slots -= 1
+
+  if extra_slots > 0 and allow_sequential_fallback:
+    for layer_idx in encoder_layers:
+      for eid in range(int(adapter.num_expert_per_layer)):
+        if extra_slots <= 0:
+          break
+        item = (layer_idx, eid)
+        if item in seen:
+          continue
+        plan.append(item)
+        seen.add(item)
+        selected_per_layer[layer_idx] = selected_per_layer.get(layer_idx, 0) + 1
+        extra_slots -= 1
+      if extra_slots <= 0:
+        break
+
+  if len(plan) != total_slots:
+    raise ValueError(
+      f"balanced hot initial plan has {len(plan)} entries, expected {total_slots}; "
+      "reduce cache_rate or pass allow_sequential_fallback=True"
+    )
+  return _order_initial_plan_for_encoder_lru(plan, adapter)
+
 def build_encoder_hot_initial_plan(
     hot_expert_file: str | Path,
     adapter,
