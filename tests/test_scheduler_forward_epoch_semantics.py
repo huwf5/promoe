@@ -127,3 +127,77 @@ def test_reset_and_load_initial_cache_still_rebuilds_for_generate_start():
 
     assert "void reset_and_load_initial_cache() { reset_for_generate(); }" in hpp
     assert "DecoderWarmupAction::kRebuildForGenerateStart" in body
+
+
+def test_forward_epoch_boundary_filters_prefetch_queues_by_task_epoch():
+    cpp = _read(PREFETCHER_CPP)
+    hpp = _read(PREFETCHER_HPP)
+
+    assert "void clear_stale_prefetch_queues_before_epoch(int64_t min_forward_epoch)" in hpp
+    body = _function_body(
+        cpp,
+        "void FetchScheduleWorker::clear_stale_prefetch_queues_before_epoch",
+    )
+    assert "for (auto& queue : per_layer_job_queues)" in body
+    assert "TaskQueue kept" in body
+    assert "CopyTask task = queue.front()" in body
+    assert "queue.pop()" in body
+    assert "task.forward_epoch >= min_forward_epoch" in body
+    assert "kept.push(task)" in body
+    assert "queue.clear()" in body
+    assert "queue.push(task)" in body
+    assert body.index("kept.push(task)") < body.rindex("queue.push(task)")
+    assert "precise_job_queue" not in body
+
+
+def test_normal_forward_epoch_advance_preserves_future_prefetch_tasks():
+    cpp = _read(PREFETCHER_CPP)
+    body = _function_body(cpp, "void FetchScheduleWorker::start_forward_epoch")
+    boundary = _text_between(
+        body,
+        "if (forward_epoch > current_forward_epoch)",
+        "switch (decoder_warmup_action)",
+    )
+
+    assert "clear_stale_prefetch_queues_before_epoch(current_forward_epoch)" in boundary
+    assert "precise_job_queue.clear()" in boundary
+    assert "clear_all_job_queues()" not in boundary
+
+
+def test_reset_still_discards_all_prefetch_and_precise_work():
+    cpp = _read(PREFETCHER_CPP)
+    body = _function_body(cpp, "void FetchScheduleWorker::do_one_task_impl(ResetTask *task)")
+
+    assert "clear_all_job_queues()" in body
+    assert "clear_stale_prefetch_queues_before_epoch" not in body
+
+
+def test_cross_token_prediction_paths_advance_epoch_before_submit():
+    cpp = _read(PREFETCHER_CPP)
+
+    attn_body = _function_body(cpp, "void PrefetchMngr::report_moe_attn_logits")
+    attn_bump_pos = attn_body.index("forward_epoch += 1")
+    attn_submit_pos = attn_body.index(
+        "predict_thread->on_moe_attn_input_logits_recorded(layer_id, forward_epoch, generate_epoch)"
+    )
+    assert attn_bump_pos < attn_submit_pos
+
+    layer_body = _function_body(cpp, "void PrefetchMngr::report_moe_layer_logits")
+    layer_bump_pos = layer_body.index("forward_epoch += 1")
+    layer_submit_pos = layer_body.index(
+        "predict_thread->on_moe_layer_logits_recorded(layer_id, predict_forward_epoch, generate_epoch)"
+    )
+    layer_bump_guard = layer_body[layer_body.rindex("if", 0, layer_bump_pos):layer_bump_pos]
+    assert layer_bump_pos < layer_submit_pos
+    assert "metas->predict_input_mode == kMoeLayerLogits" in layer_bump_guard
+    assert "layer_id == metas->first_decoder_layer()" in layer_bump_guard
+    assert "layer_id == metas->num_layer" not in layer_bump_guard
+    assert "predict_forward_epoch = forward_epoch + 1" in layer_body
+    next_token_pos = layer_body.index("predict_forward_epoch = forward_epoch + 1")
+    assert next_token_pos < layer_submit_pos
+
+    last_body = _function_body(cpp, "void PrefetchMngr::one_moe_layer_done")
+    bump_pos = last_body.index("forward_epoch += 1")
+    submit_pos = last_body.index("predict_thread->on_one_iter_done(forward_epoch, generate_epoch)")
+    assert bump_pos < submit_pos
+

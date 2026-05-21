@@ -113,6 +113,26 @@ void FetchScheduleWorker::clear_all_prefetch_queues() {
   }
 }
 
+void FetchScheduleWorker::clear_stale_prefetch_queues_before_epoch(
+    int64_t min_forward_epoch) {
+  for (auto& queue : per_layer_job_queues) {
+    TaskQueue kept;
+    while (!queue.empty()) {
+      CopyTask task = queue.front();
+      queue.pop();
+      if (task.forward_epoch >= min_forward_epoch) {
+        kept.push(task);
+      }
+    }
+    queue.clear();
+    while (!kept.empty()) {
+      CopyTask task = kept.front();
+      kept.pop();
+      queue.push(task);
+    }
+  }
+}
+
 void FetchScheduleWorker::clear_all_job_queues() {
   clear_all_prefetch_queues();
   precise_job_queue.clear();
@@ -394,7 +414,8 @@ void FetchScheduleWorker::start_forward_epoch(
   if (forward_epoch > current_forward_epoch) {
     current_forward_epoch = forward_epoch;
     current_layer = -1;
-    clear_all_job_queues();
+    clear_stale_prefetch_queues_before_epoch(current_forward_epoch);
+    precise_job_queue.clear();
   }
   switch (decoder_warmup_action) {
     case DecoderWarmupAction::kPreserve: {
@@ -1084,19 +1105,24 @@ void PrefetchMngr::report_moe_attn_logits(int layer_id, torch::Tensor attn_logit
 
 void PrefetchMngr::report_moe_layer_logits(int layer_id, torch::Tensor layer_logits) {
   NVTX_RANGE("hook/report_moe_layer_logits L" + std::to_string(layer_id));
+  int64_t predict_forward_epoch = forward_epoch;
   if (layer_id == metas->first_decoder_layer() && metas->predict_input_mode == kMoeLayerLogits) {
     forward_epoch += 1;
+    predict_forward_epoch = forward_epoch;
     fetch_schedule_thread->forward_epoch_start_task.forward_epoch = forward_epoch;
     fetch_schedule_thread->forward_epoch_start_task.generate_epoch = generate_epoch;
     fetch_schedule_thread->forward_epoch_start_task.decoder_warmup_action = DecoderWarmupAction::kPreserve;
     auto handler = fetch_schedule_thread->add_one_task(&fetch_schedule_thread->forward_epoch_start_task);
     fetch_schedule_thread->wait_progress(handler);
+  } else if (layer_id == metas->num_layer && metas->predict_input_mode == kMoeLayerLogits) {
+    // we are at the last layer, so we need to advance the prediction epoch
+    predict_forward_epoch = forward_epoch + 1;
   }
   LOG_BLOCK(INFO, logger, {
     logger << "prefetch mngr, report_moe_layer_logits " << layer_id << ", " << layer_logits.sizes();
   });
   predictor->record_moe_layer_logits(layer_id, layer_logits);
-  predict_thread->on_moe_layer_logits_recorded(layer_id, forward_epoch, generate_epoch);
+  predict_thread->on_moe_layer_logits_recorded(layer_id, predict_forward_epoch, generate_epoch);
   if (layer_id == metas->first_decoder_layer()) {
     auto seq_len = layer_logits.size(1);
     profiler->push(TimeProfiler::kSeqLen, seq_len);

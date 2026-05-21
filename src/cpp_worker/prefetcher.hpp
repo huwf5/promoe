@@ -193,6 +193,7 @@ class FetchScheduleWorker : public WorkerThread<FetchScheduleTaskBase*> {
   void advance_actual_layer(int64_t forward_epoch, int layer_idx);
   void clear_prefetch_queues_up_to_layer(int layer_idx);
   void clear_all_prefetch_queues();
+  void clear_stale_prefetch_queues_before_epoch(int64_t min_forward_epoch);
   void clear_all_job_queues();
   void set_phase(SchedulerPhase next_phase);
   void clear_decoder_warmup_queue();
