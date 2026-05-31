@@ -183,7 +183,7 @@ def test_scheduler_reset_task_is_fifo_barrier_and_clears_only_internal_state():
       "reset_requested.store(true",
       "current_task.expert = nullptr",
       "clear_all_job_queues()",
-      "clear_decoder_warmup_queue()",
+      "clear_decoder_warmup_plan_queue()",
       "reset_pending_reclaimable_updates()",
       "current_forward_epoch = task->next_forward_epoch",
       "current_generate_epoch = task->next_generate_epoch",

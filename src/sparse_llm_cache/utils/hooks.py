@@ -273,6 +273,27 @@ class MoeLayerHook(ModelHook):
   # def detach_hook(self, module):
   #   return super().detach_hook(module)
 
+class ErppEncoderPrefetchHook(ModelHook):
+  no_grad = True
+
+  def __init__(self, prefetch_mngr):
+    self.prefetch_mngr = prefetch_mngr
+    self._attention_mask = None
+
+  def pre_forward(self, module, *args, **kwargs):
+    attention_mask = kwargs.get("attention_mask", None)
+    if attention_mask is None and len(args) > 1:
+      attention_mask = args[1]
+    self._attention_mask = attention_mask
+    return args, kwargs
+
+  def post_forward(self, module, output):
+    hidden = output[0] if isinstance(output, tuple) else output
+    if self._attention_mask is not None:
+      self.prefetch_mngr.report_erpp_encoder_layer0(hidden, self._attention_mask)
+    self._attention_mask = None
+    return output
+
 class TraceEventHook(ModelHook):
   def __init__(self):
     self.trace_guard_stack = []

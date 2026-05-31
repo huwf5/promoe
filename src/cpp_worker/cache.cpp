@@ -1,4 +1,5 @@
 #include <nlohmann/json.hpp>
+#include <cstdlib>
 #include <fstream>
 #include <sstream>
 #include "cache.hpp"
@@ -11,6 +12,17 @@ namespace {
 std::vector<std::shared_ptr<CachePolicy>>& retired_scheduler_aware_policies() {
   static auto* policies = new std::vector<std::shared_ptr<CachePolicy>>();
   return *policies;
+}
+
+bool is_reclaimable_only_request(CacheRequestType request_type) {
+  return request_type == kCacheRequestEncoderPredictorPrefetch ||
+         request_type == kCacheRequestEncoderJitRefill ||
+         request_type == kCacheRequestDecoderWarmupPrefetch;
+}
+
+bool log_prefetch_decision_enabled() {
+  const char* flag = std::getenv("SPARSE_CACHE_LOG_PREFETCH_DECISION");
+  return flag != nullptr && flag[0] != '\0' && flag[0] != '0';
 }
 
 int parse_initial_plan_int(const std::string &value,
@@ -287,6 +299,7 @@ void CacheMngr::reset_cache_contents() {
   size_t ready_count = 0;
   size_t idle_count = 0;
   size_t fetching_count = 0;
+  size_t launching_count = 0;
   for (auto &pair : prefetched_experts) {
     auto expert = pair.first;
     CHECK(expert != nullptr) << "prefetched_experts contains null expert";
@@ -299,7 +312,7 @@ void CacheMngr::reset_cache_contents() {
                 << " num_ready=" << expert->num_ready
                 << " gpu_ptr=" << pair.second;
     }
-    CHECK(status == kReady || status == kIdle || status == kFetching)
+    CHECK(status == kReady || status == kIdle || status == kFetching || status == kLaunching)
         << "cannot reset active expert " << expert->toString()
         << " with status " << status;
     if (status == kReady) {
@@ -308,6 +321,9 @@ void CacheMngr::reset_cache_contents() {
     } else if (status == kFetching) {
       expert->expert_status.transfer(kFetching, kIdle);
       fetching_count += 1;
+    } else if (status == kLaunching) {
+      expert->expert_status.transfer(kLaunching, kIdle);
+      launching_count += 1;
     } else {
       idle_count += 1;
     }
@@ -319,9 +335,11 @@ void CacheMngr::reset_cache_contents() {
             << reset_idx
             << " ready=" << ready_count
             << " idle=" << idle_count
-            << " fetching=" << fetching_count;
+            << " fetching=" << fetching_count
+            << " launching=" << launching_count;
   LOG(INFO) << "cache/reset_cache_contents: clear prefetched_experts begin";
   prefetched_experts.clear();
+  std::fill(encoder_layer_cached_count.begin(), encoder_layer_cached_count.end(), 0);
   LOG(INFO) << "cache/reset_cache_contents: clear prefetched_experts done";
   for (auto &cache_slot : cache_slots->slots) {
     LOG(INFO) << "cache/reset_cache_contents: reset slot begin all_mems="
@@ -380,7 +398,7 @@ void CacheMngr::load_initial_plan_sync(cudaStream_t stream) {
     {
       NVTX_RANGE("cache/load_initial_plan/miss_and_wait");
       Timer timer;
-      auto waiter = miss(expert, false);
+      auto waiter = miss(expert, false, kCacheRequestInitialLoad);
       waiter();
       miss_wait_us += timer.dur_us();
     }
@@ -460,6 +478,7 @@ CacheMngr::CacheMngr(std::shared_ptr<ModuleMeta> metas,
                      std::shared_ptr<ModelLoader> model_loader)
     : metas(metas), model_loader(model_loader), policy_factory() {
   // prefetched_experts.resize(metas->num_layer);
+  encoder_layer_cached_count.assign(metas->num_layer, 0);
 
   if (metas->cache_policy == "nn") {
     this->priority_get_fn = [this](ExpertHandler* e) ->float { return this->priority.index({e->layer_idx, e->expert_idx}).item<float>(); };
@@ -508,6 +527,35 @@ void CacheMngr::handle_hit(ExpertHandler *expert) {}
 void CacheMngr::handle_miss(ExpertHandler *expert) {
   CHECK(false) << "Deprecated";
 }
+
+void CacheMngr::increment_encoder_layer_cached_count(ExpertHandler* expert) {
+  if (expert == nullptr || !metas->is_encoder_layer(expert->layer_idx)) {
+    return;
+  }
+  CHECK(expert->layer_idx >= 0 &&
+        expert->layer_idx < static_cast<int>(encoder_layer_cached_count.size()))
+      << "encoder layer index out of range: " << expert->layer_idx;
+  encoder_layer_cached_count[expert->layer_idx] += 1;
+}
+
+void CacheMngr::decrement_encoder_layer_cached_count(ExpertHandler* expert) {
+  if (expert == nullptr || !metas->is_encoder_layer(expert->layer_idx)) {
+    return;
+  }
+  CHECK(expert->layer_idx >= 0 &&
+        expert->layer_idx < static_cast<int>(encoder_layer_cached_count.size()))
+      << "encoder layer index out of range: " << expert->layer_idx;
+  CHECK(encoder_layer_cached_count[expert->layer_idx] > 0)
+      << "encoder layer cached count underflow for layer " << expert->layer_idx;
+  encoder_layer_cached_count[expert->layer_idx] -= 1;
+}
+
+int CacheMngr::encoder_layer_cache_occupancy(int layer_idx) const {
+  if (layer_idx < 0 || layer_idx >= static_cast<int>(encoder_layer_cached_count.size())) {
+    return 0;
+  }
+  return encoder_layer_cached_count[layer_idx];
+}
 ExpertMemHanlderBase* CacheMngr::evict(ExpertHandler *e_to_evict, ExpertHandler *incoming_e, bool reserve_mem) {
   CHECK(false) << "Deprecated";
   TRACE_EVENT_GURAD(kCache, "evict " + e_to_evict->toString());
@@ -535,6 +583,7 @@ ExpertMemHanlderBase* CacheMngr::evict(ExpertHandler *e_to_evict, ExpertHandler 
   cache_slot->policy->evict(e_to_evict);
   auto ret = prefetched_experts[e_to_evict];
   prefetched_experts.erase(e_to_evict);
+  decrement_encoder_layer_cached_count(e_to_evict);
   CHECK(ret != nullptr);
   e_to_evict->gpu_data = nullptr;
   if (!reserve_mem) {
@@ -545,11 +594,7 @@ ExpertMemHanlderBase* CacheMngr::evict(ExpertHandler *e_to_evict, ExpertHandler 
   return ret;
 }
 void CacheMngr::access(ExpertHandler *expert, bool is_precise) {
-  if (is_in_cache(expert)) {
-    hit(expert, is_precise);
-  } else {
-    miss(expert, is_precise);
-  }
+  CHECK(false) << "Deprecated: CacheMngr::access requires explicit hit/miss with CacheRequestType";
 }
 void CacheMngr::hit(ExpertHandler *expert, bool is_precise) {
   auto cache_slot = cache_slots->to_slot(expert);
@@ -564,8 +609,7 @@ void CacheMngr::hit(ExpertHandler *expert, bool is_precise) {
 }
 
 CacheMngr::CacheLineOccupancyWaiter CacheMngr::miss(ExpertHandler *incoming_e, bool is_precise) {
-  return miss(incoming_e, is_precise,
-              is_precise ? kCacheRequestDemand : kCacheRequestPrefetch);
+  CHECK(false) << "Deprecated: CacheMngr::miss requires CacheRequestType";
 }
 
 CacheMngr::CacheLineOccupancyWaiter CacheMngr::miss(
@@ -585,17 +629,24 @@ CacheMngr::CacheLineOccupancyWaiter CacheMngr::miss(
   }
   CacheLineOccupancyWaiter lambda_to_wait_expert_occupancy = [](){};
   if (cache_slot->unused_mems.size() > 0 &&
-      request_type != kCacheRequestDecoderWarmupOverlap) {
+      (request_type == kCacheRequestEncoderJitRefill ||
+       !is_reclaimable_only_request(request_type))) {
     auto gpu_data = cache_slot->unused_mems.back();
     incoming_e->gpu_data = gpu_data;
     cache_slot->unused_mems.pop_back();
     cache_slot->policy->access_on_miss(incoming_e, is_precise);
     prefetched_experts[incoming_e] = gpu_data;
+    increment_encoder_layer_cached_count(incoming_e);
   } else {
     auto e_to_evict = cache_slot->policy->select_for_evict(incoming_e, request_type);
     if (e_to_evict == nullptr) {
-      CHECK(request_type == kCacheRequestDecoderWarmupOverlap)
-          << "only decoder warmup overlap may skip eviction";
+      CHECK(is_reclaimable_only_request(request_type))
+          << "only reclaimable-only requests may skip eviction";
+      if (log_prefetch_decision_enabled()) {
+        LOG(INFO) << "cache_miss: reclaimable-only request has no victim"
+                  << " request_type=" << request_type
+                  << " incoming=" << incoming_e->toString();
+      }
       return [](){};
     }
     // incoming_e->gpu_data = evict(e_to_evict, incoming_e, true);
@@ -618,7 +669,9 @@ CacheMngr::CacheLineOccupancyWaiter CacheMngr::miss(
       });
       auto gpu_data = prefetched_experts[e_to_evict];
       prefetched_experts.erase(e_to_evict);
+      decrement_encoder_layer_cached_count(e_to_evict);
       prefetched_experts[incoming_e] = gpu_data;
+      increment_encoder_layer_cached_count(incoming_e);
       // kIdle: ?
       // kFetching: ?
       // kReady: ?
@@ -707,6 +760,14 @@ bool CacheMngr::has_reclaimable_encoder() const {
     }
   }
   return false;
+}
+
+
+bool CacheMngr::has_unused_slot_for(ExpertHandler* expert) const {
+  if (expert == nullptr) {
+    return false;
+  }
+  return cache_slots->to_slot(expert)->unused_mems.size() > 0;
 }
 
 CachePolicySchedulerAware::~CachePolicySchedulerAware() {
@@ -848,7 +909,7 @@ bool CachePolicySchedulerAware::has_reclaimable_encoder() const {
 }
 
 ExpertHandler* CachePolicySchedulerAware::select_for_evict(ExpertHandler* incoming) {
-  return select_for_evict(incoming, kCacheRequestPrefetch);
+  CHECK(false) << "Deprecated: scheduler_aware select_for_evict requires CacheRequestType";
 }
 
 ExpertHandler* CachePolicySchedulerAware::select_for_evict(
@@ -857,7 +918,7 @@ ExpertHandler* CachePolicySchedulerAware::select_for_evict(
   if (auto victim = first_loaded_candidate(reclaimable_map, reclaimable_encoder_lru)) {
     return victim;
   }
-  if (request_type == kCacheRequestDecoderWarmupOverlap) {
+  if (is_reclaimable_only_request(request_type)) {
     return nullptr;
   }
   if (auto victim = first_loaded_candidate(encoder_map, encoder_lru)) {

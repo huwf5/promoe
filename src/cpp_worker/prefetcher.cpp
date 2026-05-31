@@ -1,6 +1,11 @@
 #include <omp.h>
+#include <algorithm>
 #include <climits>
+#include <cmath>
 #include <cstdlib>
+#include <sstream>
+#include <tuple>
+#include <cuda_runtime.h>
 #include "prefetcher.hpp"
 #include "profiler.hpp"
 #include "logging.hpp"
@@ -23,6 +28,16 @@ class AtomicQueueLockGuard {
 
 // Set SPARSE_CACHE_LOG_ENCODER_EXPERTS_ON_DECODER_ENTRY=1 to print encoder-side
 // cache occupancy when the scheduler first enters the decoder predictor phase.
+bool log_prefetch_decision_enabled() {
+  const char* flag = std::getenv("SPARSE_CACHE_LOG_PREFETCH_DECISION");
+  return flag != nullptr && flag[0] != '\0' && flag[0] != '0';
+}
+
+bool log_encoder_layer_stats_enabled() {
+  const char* flag = std::getenv("SPARSE_CACHE_LOG_ENCODER_LAYER_STATS");
+  return flag != nullptr && flag[0] != '\0' && flag[0] != '0';
+}
+
 void log_encoder_experts_in_cache_on_decoder_entry(
     ModuleMeta* metas,
     ModelLoader* model_loader,
@@ -108,14 +123,19 @@ bool FetchScheduleWorker::is_stale_prefetch(int64_t forward_epoch, int layer_idx
 }
 
 void FetchScheduleWorker::clear_all_prefetch_queues() {
-  for (auto &queue : per_layer_job_queues) {
+  clear_encoder_jit_state();
+  for (auto& queue : prefetch_queues.encoder_predictor_by_layer) {
     queue.clear();
   }
+  for (auto& queue : prefetch_queues.decoder_predictor_by_layer) {
+    queue.clear();
+  }
+  prefetch_queues.decoder_warmup_plan_queue.clear();
 }
 
 void FetchScheduleWorker::clear_stale_prefetch_queues_before_epoch(
     int64_t min_forward_epoch) {
-  for (auto& queue : per_layer_job_queues) {
+  auto keep_current_epoch = [min_forward_epoch](TaskQueue& queue) {
     TaskQueue kept;
     while (!queue.empty()) {
       CopyTask task = queue.front();
@@ -124,12 +144,18 @@ void FetchScheduleWorker::clear_stale_prefetch_queues_before_epoch(
         kept.push(task);
       }
     }
-    queue.clear();
     while (!kept.empty()) {
       CopyTask task = kept.front();
       kept.pop();
       queue.push(task);
     }
+  };
+
+  for (auto& queue : prefetch_queues.encoder_predictor_by_layer) {
+    keep_current_epoch(queue);
+  }
+  for (auto& queue : prefetch_queues.decoder_predictor_by_layer) {
+    keep_current_epoch(queue);
   }
 }
 
@@ -139,16 +165,12 @@ void FetchScheduleWorker::clear_all_job_queues() {
 }
 
 bool FetchScheduleWorker::is_idle() {
+  // Prefetch work is opportunistic; reset clears stale pending entries.
   if (current_task.expert != nullptr) {
     return false;
   }
   if (!precise_job_queue.empty()) {
     return false;
-  }
-  for (auto &queue : per_layer_job_queues) {
-    if (!queue.empty()) {
-      return false;
-    }
   }
   return true;
 }
@@ -323,6 +345,248 @@ void FetchScheduleWorker::drain_reclaimable_updates(int max_updates) {
   }
 }
 
+bool FetchScheduleWorker::encoder_jit_is_missing(int layer_idx, int expert_idx) const {
+  if (encoder_jit_is_submitted(layer_idx, expert_idx)) {
+    return false;
+  }
+  ExpertHandler* expert = model_loader->get_source(layer_idx, expert_idx);
+  if (cache->is_in_cache(expert) || current_task.expert == expert) {
+    return false;
+  }
+  return true;
+}
+
+bool FetchScheduleWorker::encoder_jit_can_dispatch(const CopyTask& task) const {
+  if (task.request_type != kCacheRequestEncoderJitRefill || task.expert == nullptr) {
+    return true;
+  }
+  if (task.expert->gpu_data != nullptr || cache->has_unused_slot_for(task.expert)) {
+    return true;
+  }
+  return cache->has_reclaimable_encoder();
+}
+
+std::vector<int> FetchScheduleWorker::build_encoder_jit_required_experts(
+    int layer_idx, int occupancy, int floor_value, int low_watermark, int budget) {
+  std::vector<int> required;
+  if (layer_idx < 0 || layer_idx >= static_cast<int>(encoder_jit_rankings.size())) {
+    return required;
+  }
+  const auto& ranking = encoder_jit_rankings[layer_idx];
+  std::vector<uint8_t> selected(metas->num_expert, 0);
+  required.reserve(std::min(
+      metas->num_expert,
+      std::max(0, floor_value - occupancy) + std::max(0, budget)));
+  const bool log_enabled = log_prefetch_decision_enabled();
+
+  auto add_missing = [&](int expert_idx, const char* reason) {
+    if (selected[expert_idx]) {
+      return false;
+    }
+    if (!encoder_jit_is_missing(layer_idx, expert_idx)) {
+      if (log_enabled) {
+        LOG(INFO) << "erpp_encoder_jit_refill: skip target=L" << layer_idx
+                  << " expert=" << expert_idx
+                  << " reason=already_cache_or_pending";
+      }
+      return false;
+    }
+    selected[expert_idx] = 1;
+    required.push_back(expert_idx);
+    if (log_enabled) {
+      LOG(INFO) << "erpp_encoder_jit_refill: select target=L" << layer_idx
+                << " expert=" << expert_idx
+                << " " << reason;
+    }
+    return true;
+  };
+
+  if (occupancy < low_watermark) {
+    int floor_deficit = std::max(0, floor_value - occupancy);
+    for (int expert_idx : ranking) {
+      if (floor_deficit <= 0) {
+        break;
+      }
+      if (add_missing(expert_idx, "reason=floor_deficit")) {
+        floor_deficit -= 1;
+      }
+    }
+  }
+
+  if (metas->enable_erpp_encoder_jit_topk_cover && budget > 0) {
+    const int limit = std::min<int>(budget, ranking.size());
+    for (int rank = 0; rank < limit; rank++) {
+      add_missing(ranking[rank], "reason=topk_cover");
+    }
+  }
+
+  return required;
+}
+
+void FetchScheduleWorker::maybe_enqueue_encoder_jit_refill() {
+  if (!metas->enable_erpp_encoder_jit_refill || phase != kEncoderPhase) {
+    return;
+  }
+  const bool log_enabled = log_prefetch_decision_enabled();
+  if (encoder_jit_rankings.empty()) {
+    if (log_enabled) {
+      LOG(INFO) << "erpp_encoder_jit_refill: skip reason=no_ranking"
+                << " current=L" << current_layer
+                << " forward_epoch=" << current_forward_epoch;
+    }
+    return;
+  }
+  if (encoder_jit_generate_epoch != current_generate_epoch ||
+      encoder_jit_forward_epoch != current_forward_epoch) {
+        CHECK(false) << "erpp_encoder_jit_refill: skip reason=stale_ranking";
+    // if (log_enabled) {
+    //   LOG(INFO) << "erpp_encoder_jit_refill: skip reason=stale_ranking"
+    //             << " ranking_forward_epoch=" << encoder_jit_forward_epoch
+    //             << " current_forward_epoch=" << current_forward_epoch
+    //             << " ranking_generate_epoch=" << encoder_jit_generate_epoch
+    //             << " current_generate_epoch=" << current_generate_epoch;
+    // }
+    return;
+  }
+
+  const int begin_layer = std::max(0, current_layer + 1);
+  const int end_layer = std::min(metas->num_encoder_moe_layer, current_layer + metas->erpp_encoder_jit_refill_window + 1);
+  if (begin_layer >= end_layer) {
+    if (log_enabled) {
+      LOG(INFO) << "erpp_encoder_jit_refill: skip reason=no_future_layer_in_window"
+                << " current=L" << current_layer
+                << " window=" << metas->erpp_encoder_jit_refill_window;
+    }
+    return;
+  }
+
+  // Per-layer target resident expert count when floor refill runs (avg split or fixed).
+  const int floor_value = encoder_jit_floor();
+  // Trigger floor refill only when occupancy drops below this fraction of floor_value.
+  const int low_watermark = std::max(
+      1,
+      int(std::floor(floor_value * metas->erpp_encoder_jit_refill_low_watermark_ratio)));
+
+  int enqueued = 0;
+  for (int layer_idx = begin_layer; layer_idx < end_layer; layer_idx++) {
+    if (!encoder_jit_layer_enabled(layer_idx)) {
+      if (log_enabled) {
+        LOG(INFO) << "erpp_encoder_jit_refill: skip target=L" << layer_idx
+                  << " reason=layer_disabled";
+      }
+      continue;
+    }
+
+    // Experts currently resident in GPU cache for this layer (not in-flight refill).
+    const int occupancy = cache->encoder_layer_cache_occupancy(layer_idx);
+    // ERPP top-k cover width for this layer; 0 if budgets are unavailable.
+    const int budget = layer_idx < static_cast<int>(encoder_jit_budgets.size())
+        ? encoder_jit_budgets[layer_idx]
+        : 0;
+    if (log_enabled) {
+      LOG(INFO) << "erpp_encoder_jit_refill: inspect current=L" << current_layer
+                << " target=L" << layer_idx
+                << " occupancy=" << occupancy
+                << " floor=" << floor_value
+                << " low=" << low_watermark
+                << " budget=" << budget
+                << " topk_cover=" << metas->enable_erpp_encoder_jit_topk_cover;
+    }
+    auto required = build_encoder_jit_required_experts(
+        layer_idx, occupancy, floor_value, low_watermark, budget);
+    for (int expert_idx : required) {
+      if (metas->erpp_encoder_jit_refill_per_idle > 0 &&
+          enqueued >= metas->erpp_encoder_jit_refill_per_idle) {
+        if (log_enabled) {
+          LOG(INFO) << "erpp_encoder_jit_refill: skip target=L" << layer_idx
+                    << " expert=" << expert_idx
+                    << " reason=per_idle_limit"
+                    << " limit=" << metas->erpp_encoder_jit_refill_per_idle;
+        }
+        return;
+      }
+      TaskQueue* queue = queue_for_class_and_layer(PrefetchClass::kEncoderPredictor, layer_idx);
+      if (queue == nullptr) {
+        return;
+      }
+      if (metas->chunk_prefetch) {
+        add_separate_tasks_for_one_expert(layer_idx, expert_idx, queue, 0,
+                                          metas->num_per_expert_param, false,
+                                          current_forward_epoch,
+                                          kCacheRequestEncoderJitRefill);
+      } else {
+        add_single_tasks_for_one_expert(layer_idx, expert_idx, queue, 0,
+                                        metas->num_per_expert_param, false,
+                                        current_forward_epoch,
+                                        kCacheRequestEncoderJitRefill);
+      }
+      mark_encoder_jit_submitted(layer_idx, expert_idx);
+      enqueued += 1;
+      if (log_enabled) {
+        int rank = -1;
+        if (layer_idx >= 0 && layer_idx < static_cast<int>(encoder_jit_rankings.size())) {
+          const auto& ranking = encoder_jit_rankings[layer_idx];
+          auto it = std::find(ranking.begin(), ranking.end(), expert_idx);
+          if (it != ranking.end()) {
+            rank = static_cast<int>(std::distance(ranking.begin(), it));
+          }
+        }
+        const int budget = layer_idx < static_cast<int>(encoder_jit_budgets.size())
+            ? encoder_jit_budgets[layer_idx]
+            : 0;
+        const char* reason = metas->enable_erpp_encoder_jit_topk_cover &&
+                rank >= 0 && rank < budget
+            ? "topk_cover"
+            : "floor_deficit";
+        LOG(INFO) << "erpp_encoder_jit_refill: enqueue target=L" << layer_idx
+                  << " expert=" << expert_idx
+                  << " rank=" << rank
+                  << " reason=" << reason
+                  << " forward_epoch=" << current_forward_epoch;
+      }
+    }
+  }
+
+}
+
+void FetchScheduleWorker::store_erpp_encoder_jit_rankings(
+    const ErppEncoderJitRankingsTask& task) {
+  if (!metas->enable_erpp_encoder_jit_refill) {
+    return;
+  }
+  if (task.generate_epoch != current_generate_epoch ||
+      task.forward_epoch < current_forward_epoch) {
+    if (log_prefetch_decision_enabled()) {
+      LOG(INFO) << "erpp_encoder_jit_refill: drop stale rankings"
+                << " task_forward_epoch=" << task.forward_epoch
+                << " current_forward_epoch=" << current_forward_epoch
+                << " task_generate_epoch=" << task.generate_epoch
+                << " current_generate_epoch=" << current_generate_epoch;
+    }
+    return;
+  }
+  encoder_jit_rankings = task.rankings;
+  encoder_jit_budgets = task.budgets;
+  encoder_jit_forward_epoch = task.forward_epoch;
+  encoder_jit_generate_epoch = task.generate_epoch;
+  encoder_jit_submitted_mask.assign(
+      metas->num_encoder_moe_layer,
+      std::vector<uint8_t>(metas->num_expert, 0));
+  if (log_prefetch_decision_enabled()) {
+    LOG(INFO) << "erpp_encoder_jit_refill: store rankings"
+              << " forward_epoch=" << task.forward_epoch
+              << " generate_epoch=" << task.generate_epoch
+              << " layers=" << encoder_jit_rankings.size();
+  }
+  if (current_layer >= 0) {
+    maybe_enqueue_encoder_jit_refill();
+  }
+}
+
+void FetchScheduleWorker::do_one_task_impl(ErppEncoderJitRankingsTask *task) {
+  store_erpp_encoder_jit_rankings(*task);
+}
+
 void FetchScheduleWorker::set_phase(SchedulerPhase next_phase) {
   if (phase == next_phase) {
     return;
@@ -330,14 +594,12 @@ void FetchScheduleWorker::set_phase(SchedulerPhase next_phase) {
   phase = next_phase;
   if (phase == kDecoderPredictorPhase) {
     log_encoder_experts_in_cache_on_decoder_entry(metas, model_loader, cache);
-    clear_decoder_warmup_queue();
+    clear_decoder_warmup_plan_queue();
   }
 }
 
-void FetchScheduleWorker::clear_decoder_warmup_queue() {
-  while (!decoder_warmup_queue.empty()) {
-    decoder_warmup_queue.pop();
-  }
+void FetchScheduleWorker::clear_decoder_warmup_plan_queue() {
+  prefetch_queues.decoder_warmup_plan_queue.clear();
   decoder_warmup_seen.clear();
 }
 
@@ -378,7 +640,7 @@ bool FetchScheduleWorker::parse_layer_expert_plan(
 }
 
 void FetchScheduleWorker::rebuild_decoder_warmup_queue() {
-  clear_decoder_warmup_queue();
+  clear_decoder_warmup_plan_queue();
   if (!metas->enable_decoder_warmup_overlap) {
     return;
   }
@@ -387,25 +649,34 @@ void FetchScheduleWorker::rebuild_decoder_warmup_queue() {
   for (auto [layer_idx, expert_idx] : parsed) {
     auto gid = flatten_expert(layer_idx, expert_idx);
     if (decoder_warmup_seen.insert(gid).second) {
-      if (metas->chunk_prefetch) {
-        for (int j = 0; j < metas->num_per_expert_param; j++) {
-          decoder_warmup_queue.push({layer_idx, expert_idx, j, j + 1});
-        }
-      } else {
-        decoder_warmup_queue.push({layer_idx, expert_idx, 0, metas->num_per_expert_param});
+      const int num_chunks = metas->chunk_prefetch ? metas->num_per_expert_param : 1;
+      for (int j = 0; j < num_chunks; j++) {
+        CopyTask task;
+        task.start_mem_buf_idx = metas->chunk_prefetch ? j : 0;
+        task.stop_mem_buf_idx = metas->chunk_prefetch ? j + 1 : metas->num_per_expert_param;
+        task.expert = model_loader->get_source(layer_idx, expert_idx);
+        task.is_precise = false;
+        task.forward_epoch = current_forward_epoch;
+        task.generate_epoch = current_generate_epoch;
+        task.request_type = kCacheRequestDecoderWarmupPrefetch;
+        NVTX_DETAIL_MARK(std::string("sched/enqueue_decoder_warmup_prefetch") + " L" +
+                        std::to_string(layer_idx) +
+                        " E" + std::to_string(expert_idx) +
+                        " P" + std::to_string(task.start_mem_buf_idx) +
+                        "-" + std::to_string(task.stop_mem_buf_idx) +
+                        " forward_epoch=" + std::to_string(task.forward_epoch));
+        prefetch_queues.decoder_warmup_plan_queue.push(task);
       }
     }
   }
 }
 
 void FetchScheduleWorker::clear_prefetch_queues_up_to_layer(int layer_idx) {
-  if (layer_idx < 0 || per_layer_job_queues.empty()) {
+  if (layer_idx < 0) {
     return;
   }
-  int stop_layer = std::min<int>(layer_idx, per_layer_job_queues.size() - 1);
-  for (int l = 0; l <= stop_layer; l++) {
-    per_layer_job_queues[l].clear();
-  }
+  clear_prefetch_class_up_to_layer(PrefetchClass::kEncoderPredictor, layer_idx);
+  clear_prefetch_class_up_to_layer(PrefetchClass::kDecoderPredictor, layer_idx);
 }
 
 void FetchScheduleWorker::start_forward_epoch(
@@ -414,6 +685,7 @@ void FetchScheduleWorker::start_forward_epoch(
   if (forward_epoch > current_forward_epoch) {
     current_forward_epoch = forward_epoch;
     current_layer = -1;
+    clear_encoder_jit_state();
     clear_stale_prefetch_queues_before_epoch(current_forward_epoch);
     precise_job_queue.clear();
   }
@@ -422,7 +694,7 @@ void FetchScheduleWorker::start_forward_epoch(
       break;
     }
     case DecoderWarmupAction::kClear: {
-      clear_decoder_warmup_queue();
+      clear_decoder_warmup_plan_queue();
       break;
     }
     case DecoderWarmupAction::kRebuildForGenerateStart: {
@@ -437,7 +709,9 @@ void FetchScheduleWorker::advance_actual_layer(int64_t forward_epoch, int layer_
   if (forward_epoch > current_forward_epoch) {
     current_forward_epoch = forward_epoch;
     current_layer = -1;
-    clear_all_prefetch_queues();
+    clear_encoder_jit_state();
+    clear_stale_prefetch_queues_before_epoch(current_forward_epoch);
+    precise_job_queue.clear();
   }
   if (forward_epoch == current_forward_epoch && layer_idx > current_layer) {
     current_layer = layer_idx;
@@ -552,7 +826,19 @@ void FetchScheduleWorker::preempt_one_layer_without_reorder_(int layer_idx, int6
 }
 void FetchScheduleWorker::add_single_tasks_for_one_expert(int layer_idx, int expert_idx, TaskQueue* queue, int starting_mem_buffer, int stop_mem_buffer, bool is_precise, int64_t forward_epoch, CacheRequestType request_type) {
   auto expert_handler = model_loader->get_source(layer_idx, expert_idx);
-  NVTX_RANGE(std::string(is_precise ? "submit/demand_io " : "submit/prefetch_io ") +
+  std::string request_label = "decoder_predictor_prefetch";
+  if (request_type == kCacheRequestEncoderPredictorPrefetch) {
+    request_label = "encoder_predictor_prefetch";
+  } else if (request_type == kCacheRequestEncoderJitRefill) {
+    request_label = "encoder_jit_refill";
+  } else if (request_type == kCacheRequestDecoderWarmupPrefetch) {
+    request_label = "decoder_warmup_prefetch";
+  } else if (request_type == kCacheRequestDecoderPredictorPrefetch) {
+    request_label = "decoder_predictor_prefetch";
+  } else if (request_type == kCacheRequestDemand) {
+    request_label = "demand";
+  }
+  NVTX_RANGE(std::string("submit/") + request_label + "_io " +
              "L" + std::to_string(layer_idx) +
              " E" + std::to_string(expert_idx) +
              " P" + std::to_string(starting_mem_buffer) +
@@ -578,96 +864,446 @@ void FetchScheduleWorker::add_separate_tasks_for_one_expert(int layer_idx, int e
 
 void FetchScheduleWorker::pop_next_task(CopyTask &task, bool &found) {
   found = false;
+  // Runtime priority: demand > ERPP encoder prefetch > normal predictor
+  // prefetch > decoder warmup overlap.
   if (!precise_job_queue.empty()) {
     task = precise_job_queue.front();
     precise_job_queue.pop();
     found = true;
+    if (log_prefetch_decision_enabled()) {
+      LOG(INFO) << "prefetch_decision: choose demand L"
+                << task.expert->layer_idx << " E" << task.expert->expert_idx
+                << " current_layer=" << current_layer
+                << " forward_epoch=" << current_forward_epoch;
+    }
     return;
   }
   drain_reclaimable_updates();
-  if (!metas->enable_decoder_warmup_overlap) {
-    for (int layer_idx = 0; layer_idx < metas->num_layer; layer_idx++) {
-      if (per_layer_job_queues[layer_idx].empty()) {
+  if (log_prefetch_decision_enabled()) {
+    LOG(INFO) << "prefetch_decision: scan phase=" << phase
+              << " current_layer=" << current_layer
+              << " forward_epoch=" << current_forward_epoch
+              << " encoder_predictor_prefetch_pending=" << has_pending_prefetch_for_class(PrefetchClass::kEncoderPredictor)
+              << " decoder_predictor_prefetch_pending=" << has_pending_prefetch_for_class(PrefetchClass::kDecoderPredictor)
+              << " decoder_warmup_pending=" << has_pending_prefetch_for_class(PrefetchClass::kDecoderWarmup)
+              << " has_reclaimable_encoder=" << cache->has_reclaimable_encoder();
+  }
+  bool block_lower_priority_for_encoder = false;
+  if (pop_next_prefetch_for_class(PrefetchClass::kEncoderPredictor, task, &block_lower_priority_for_encoder)) {
+    found = true;
+    return;
+  }
+  if (block_lower_priority_for_encoder) {
+    if (log_prefetch_decision_enabled()) {
+      LOG(INFO) << "prefetch_decision: hold lower priority prefetches because ERPP encoder queue is waiting reclaimable"
+                << " current_layer=" << current_layer
+                << " forward_epoch=" << current_forward_epoch;
+    }
+    return;
+  }
+  if (pop_next_prefetch_for_class(PrefetchClass::kDecoderPredictor, task)) {
+    found = true;
+    return;
+  }
+  if (pop_next_prefetch_for_class(PrefetchClass::kDecoderWarmup, task)) {
+    found = true;
+    return;
+  }
+}
+
+FetchScheduleWorker::PrefetchClass FetchScheduleWorker::prefetch_class_for_request(CacheRequestType request_type) const {
+  if (request_type == kCacheRequestEncoderPredictorPrefetch ||
+      request_type == kCacheRequestEncoderJitRefill) {
+    return PrefetchClass::kEncoderPredictor;
+  }
+  if (request_type == kCacheRequestDecoderWarmupPrefetch) {
+    return PrefetchClass::kDecoderWarmup;
+  }
+  return PrefetchClass::kDecoderPredictor;
+}
+
+CacheRequestType FetchScheduleWorker::request_type_for_prefetch_class(PrefetchClass cls) const {
+  switch (cls) {
+    case PrefetchClass::kEncoderPredictor: return kCacheRequestEncoderPredictorPrefetch;
+    case PrefetchClass::kDecoderPredictor: return kCacheRequestDecoderPredictorPrefetch;
+    case PrefetchClass::kDecoderWarmup: return kCacheRequestDecoderWarmupPrefetch;
+  }
+  CHECK(false) << "unknown prefetch class";
+  return kCacheRequestDecoderPredictorPrefetch;
+}
+
+bool FetchScheduleWorker::requires_encoder_phase(PrefetchClass cls) const {
+  return cls == PrefetchClass::kEncoderPredictor;
+}
+
+bool FetchScheduleWorker::requires_reclaimable_encoder(PrefetchClass cls) const {
+  return cls == PrefetchClass::kEncoderPredictor || cls == PrefetchClass::kDecoderWarmup;
+}
+
+bool FetchScheduleWorker::blocks_lower_priority_when_pending(PrefetchClass cls) const {
+  return cls == PrefetchClass::kEncoderPredictor;
+}
+
+bool FetchScheduleWorker::replace_same_layer_on_enqueue(PrefetchClass cls) const {
+  return cls == PrefetchClass::kEncoderPredictor || cls == PrefetchClass::kDecoderPredictor;
+}
+
+FetchScheduleWorker::TaskQueue* FetchScheduleWorker::queue_for_class_and_layer(PrefetchClass cls, int layer_idx) {
+  switch (cls) {
+    case PrefetchClass::kEncoderPredictor:
+      CHECK(layer_idx >= 0 && layer_idx < static_cast<int>(prefetch_queues.encoder_predictor_by_layer.size()));
+      return &prefetch_queues.encoder_predictor_by_layer[layer_idx];
+    case PrefetchClass::kDecoderPredictor:
+      CHECK(layer_idx >= 0 && layer_idx < static_cast<int>(prefetch_queues.decoder_predictor_by_layer.size()));
+      return &prefetch_queues.decoder_predictor_by_layer[layer_idx];
+    case PrefetchClass::kDecoderWarmup:
+      return &prefetch_queues.decoder_warmup_plan_queue;
+  }
+  CHECK(false) << "unknown prefetch class";
+  return nullptr;
+}
+
+const FetchScheduleWorker::TaskQueue* FetchScheduleWorker::queue_for_class_and_layer(PrefetchClass cls, int layer_idx) const {
+  switch (cls) {
+    case PrefetchClass::kEncoderPredictor:
+      CHECK(layer_idx >= 0 && layer_idx < static_cast<int>(prefetch_queues.encoder_predictor_by_layer.size()));
+      return &prefetch_queues.encoder_predictor_by_layer[layer_idx];
+    case PrefetchClass::kDecoderPredictor:
+      CHECK(layer_idx >= 0 && layer_idx < static_cast<int>(prefetch_queues.decoder_predictor_by_layer.size()));
+      return &prefetch_queues.decoder_predictor_by_layer[layer_idx];
+    case PrefetchClass::kDecoderWarmup:
+      return &prefetch_queues.decoder_warmup_plan_queue;
+  }
+  CHECK(false) << "unknown prefetch class";
+  return nullptr;
+}
+
+bool FetchScheduleWorker::has_pending_prefetch_for_class(PrefetchClass cls) {
+  if (cls == PrefetchClass::kEncoderPredictor) {
+    for (auto& queue : prefetch_queues.encoder_predictor_by_layer) {
+      if (!queue.empty()) { return true; }
+    }
+    return false;
+  }
+  if (cls == PrefetchClass::kDecoderPredictor) {
+    for (auto& queue : prefetch_queues.decoder_predictor_by_layer) {
+      if (!queue.empty()) { return true; }
+    }
+    return false;
+  }
+  return !prefetch_queues.decoder_warmup_plan_queue.empty();
+}
+
+void FetchScheduleWorker::clear_prefetch_class(PrefetchClass cls) {
+  if (cls == PrefetchClass::kEncoderPredictor) {
+    clear_encoder_jit_state();
+    for (auto& queue : prefetch_queues.encoder_predictor_by_layer) { queue.clear(); }
+    return;
+  }
+  if (cls == PrefetchClass::kDecoderPredictor) {
+    for (auto& queue : prefetch_queues.decoder_predictor_by_layer) { queue.clear(); }
+    return;
+  }
+  prefetch_queues.decoder_warmup_plan_queue.clear();
+}
+
+void FetchScheduleWorker::clear_prefetch_class_up_to_layer(PrefetchClass cls, int layer_idx) {
+  if (layer_idx < 0) { return; }
+  auto clear_by_layer = [layer_idx](std::vector<TaskQueue>& queues) {
+    if (queues.empty()) { return; }
+    int stop_layer = std::min<int>(layer_idx, queues.size() - 1);
+    for (int l = 0; l <= stop_layer; l++) { queues[l].clear(); }
+  };
+  if (cls == PrefetchClass::kEncoderPredictor) {
+    if (log_prefetch_decision_enabled()) {
+      LOG(INFO) << "prefetch_decision: clear ERPP encoder prefetch queues up to layer " << layer_idx;
+    }
+    clear_by_layer(prefetch_queues.encoder_predictor_by_layer);
+    if (!encoder_jit_submitted_mask.empty()) {
+      int stop_layer = std::min<int>(layer_idx, encoder_jit_submitted_mask.size() - 1);
+      for (int l = 0; l <= stop_layer; l++) {
+        std::fill(encoder_jit_submitted_mask[l].begin(), encoder_jit_submitted_mask[l].end(), 0);
+      }
+    }
+  } else if (cls == PrefetchClass::kDecoderPredictor) {
+    clear_by_layer(prefetch_queues.decoder_predictor_by_layer);
+  }
+}
+
+void FetchScheduleWorker::clear_prefetch_class_for_layer(PrefetchClass cls, int64_t forward_epoch, int layer_idx) {
+  TaskQueue* queue = queue_for_class_and_layer(cls, layer_idx);
+  TaskQueue kept;
+  while (!queue->empty()) {
+    CopyTask task = queue->front();
+    queue->pop();
+    if (task.expert != nullptr && task.forward_epoch == forward_epoch && task.expert->layer_idx == layer_idx) {
+      continue;
+    }
+    kept.push(task);
+  }
+  while (!kept.empty()) {
+    CopyTask task = kept.front();
+    kept.pop();
+    queue->push(task);
+  }
+}
+
+void FetchScheduleWorker::prune_prefetch_class(PrefetchClass cls) {
+  auto prune_queue = [this](TaskQueue& queue, const char* stale_label) {
+    TaskQueue kept;
+    while (!queue.empty()) {
+      CopyTask task = queue.front();
+      queue.pop();
+      if (task.expert == nullptr) {
         continue;
       }
-      task = per_layer_job_queues[layer_idx].front();
-      per_layer_job_queues[layer_idx].pop();
-      found = true;
-      return;
+      if (is_stale_prefetch(task.forward_epoch, task.expert->layer_idx)) {
+        NVTX_DETAIL_MARK(std::string(stale_label) + " L" +
+                         std::to_string(task.expert->layer_idx) +
+                         " E" + std::to_string(task.expert->expert_idx) +
+                         " forward_epoch=" + std::to_string(task.forward_epoch) +
+                         " current_layer=" + std::to_string(current_layer));
+        continue;
+      }
+      if (task.expert->num_ready >= task.stop_mem_buf_idx) {
+        continue;
+      }
+      kept.push(task);
     }
-    return;
-  }
-  if (pop_next_normal_prefetch(task)) {
-    found = true;
-    return;
-  }
-  if (pop_next_decoder_warmup(task)) {
-    found = true;
-    return;
+    while (!kept.empty()) {
+      CopyTask task = kept.front();
+      kept.pop();
+      queue.push(task);
+    }
+  };
+
+  auto prune_decoder_warmup_queue = [this]() {
+    TaskQueue kept;
+    auto& queue = prefetch_queues.decoder_warmup_plan_queue;
+    while (!queue.empty()) {
+      CopyTask task = queue.front();
+      queue.pop();
+      if (task.expert == nullptr) {
+        continue;
+      }
+      if (task.expert->num_ready >= task.stop_mem_buf_idx) {
+        continue;
+      }
+      kept.push(task);
+    }
+    while (!kept.empty()) {
+      CopyTask task = kept.front();
+      kept.pop();
+      queue.push(task);
+    }
+  };
+
+  if (cls == PrefetchClass::kEncoderPredictor) {
+    for (auto& queue : prefetch_queues.encoder_predictor_by_layer) {
+      prune_queue(queue, "sched/drop_stale_encoder_predictor_prefetch");
+    }
+  } else if (cls == PrefetchClass::kDecoderPredictor) {
+    for (auto& queue : prefetch_queues.decoder_predictor_by_layer) {
+      prune_queue(queue, "sched/drop_stale_decoder_predictor_prefetch");
+    }
+  } else {
+    prune_decoder_warmup_queue();
   }
 }
 
-bool FetchScheduleWorker::pop_next_normal_prefetch(CopyTask& task) {
-  int best_layer = -1;
-  std::tuple<int, int, int> best_key{INT_MAX, INT_MAX, INT_MAX};
-  for (int layer_idx = 0; layer_idx < int(per_layer_job_queues.size()); layer_idx++) {
-    if (per_layer_job_queues[layer_idx].empty()) {
-      continue;
+bool FetchScheduleWorker::pop_next_prefetch_for_class(PrefetchClass cls, CopyTask& task, bool* blocked_lower_priority) {
+  if (requires_encoder_phase(cls) && phase != kEncoderPhase) {
+    if (log_prefetch_decision_enabled() && has_pending_prefetch_for_class(cls)) {
+      LOG(INFO) << "prefetch_decision: clear ERPP encoder prefetch because scheduler left encoder phase"
+                << " phase=" << phase
+                << " current_layer=" << current_layer
+                << " forward_epoch=" << current_forward_epoch;
     }
-    int bucket = 0;
-    int distance = 0;
-    if (current_layer < 0) {
-      bucket = 1;
-      distance = layer_idx;
-    } else if (layer_idx == current_layer) {
-      bucket = 0;
-      distance = 0;
-    } else if (layer_idx > current_layer) {
-      bucket = 1;
-      distance = layer_idx - current_layer;
-    } else {
-      bucket = 2;
-      distance = current_layer - layer_idx;
-    }
-    auto key = std::make_tuple(bucket, distance, layer_idx);
-    if (key < best_key) {
-      best_key = key;
-      best_layer = layer_idx;
-    }
-  }
-  if (best_layer < 0) {
+    clear_prefetch_class(cls);
     return false;
   }
-  task = per_layer_job_queues[best_layer].front();
-  per_layer_job_queues[best_layer].pop();
-  return true;
-}
+  if (cls == PrefetchClass::kDecoderWarmup && !metas->enable_decoder_warmup_overlap) {
+    return false;
+  }
 
-bool FetchScheduleWorker::pop_next_decoder_warmup(CopyTask& task) {
-  if (phase != kEncoderPhase || !metas->enable_decoder_warmup_overlap) {
+  if (cls == PrefetchClass::kEncoderPredictor || cls == PrefetchClass::kDecoderWarmup) {
+    drain_reclaimable_updates();
+  }
+  prune_prefetch_class(cls);
+  if (!has_pending_prefetch_for_class(cls)) {
+    if (log_prefetch_decision_enabled() && cls == PrefetchClass::kEncoderPredictor) {
+      LOG(INFO) << "prefetch_decision: no ERPP encoder prefetch candidate after prune"
+                << " current_layer=" << current_layer
+                << " forward_epoch=" << current_forward_epoch;
+    }
     return false;
   }
-  drain_reclaimable_updates();
-  if (!cache->has_reclaimable_encoder()) {
+  if (cls != PrefetchClass::kEncoderPredictor &&
+      requires_reclaimable_encoder(cls) && !cache->has_reclaimable_encoder()) {
+    NVTX_DETAIL_MARK("sched/wait_decoder_warmup_prefetch_reclaimable");
     return false;
   }
-  while (!decoder_warmup_queue.empty()) {
-    auto entry = decoder_warmup_queue.front();
-    decoder_warmup_queue.pop();
-    auto expert = model_loader->get_source(entry.layer_idx, entry.expert_idx);
-    if (expert->num_ready >= entry.stop_mem_buf_idx) {
+
+  if (cls == PrefetchClass::kEncoderPredictor) {
+    bool legacy_waiting_for_reclaimable = false;
+    for (auto& queue : prefetch_queues.encoder_predictor_by_layer) {
+      while (!queue.empty()) {
+        CopyTask candidate = queue.front();
+        queue.pop();
+        if (candidate.expert == nullptr) {
+          if (log_prefetch_decision_enabled()) {
+            LOG(INFO) << "prefetch_decision: skip ERPP encoder prefetch with null expert";
+          }
+          continue;
+        }
+        if (is_stale_prefetch(candidate.forward_epoch, candidate.expert->layer_idx)) {
+          if (log_prefetch_decision_enabled()) {
+            LOG(INFO) << "prefetch_decision: skip stale ERPP encoder prefetch L"
+                      << candidate.expert->layer_idx << " E" << candidate.expert->expert_idx
+                      << " P" << candidate.start_mem_buf_idx << "-" << candidate.stop_mem_buf_idx
+                      << " task_forward_epoch=" << candidate.forward_epoch
+                      << " current_layer=" << current_layer
+                      << " current_forward_epoch=" << current_forward_epoch;
+          }
+          continue;
+        }
+        if (candidate.expert->num_ready >= candidate.stop_mem_buf_idx) {
+          if (log_prefetch_decision_enabled()) {
+            LOG(INFO) << "prefetch_decision: skip ready ERPP encoder prefetch L"
+                      << candidate.expert->layer_idx << " E" << candidate.expert->expert_idx
+                      << " P" << candidate.start_mem_buf_idx << "-" << candidate.stop_mem_buf_idx
+                      << " num_ready=" << candidate.expert->num_ready;
+          }
+          continue;
+        }
+        if (candidate.request_type == kCacheRequestEncoderPredictorPrefetch &&
+            !cache->has_reclaimable_encoder()) {
+          legacy_waiting_for_reclaimable = true;
+          queue.push(candidate);
+          if (log_prefetch_decision_enabled()) {
+            LOG(INFO) << "prefetch_decision: ERPP encoder legacy prefetch waits reclaimable victim L"
+                      << candidate.expert->layer_idx << " E" << candidate.expert->expert_idx
+                      << " current_layer=" << current_layer
+                      << " forward_epoch=" << current_forward_epoch;
+          }
+          break;
+        }
+        if (candidate.request_type == kCacheRequestEncoderJitRefill &&
+            !encoder_jit_can_dispatch(candidate)) {
+          queue.push(candidate);
+          if (log_prefetch_decision_enabled()) {
+            LOG(INFO) << "erpp_encoder_jit_refill: skip target=L"
+                      << candidate.expert->layer_idx
+                      << " expert=" << candidate.expert->expert_idx
+                      << " reason=no_safe_victim"
+                      << " current=L" << current_layer
+                      << " floor=" << encoder_jit_floor();
+          }
+          break;
+        }
+        NVTX_DETAIL_MARK(std::string(candidate.request_type == kCacheRequestEncoderJitRefill
+                             ? "sched/pop_encoder_jit_refill"
+                             : "sched/pop_encoder_predictor_prefetch") + " L" +
+                         std::to_string(candidate.expert->layer_idx) +
+                         " E" + std::to_string(candidate.expert->expert_idx) +
+                         " P" + std::to_string(candidate.start_mem_buf_idx) +
+                         "-" + std::to_string(candidate.stop_mem_buf_idx) +
+                         " forward_epoch=" + std::to_string(candidate.forward_epoch));
+        if (log_prefetch_decision_enabled()) {
+          LOG(INFO) << "prefetch_decision: choose ERPP encoder prefetch L"
+                    << candidate.expert->layer_idx << " E" << candidate.expert->expert_idx
+                    << " P" << candidate.start_mem_buf_idx << "-" << candidate.stop_mem_buf_idx
+                    << " current_layer=" << current_layer
+                    << " forward_epoch=" << current_forward_epoch;
+        }
+        task = candidate;
+        return true;
+      }
+    }
+    if (legacy_waiting_for_reclaimable) {
+      if (blocked_lower_priority != nullptr) {
+        *blocked_lower_priority = true;
+      }
+      NVTX_DETAIL_MARK("sched/wait_encoder_predictor_prefetch_reclaimable");
+      if (log_prefetch_decision_enabled()) {
+        LOG(INFO) << "prefetch_decision: hold lower priority prefetches because legacy ERPP encoder queue is waiting reclaimable"
+                  << " current_layer=" << current_layer
+                  << " forward_epoch=" << current_forward_epoch;
+      }
+      return false;
+    }
+    if (log_prefetch_decision_enabled()) {
+      LOG(INFO) << "prefetch_decision: ERPP encoder queue exhausted without dispatch"
+                << " current_layer=" << current_layer
+                << " forward_epoch=" << current_forward_epoch;
+    }
+    return false;
+  }
+
+  if (cls == PrefetchClass::kDecoderPredictor) {
+    int best_layer = -1;
+    std::tuple<int, int, int> best_key{INT_MAX, INT_MAX, INT_MAX};
+    for (int layer_idx = 0; layer_idx < int(prefetch_queues.decoder_predictor_by_layer.size()); layer_idx++) {
+      if (prefetch_queues.decoder_predictor_by_layer[layer_idx].empty()) {
+        continue;
+      }
+      int bucket = 0;
+      int distance = 0;
+      if (current_layer < 0) {
+        bucket = 1;
+        distance = layer_idx;
+      } else if (layer_idx == current_layer) {
+        bucket = 0;
+        distance = 0;
+      } else if (layer_idx > current_layer) {
+        bucket = 1;
+        distance = layer_idx - current_layer;
+      } else {
+        bucket = 2;
+        distance = current_layer - layer_idx;
+      }
+      auto key = std::make_tuple(bucket, distance, layer_idx);
+      if (key < best_key) {
+        best_key = key;
+        best_layer = layer_idx;
+      }
+    }
+    if (best_layer < 0) {
+      return false;
+    }
+    auto& queue = prefetch_queues.decoder_predictor_by_layer[best_layer];
+    task = queue.front();
+    queue.pop();
+    NVTX_DETAIL_MARK(std::string("sched/pop_decoder_predictor_prefetch") + " L" +
+                     std::to_string(task.expert->layer_idx) +
+                     " E" + std::to_string(task.expert->expert_idx) +
+                     " P" + std::to_string(task.start_mem_buf_idx) +
+                     "-" + std::to_string(task.stop_mem_buf_idx) +
+                     " forward_epoch=" + std::to_string(task.forward_epoch));
+    return true;
+  }
+
+  while (!prefetch_queues.decoder_warmup_plan_queue.empty()) {
+    CopyTask candidate = prefetch_queues.decoder_warmup_plan_queue.front();
+    prefetch_queues.decoder_warmup_plan_queue.pop();
+    if (candidate.expert == nullptr ||
+        candidate.expert->num_ready >= candidate.stop_mem_buf_idx) {
       continue;
     }
-    if (expert->gpu_data == nullptr && entry.start_mem_buf_idx > 0) {
-      continue;
+    NVTX_DETAIL_MARK(std::string("sched/pop_decoder_warmup_prefetch") + " L" +
+                     std::to_string(candidate.expert->layer_idx) +
+                     " E" + std::to_string(candidate.expert->expert_idx) +
+                     " P" + std::to_string(candidate.start_mem_buf_idx) +
+                     "-" + std::to_string(candidate.stop_mem_buf_idx) +
+                     " forward_epoch=" + std::to_string(candidate.forward_epoch));
+    if (log_prefetch_decision_enabled()) {
+      LOG(INFO) << "prefetch_decision: choose decoder warmup L"
+                << candidate.expert->layer_idx << " E" << candidate.expert->expert_idx
+                << " P" << candidate.start_mem_buf_idx << "-" << candidate.stop_mem_buf_idx
+                << " current_layer=" << current_layer
+                << " forward_epoch=" << current_forward_epoch;
     }
-    task.start_mem_buf_idx = entry.start_mem_buf_idx;
-    task.stop_mem_buf_idx = entry.stop_mem_buf_idx;
-    task.expert = expert;
-    task.is_precise = false;
-    task.forward_epoch = current_forward_epoch;
-    task.generate_epoch = current_generate_epoch;
-    task.request_type = kCacheRequestDecoderWarmupOverlap;
+    task = candidate;
     return true;
   }
   return false;
@@ -693,7 +1329,6 @@ void PrefetchMngr::reset_for_generate() {
   if (!metas->reset_cache_on_generate_start) {
     return;
   }
-  CHECK(!reset_in_progress.exchange(true));
   bool reset_finished = false;
   struct ResetInProgressGuard {
     std::atomic<bool>& reset_in_progress;
@@ -710,13 +1345,20 @@ void PrefetchMngr::reset_for_generate() {
   uint64_t reset_us = 0;
   uint64_t load_us = 0;
   uint64_t rebuild_us = 0;
+  CHECK(!reset_in_progress.exchange(true, std::memory_order_acq_rel));
   generate_epoch += 1;
   forward_epoch += 1;
   LOG(INFO) << "reset_for_generate: begin generate_epoch=" << generate_epoch
             << " forward_epoch=" << forward_epoch;
   LOG(INFO) << "reset_for_generate: begin predict reset barrier";
+  if (erpp_encoder_predict_thread != nullptr) {
+    erpp_encoder_predict_thread->begin_reset_for_generate();
+  }
   predict_thread->begin_reset_for_generate();
   predict_thread->wait_until_idle();
+  if (erpp_encoder_predict_thread != nullptr) {
+    erpp_encoder_predict_thread->wait_until_idle();
+  }
   LOG(INFO) << "reset_for_generate: predict reset barrier done";
   LOG(INFO) << "reset_for_generate: begin fetch scheduler barrier";
   fetch_schedule_thread->begin_reset_for_generate();
@@ -737,8 +1379,16 @@ void PrefetchMngr::reset_for_generate() {
   LOG(INFO) << "reset_for_generate: device synchronize done";
   predict_thread->reset_for_generate(generate_epoch);
   LOG(INFO) << "reset_for_generate: predict worker reset done";
+  if (erpp_encoder_predict_thread != nullptr) {
+    erpp_encoder_predict_thread->reset_for_generate(generate_epoch);
+    LOG(INFO) << "reset_for_generate: ERPP encoder predict worker reset done";
+  }
   predictor->reset_sequence_state();
   LOG(INFO) << "reset_for_generate: predictor sequence reset done";
+  if (erpp_encoder_predictor != nullptr) {
+    erpp_encoder_predictor->reset_sequence_state();
+    LOG(INFO) << "reset_for_generate: ERPP encoder predictor sequence reset done";
+  }
   fetch_schedule_thread->reset_for_generate(
       generate_epoch, forward_epoch, DecoderWarmupAction::kClear);
   LOG(INFO) << "reset_for_generate: scheduler clear reset done";
@@ -789,6 +1439,122 @@ void PrefetchMngr::preempt_and_launch_one_layer(int layer_idx, int64_t* experts,
   // preempt_one_layer_(layer_idx, experts.data_ptr<int64_t>(), experts.size(0));
 }
 
+void PrefetchMngr::ensure_encoder_layer_stats_size() {
+  if (encoder_layer_stats.size() != static_cast<size_t>(metas->num_layer)) {
+    encoder_layer_stats.assign(metas->num_layer, EncoderLayerStats());
+  }
+}
+
+bool PrefetchMngr::encoder_layer_expert_entry_hit(int layer_id, int expert_id) const {
+  auto expert = model_loader->get_source(layer_id, expert_id);
+  auto status = expert->expert_status.get();
+  return status == kReady || status == kLaunching;
+}
+
+void PrefetchMngr::log_encoder_layer_entry_stats(
+    int layer_id,
+    int64_t* experts,
+    int64_t num_expert) {
+  if (!metas->is_encoder_layer(layer_id)) {
+    return;
+  }
+  ensure_encoder_layer_stats_size();
+  auto& stats = encoder_layer_stats[layer_id];
+  stats = EncoderLayerStats();
+  stats.forward_epoch = forward_epoch;
+  stats.generate_epoch = generate_epoch;
+  stats.needed = num_expert;
+  for (int64_t i = 0; i < num_expert; i++) {
+    int expert_id = int(experts[i]);
+    if (expert_id < 0 || expert_id >= metas->num_expert) {
+      stats.entry_miss += 1;
+      continue;
+    }
+    if (encoder_layer_expert_entry_hit(layer_id, expert_id)) {
+      stats.entry_hit += 1;
+    } else {
+      stats.entry_miss += 1;
+    }
+  }
+  if (log_encoder_layer_stats_enabled()) {
+    LOG(INFO) << "encoder_layer_stats: phase=entry"
+              << " L=" << layer_id
+              << " needed=" << stats.needed
+              << " hit=" << stats.entry_hit
+              << " miss=" << stats.entry_miss
+              << " entry_hit=" << stats.entry_hit
+              << " entry_miss=" << stats.entry_miss
+              << " forward_epoch=" << stats.forward_epoch
+              << " generate_epoch=" << stats.generate_epoch;
+  }
+}
+
+void PrefetchMngr::log_encoder_layer_use_stats(
+    int layer_id,
+    int expert_id,
+    bool hit,
+    bool waited,
+    uint64_t wait_us,
+    int status_before) {
+  if (!metas->is_encoder_layer(layer_id)) {
+    return;
+  }
+  ensure_encoder_layer_stats_size();
+  auto& stats = encoder_layer_stats[layer_id];
+  if (stats.forward_epoch != forward_epoch || stats.generate_epoch != generate_epoch) {
+    stats = EncoderLayerStats();
+    stats.forward_epoch = forward_epoch;
+    stats.generate_epoch = generate_epoch;
+  }
+  if (hit) {
+    stats.actual_hit += 1;
+  } else {
+    stats.actual_miss += 1;
+  }
+  if (waited) {
+    stats.waited += 1;
+    stats.wait_us_total += static_cast<int64_t>(wait_us);
+    stats.wait_us_max = std::max<int64_t>(stats.wait_us_max, static_cast<int64_t>(wait_us));
+  }
+  if (log_encoder_layer_stats_enabled()) {
+    LOG(INFO) << "encoder_layer_stats: phase=use"
+              << " L=" << layer_id
+              << " E=" << expert_id
+              << " hit=" << (hit ? 1 : 0)
+              << " miss=" << (hit ? 0 : 1)
+              << " waited=" << (waited ? 1 : 0)
+              << " wait_us=" << wait_us
+              << " status_before=" << status_before
+              << " actual_hit=" << stats.actual_hit
+              << " actual_miss=" << stats.actual_miss
+              << " wait_us_total=" << stats.wait_us_total
+              << " forward_epoch=" << stats.forward_epoch
+              << " generate_epoch=" << stats.generate_epoch;
+  }
+}
+
+void PrefetchMngr::log_encoder_layer_done_stats(int layer_id) {
+  if (!metas->is_encoder_layer(layer_id)) {
+    return;
+  }
+  ensure_encoder_layer_stats_size();
+  const auto& stats = encoder_layer_stats[layer_id];
+  if (log_encoder_layer_stats_enabled()) {
+    LOG(INFO) << "encoder_layer_stats: phase=done"
+              << " L=" << layer_id
+              << " needed=" << stats.needed
+              << " entry_hit=" << stats.entry_hit
+              << " entry_miss=" << stats.entry_miss
+              << " actual_hit=" << stats.actual_hit
+              << " actual_miss=" << stats.actual_miss
+              << " waited=" << stats.waited
+              << " wait_us_total=" << stats.wait_us_total
+              << " wait_us_max=" << stats.wait_us_max
+              << " forward_epoch=" << stats.forward_epoch
+              << " generate_epoch=" << stats.generate_epoch;
+  }
+}
+
 void PrefetchMngr::report_one_layer(int layer_id, torch::Tensor experts) {
   report_one_layer(layer_id, experts.data_ptr<int64_t>(), experts.numel());
 }
@@ -798,6 +1564,7 @@ void PrefetchMngr::report_one_layer(int layer_id, int64_t* experts, int64_t num_
   NVTX_DETAIL_MARK("demand/layer_experts L" + std::to_string(layer_id) +
                    " experts=[" + array_to_str(experts, num_expert) + "]");
   cache_stats->forward();
+  log_encoder_layer_entry_stats(layer_id, experts, num_expert);
   if (metas->is_decoder_layer(layer_id)) {
     LOG(INFO) << "prefetcher: consume prefetch layer progress at layer " << layer_id;
     int progress_idx = predict_thread->consume_prefetch_layer_progress();
@@ -823,6 +1590,7 @@ void PrefetchMngr::one_moe_layer_done(int layer_id) {
   TRACE_EVENT_GURAD(kHook, "one_moe_layer_done");
   NVTX_RANGE("hook/one_moe_layer_done L" + std::to_string(layer_id));
   if (metas->is_encoder_layer(layer_id)) {
+    log_encoder_layer_done_stats(layer_id);
     fetch_schedule_thread->enqueue_layer_reclaimable(layer_id);
   }
   if (metas->early_preempt == false) {
@@ -882,6 +1650,10 @@ void PrefetchMngr::one_expert_done(int layer_id, int expert_id) {
   NVTX_RANGE("hook/one_expert_done L" + std::to_string(layer_id) + " E" + std::to_string(expert_id));
   mark_expert_using(layer_id, expert_id);
   if (metas->is_encoder_layer(layer_id)) {
+    if (log_prefetch_decision_enabled()) {
+      LOG(INFO) << "erpp_encoder_prefetch: encoder expert reclaimable L"
+                << layer_id << " E" << expert_id;
+    }
     fetch_schedule_thread->enqueue_expert_reclaimable(layer_id, expert_id);
   }
 }
@@ -895,6 +1667,7 @@ void PrefetchMngr::wait_expert(int layer_id, int expert_id) {
   if (current_status == kLaunching) {
     cache_stats->hit();
     profiler->add(TimeProfiler::kReadyCnt, 1);
+    log_encoder_layer_use_stats(layer_id, expert_id, true, false, 0, int(current_status));
   } else {
     NVTX_RANGE("hook/wait_expert L" + std::to_string(layer_id) + " E" + std::to_string(expert_id));
     Timer timer;
@@ -904,6 +1677,7 @@ void PrefetchMngr::wait_expert(int layer_id, int expert_id) {
     expert->expert_status.wait(kLaunching);
     auto dur = timer.dur_us();
     profiler->add(TimeProfiler::kWaitTime, dur);
+    log_encoder_layer_use_stats(layer_id, expert_id, false, true, dur, int(current_status));
   }
   LOG(TRACE) << "waiting expert " << expert->toString() << " success";
 }
@@ -915,12 +1689,44 @@ void PrefetchMngr::mark_expert_using(int layer_id, int expert_id) {
   expert_unlocker_thread->add_one_task(expert);
 }
 
+void PrefetchMngr::report_erpp_encoder_layer0(torch::Tensor hidden, torch::Tensor attention_mask) {
+  if (!metas->enable_erpp_encoder_prefetch ||
+      erpp_encoder_predictor == nullptr ||
+      erpp_encoder_predict_thread == nullptr) {
+    if (log_prefetch_decision_enabled()) {
+      LOG(INFO) << "erpp_encoder_prefetch: skip report"
+                << " enabled=" << metas->enable_erpp_encoder_prefetch
+                << " predictor_null=" << (erpp_encoder_predictor == nullptr)
+                << " worker_null=" << (erpp_encoder_predict_thread == nullptr);
+    }
+    return;
+  }
+  const int64_t report_forward_epoch = forward_epoch;
+  const int64_t report_generate_epoch = generate_epoch;
+  erpp_encoder_predictor->record_encoder_layer0(
+      hidden,
+      attention_mask,
+      (cudaStream_t)compute_stream,
+      report_forward_epoch,
+      report_generate_epoch);
+  if (log_prefetch_decision_enabled()) {
+    LOG(INFO) << "erpp_encoder_prefetch: report recorded"
+              << " forward_epoch=" << report_forward_epoch
+              << " generate_epoch=" << report_generate_epoch;
+  }
+  erpp_encoder_predict_thread->on_encoder_layer0_recorded(
+      report_forward_epoch, report_generate_epoch);
+}
+
 void PrefetchMngr::launch_thread() {
   this->reload_env();
   predict_thread->on_one_iter_done(forward_epoch, generate_epoch);
 
   fetch_schedule_thread->launch();
   predict_thread->launch();
+  if (erpp_encoder_predict_thread != nullptr) {
+    erpp_encoder_predict_thread->launch();
+  }
   expert_unlocker_thread->launch();
   fetch_thread->launch();
   if (string_is_on(GetEnv("SPARSE_CACHE_THREAD_TO_E_CORE"))) {
@@ -943,6 +1749,11 @@ PrefetchMngr::PrefetchMngr(std::shared_ptr<ModuleMeta> metas,
   expert_unlocker_thread = std::make_shared<ExpertUnlockWorker>();
   fetch_thread = std::make_shared<FetchWorker>();
   fetch_schedule_thread = std::make_shared<FetchScheduleWorker>();
+  if (metas->enable_erpp_encoder_prefetch) {
+    erpp_encoder_predictor = std::make_shared<ErppEncoderPredictor>(metas.get());
+    erpp_encoder_predictor->load_model_from(metas->erpp_encoder_model_path);
+    erpp_encoder_predict_thread = std::make_shared<ErppEncoderPredictWorker>();
+  }
   cache_stats = std::make_shared<CacheStatistics>();
   // cache_stats->add_reporter([this, metas = this->metas](CacheStatistics* stats){
   //   auto tensor = stats->to_tensor();
@@ -1076,6 +1887,13 @@ PrefetchMngr::PrefetchMngr(std::shared_ptr<ModuleMeta> metas,
   fetch_thread->init(metas.get(), fetch_schedule_thread.get(), model_loader->mem_mngr_ctx.get(), (cudaStream_t)copy_stream);
   fetch_schedule_thread->init(metas.get(), model_loader.get(), this->cache.get(), fetch_thread.get(), predict_thread.get(), cache_stats.get(), profiler.get());
 
+  if (erpp_encoder_predict_thread != nullptr) {
+    erpp_encoder_predict_thread->init(
+        fetch_schedule_thread.get(),
+        erpp_encoder_predictor.get(),
+        metas.get());
+  }
+
   predictor->profiler = profiler;
 }
 
@@ -1153,6 +1971,11 @@ void PrefetchMngr::record_then_predict_and_prefetch(int layer_id, int64_t* exper
 PrefetchMngr::~PrefetchMngr() {
   // predict_thread->add_one_task(PredictJob());
   predict_thread->add_prefetch_layer_budget();
+  if (erpp_encoder_predict_thread != nullptr) {
+    erpp_encoder_predict_thread->begin_reset_for_generate();
+    erpp_encoder_predict_thread->wait_until_idle();
+    erpp_encoder_predict_thread->exit();
+  }
   fetch_thread->exit();
   predict_thread->exit();
   expert_unlocker_thread->exit();
@@ -1197,6 +2020,10 @@ void FetchScheduleWorker::do_one_task_impl(FetchScheduleTaskBase *task) {
       do_one_task_impl(dynamic_cast<ResetTask*>(task));
       break;
     }
+    case FetchScheduleTaskBase::kErppEncoderJitRankings: {
+      do_one_task_impl(dynamic_cast<ErppEncoderJitRankingsTask*>(task));
+      break;
+    }
     default: {
       CHECK(false) << "unknown task type " << task->task_type;
     }
@@ -1217,13 +2044,9 @@ void FetchScheduleWorker::do_one_task_impl(PreemptTask *task) {
     predict_thread->add_prefetch_layer_budget();
   }
 
-  if (per_layer_job_queues[task->layer_idx].empty() == false) {
-    LOG(TRACE) << "scheduler: do PreemptTask, preempting one layer " << task->layer_idx << ", queue is not empty, current task is " << current_task.toString();
-    per_layer_job_queues[task->layer_idx].clear();
-  } else {
-    LOG(TRACE) << "scheduler: do PreemptTask, preempting one layer " << task->layer_idx << ", queue is empty";
-  }
+  clear_prefetch_class_for_layer(PrefetchClass::kDecoderPredictor, task->forward_epoch, task->layer_idx);
   drain_reclaimable_updates();
+  maybe_enqueue_encoder_jit_refill();
 }
 void FetchScheduleWorker::do_one_task_impl(ForwardEpochStartTask *task) {
   CHECK(task == &this->forward_epoch_start_task);
@@ -1235,7 +2058,8 @@ void FetchScheduleWorker::do_one_task_impl(ResetTask *task) {
   reset_requested.store(true, std::memory_order_release);
   current_task.expert = nullptr;
   clear_all_job_queues();
-  clear_decoder_warmup_queue();
+  clear_decoder_warmup_plan_queue();
+  clear_encoder_jit_state();
   reset_pending_reclaimable_updates();
   current_layer = -1;
   current_forward_epoch = task->next_forward_epoch;
@@ -1267,7 +2091,9 @@ void FetchScheduleWorker::init(ModuleMeta *metas, ModelLoader *model_loader,
   this->predict_thread = predict_thread;
   this->cache_stats = cache_stats;
   this->profiler = profiler;
-  per_layer_job_queues.resize(metas->num_layer);
+  prefetch_queues.encoder_predictor_by_layer.resize(metas->num_layer);
+  prefetch_queues.decoder_predictor_by_layer.resize(metas->num_layer);
+  initialize_encoder_jit_enabled_layer_mask();
   pending_reclaimable_updates.assign(metas->num_layer, PendingReclaimableUpdate());
   pending_reclaimable_layers.clear();
   pending_reclaimable_layer_mask.assign(metas->num_layer, 0);
@@ -1307,7 +2133,8 @@ void FetchScheduleWorker::do_one_task_impl(IdleTask *idle_task) {
     sent = send_one_job(&current_task);
   }
   if (!found || !sent) {
-    // re add this idle task
+    // Re-add the idle task. ERPP encoder prefetch can be valid but blocked until
+    // reclaimable experts appear; keep the original scheduler polling behavior.
     current_task.expert = nullptr;
     this->add_one_task(&this->idle_task);
   }
@@ -1330,12 +2157,34 @@ void FetchScheduleWorker::do_one_task_impl(PrefetchLayerTask *task) {
     return;
   }
 
-  if (per_layer_job_queues[task->layer_idx].empty() == false) {
-    LOG(TRACE) << "scheduler: replace queued prefetch layer " << task->layer_idx
-               << ", task forward_epoch " << task->forward_epoch
-               << ", current forward_epoch " << current_forward_epoch
-               << ", current layer " << current_layer;
-    per_layer_job_queues[task->layer_idx].clear();
+  PrefetchClass cls = prefetch_class_for_request(task->request_type);
+  TaskQueue* target_queue = queue_for_class_and_layer(cls, task->layer_idx);
+  if (replace_same_layer_on_enqueue(cls)) {
+    clear_prefetch_class_for_layer(cls, task->forward_epoch, task->layer_idx);
+  }
+  if (cls == PrefetchClass::kEncoderPredictor) {
+    if (log_prefetch_decision_enabled()) {
+      LOG(INFO) << "prefetch_decision: enqueue ERPP encoder prefetch L"
+                << task->layer_idx
+                << " num_expert=" << task->num_expert
+                << " experts=[" << array_to_str(task->expert_idxs, task->num_expert) << "]"
+                << " forward_epoch=" << task->forward_epoch
+                << " generate_epoch=" << task->generate_epoch;
+    }
+    NVTX_DETAIL_MARK(std::string("sched/enqueue_encoder_predictor_prefetch") + " L" +
+                     std::to_string(task->layer_idx) +
+                     " N=" + std::to_string(task->num_expert) +
+                     " forward_epoch=" + std::to_string(task->forward_epoch));
+  } else if (cls == PrefetchClass::kDecoderPredictor) {
+    NVTX_DETAIL_MARK(std::string("sched/enqueue_decoder_predictor_prefetch") + " L" +
+                     std::to_string(task->layer_idx) +
+                     " N=" + std::to_string(task->num_expert) +
+                     " forward_epoch=" + std::to_string(task->forward_epoch));
+  } else if (cls == PrefetchClass::kDecoderWarmup) {
+    NVTX_DETAIL_MARK(std::string("sched/enqueue_decoder_warmup_prefetch") + " L" +
+                     std::to_string(task->layer_idx) +
+                     " N=" + std::to_string(task->num_expert) +
+                     " forward_epoch=" + std::to_string(task->forward_epoch));
   }
   // ready, partial, miss
   for (int i = 0; i < task->num_expert; i++) {
@@ -1353,9 +2202,9 @@ void FetchScheduleWorker::do_one_task_impl(PrefetchLayerTask *task) {
     //   continue;
     // }
     if (metas->chunk_prefetch) {
-      add_separate_tasks_for_one_expert(task->layer_idx, task->expert_idxs[i], &per_layer_job_queues[task->layer_idx], 0, metas->num_per_expert_param, false, task->forward_epoch, kCacheRequestPrefetch);
+      add_separate_tasks_for_one_expert(task->layer_idx, task->expert_idxs[i], target_queue, 0, metas->num_per_expert_param, false, task->forward_epoch, task->request_type);
     } else {
-      add_single_tasks_for_one_expert(task->layer_idx, task->expert_idxs[i], &per_layer_job_queues[task->layer_idx], 0, metas->num_per_expert_param, false, task->forward_epoch, kCacheRequestPrefetch);
+      add_single_tasks_for_one_expert(task->layer_idx, task->expert_idxs[i], target_queue, 0, metas->num_per_expert_param, false, task->forward_epoch, task->request_type);
     }
   }
 }
@@ -1370,7 +2219,19 @@ bool FetchScheduleWorker::send_one_job(CopyTask *task) {
              " P" + std::to_string(task->start_mem_buf_idx) +
              "-" + std::to_string(task->stop_mem_buf_idx) +
              (task->is_precise ? " precise" : " prefetch"));
-  NVTX_RANGE(std::string(task->is_precise ? "dispatch/demand_io " : "dispatch/prefetch_io ") +
+  std::string request_label = "decoder_predictor_prefetch";
+  if (task->request_type == kCacheRequestEncoderPredictorPrefetch) {
+    request_label = "encoder_predictor_prefetch";
+  } else if (task->request_type == kCacheRequestEncoderJitRefill) {
+    request_label = "encoder_jit_refill";
+  } else if (task->request_type == kCacheRequestDecoderWarmupPrefetch) {
+    request_label = "decoder_warmup_prefetch";
+  } else if (task->request_type == kCacheRequestDecoderPredictorPrefetch) {
+    request_label = "decoder_predictor_prefetch";
+  } else if (task->request_type == kCacheRequestDemand) {
+    request_label = "demand";
+  }
+  NVTX_RANGE(std::string("dispatch/") + request_label + "_io " +
              "L" + std::to_string(task->expert->layer_idx) +
              " E" + std::to_string(task->expert->expert_idx) +
              " P" + std::to_string(task->start_mem_buf_idx) +
@@ -1378,7 +2239,9 @@ bool FetchScheduleWorker::send_one_job(CopyTask *task) {
              " forward_epoch=" + std::to_string(task->forward_epoch));
   LOG(TRACE) << "scheduler: send one prefetch task " << task->toString();
 
-  if (task->is_precise == false && task->expert != nullptr &&
+  if (task->is_precise == false &&
+      task->request_type != kCacheRequestDecoderWarmupPrefetch &&
+      task->expert != nullptr &&
       is_stale_prefetch(task->forward_epoch, task->expert->layer_idx)) {
     LOG(TRACE) << "scheduler: skip stale prefetch copy " << task->toString()
                << ", current forward_epoch " << current_forward_epoch
@@ -1392,13 +2255,29 @@ bool FetchScheduleWorker::send_one_job(CopyTask *task) {
   // not nullptr and not 0: normal
   CacheMngr::CacheLineOccupancyWaiter lambda_wait = [](){};
   if (task->expert->gpu_data == nullptr) {
+    if ((task->request_type == kCacheRequestEncoderPredictorPrefetch ||
+         task->request_type == kCacheRequestEncoderJitRefill ||
+         task->request_type == kCacheRequestDecoderWarmupPrefetch) &&
+        task->start_mem_buf_idx > 0) {
+      return false;
+    }
     CHECK(task->start_mem_buf_idx == 0);
     CHECK(task->expert->num_ready == 0);
     // a missed task
     LOG(TRACE) << "scheduler: assigning gpu mem for expert " << task->toString();
     lambda_wait = cache_miss(task->expert, task->is_precise, task->request_type);
-    if (task->request_type == kCacheRequestDecoderWarmupOverlap &&
+    if ((task->request_type == kCacheRequestEncoderPredictorPrefetch ||
+         task->request_type == kCacheRequestEncoderJitRefill ||
+         task->request_type == kCacheRequestDecoderWarmupPrefetch) &&
         task->expert->gpu_data == nullptr) {
+      if (log_prefetch_decision_enabled()) {
+        LOG(INFO) << "prefetch_decision: skip reclaimable-only request without victim "
+                  << request_label << " L" << task->expert->layer_idx
+                  << " E" << task->expert->expert_idx
+                  << " P" << task->start_mem_buf_idx << "-" << task->stop_mem_buf_idx
+                  << " current_layer=" << current_layer
+                  << " forward_epoch=" << current_forward_epoch;
+      }
       return false;
     }
     task->expert->expert_status.transfer(kIdle, kFetching);
@@ -1434,6 +2313,25 @@ bool FetchScheduleWorker::send_one_job(CopyTask *task) {
   }
 
   {
+    if (log_prefetch_decision_enabled()) {
+      if (task->request_type == kCacheRequestEncoderPredictorPrefetch) {
+        LOG(INFO) << "prefetch_decision: dispatch encoder_predictor_prefetch"
+                  << " L" << task->expert->layer_idx
+                  << " E" << task->expert->expert_idx
+                  << " P" << task->start_mem_buf_idx << "-" << task->stop_mem_buf_idx
+                  << " precise=" << task->is_precise
+                  << " forward_epoch=" << task->forward_epoch
+                  << " generate_epoch=" << task->generate_epoch;
+      } else {
+        LOG(INFO) << "prefetch_decision: dispatch " << request_label
+                  << " L" << task->expert->layer_idx
+                  << " E" << task->expert->expert_idx
+                  << " P" << task->start_mem_buf_idx << "-" << task->stop_mem_buf_idx
+                  << " precise=" << task->is_precise
+                  << " forward_epoch=" << task->forward_epoch
+                  << " generate_epoch=" << task->generate_epoch;
+      }
+    }
     current_task = *task;
     current_task.lambda_wait = lambda_wait;
     fetch_thread->add_one_task(&current_task);

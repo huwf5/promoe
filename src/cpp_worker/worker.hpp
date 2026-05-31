@@ -4,10 +4,12 @@
 #include <condition_variable>
 #include <atomic>
 #include <thread>
+#include <vector>
 #include "cache.hpp"
 #include "utils.hpp"
 #include "model_loader.hpp"
 #include "predictor.hpp"
+#include "erpp_encoder_predictor.hpp"
 #include "profiler.hpp"
 #include <pthread.h>
 
@@ -193,7 +195,7 @@ class CopyTask : public BaseTask {
   bool is_precise = false;
   int64_t forward_epoch = 0;
   int64_t generate_epoch = 0;
-  CacheRequestType request_type = kCacheRequestPrefetch;
+  CacheRequestType request_type = kCacheRequestDecoderPredictorPrefetch;
   ExpertHandler *expert = nullptr;
   CacheMngr::CacheLineOccupancyWaiter lambda_wait = [](){};
   std::string toString() const {
@@ -212,6 +214,7 @@ class CopyTask : public BaseTask {
 };
 
 class FetchScheduleWorker;
+class ErppEncoderPredictor;
 
 class FetchWorker : public WorkerThread<CopyTask*> {
   ModuleMeta* metas;
@@ -399,4 +402,42 @@ class PredictWorker : public WorkerThread<PredictJob> {
 
 protected:
   void do_one_task_impl(PredictJob job) override;
+};
+struct ErppEncoderPredictJob {
+  int64_t forward_epoch = 0;
+  int64_t generate_epoch = 0;
+  ErppEncoderPredictJob(int64_t forward_epoch = 0, int64_t generate_epoch = 0)
+      : forward_epoch(forward_epoch), generate_epoch(generate_epoch) {}
+};
+
+class ErppEncoderPredictWorker : public WorkerThread<ErppEncoderPredictJob> {
+  FetchScheduleWorker* fetch_schedule_thread = nullptr;
+  ErppEncoderPredictor* erpp_encoder_predictor = nullptr;
+  ModuleMeta* metas = nullptr;
+  std::atomic<int64_t> current_generate_epoch{0};
+
+ public:
+  ErppEncoderPredictWorker() : WorkerThread<ErppEncoderPredictJob>() {}
+
+  void init(FetchScheduleWorker* fetch_schedule_thread, ErppEncoderPredictor* erpp_encoder_predictor, ModuleMeta* metas){
+    this->fetch_schedule_thread = fetch_schedule_thread;
+    this->erpp_encoder_predictor = erpp_encoder_predictor;
+    this->metas = metas;
+  }
+
+  void begin_reset_for_generate(){
+    // advance generate_epoch to trigger stale job detection
+    current_generate_epoch.fetch_add(1, std::memory_order_acq_rel);
+    clear_pending_tasks();
+  }
+  void reset_for_generate(int64_t next_generate_epoch){
+    wait_until_idle();
+    clear_pending_tasks();
+    current_generate_epoch.store(next_generate_epoch, std::memory_order_release);
+  }
+
+  void on_encoder_layer0_recorded(int64_t forward_epoch, int64_t generate_epoch);
+
+ protected:
+  void do_one_task_impl(ErppEncoderPredictJob job) override;
 };

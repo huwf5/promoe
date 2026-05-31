@@ -151,13 +151,14 @@ def repo_folder_name(repo_id: str, repo_type: str = 'model') -> str:
   parts = [f"{repo_type}s", *repo_id.split("/")]
   return '--'.join(parts)
 
-def wrap_generate_with_initial_cache(model, prefetch_mngr):
+def wrap_generate_with_initial_cache(model, prefetch_mngr=None):
   if hasattr(model, "_sparse_cache_old_generate"):
     return
   model._sparse_cache_old_generate = model.generate
 
   def generate_with_initial_cache(*args, **kwargs):
-    prefetch_mngr.reset_for_generate()
+    if prefetch_mngr is not None:
+      prefetch_mngr.reset_for_generate()
     return model._sparse_cache_old_generate(*args, **kwargs)
 
   model.generate = generate_with_initial_cache
@@ -249,6 +250,18 @@ def inject_model(
     initial_layer_budgets: str | None = None,
     initial_hot_expert_file: str | None = None,
     enable_decoder_warmup_overlap: bool = False,
+    enable_erpp_encoder_prefetch: bool = False,
+    erpp_encoder_model_path: str | None = None,
+    erpp_encoder_budgets: str = "fixed_p90",
+    erpp_encoder_layers: str = "all",
+    enable_erpp_encoder_jit_refill: bool = False,
+    erpp_encoder_jit_refill_window: int = 1,
+    erpp_encoder_jit_refill_floor_mode: str = "avg",
+    erpp_encoder_jit_refill_floor_value: int = -1,
+    erpp_encoder_jit_refill_low_watermark_ratio: float = 0.90,
+    erpp_encoder_jit_refill_layers: str = "all",
+    erpp_encoder_jit_refill_per_idle: int = 1,
+    enable_erpp_encoder_jit_topk_cover: bool = False,
 
     cache_device : str|int = 'cuda',
     pin_memory : bool  = True,
@@ -446,6 +459,18 @@ def inject_model(
     'initial_expert_plan'          : str(initial_expert_plan),
     'enable_decoder_warmup_overlap': str(enable_decoder_warmup_overlap),
     'decoder_warmup_expert_plan'   : str(decoder_warmup_expert_plan),
+    'enable_erpp_encoder_prefetch' : str(enable_erpp_encoder_prefetch),
+    'erpp_encoder_model_path'      : str(erpp_encoder_model_path),
+    'erpp_encoder_budgets'         : str(erpp_encoder_budgets),
+    'erpp_encoder_layers'          : str(erpp_encoder_layers),
+    'enable_erpp_encoder_jit_refill' : str(enable_erpp_encoder_jit_refill),
+    'erpp_encoder_jit_refill_window' : str(erpp_encoder_jit_refill_window),
+    'erpp_encoder_jit_refill_floor_mode' : str(erpp_encoder_jit_refill_floor_mode),
+    'erpp_encoder_jit_refill_floor_value' : str(erpp_encoder_jit_refill_floor_value),
+    'erpp_encoder_jit_refill_low_watermark_ratio' : str(erpp_encoder_jit_refill_low_watermark_ratio),
+    'erpp_encoder_jit_refill_layers' : str(erpp_encoder_jit_refill_layers),
+    'erpp_encoder_jit_refill_per_idle' : str(erpp_encoder_jit_refill_per_idle),
+    'enable_erpp_encoder_jit_topk_cover' : str(enable_erpp_encoder_jit_topk_cover),
   }
 
   meta.init_from_map(param_dict)
@@ -489,6 +514,16 @@ def inject_model(
     decode_expert_selection  = torch.load(f'{cache_trace_path}/decode_expert_selection.pt')
     entry_to_metas           = torch.load(f'{cache_trace_path}/entry_to_metas.pt')
     prefetch_mngr.cache.cache_oracle.load_from_tensor(entry_to_metas, prefill_expert_len, prefill_expert_selection, decode_expert_selection)
+
+  if enable_erpp_encoder_prefetch:
+    encoder_blocks = getattr(getattr(model, "encoder", None), "block", None)
+    if encoder_blocks is None or len(encoder_blocks) == 0:
+      raise ValueError("ERPP encoder prefetch requires model.encoder.block[0].layer[0]")
+    hooks.add_hook_to_module(
+      encoder_blocks[0].layer[0],
+      hooks.ErppEncoderPrefetchHook(prefetch_mngr),
+      append=True,
+    )
 
   add_hook_to_experts(model, prefetch_mngr, expert_name_filter)
   # add_hook_to_moe_attns(model, prefetch_mngr, moe_attn_name_filter)

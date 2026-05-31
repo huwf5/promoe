@@ -162,6 +162,18 @@ class ModuleMeta {
   std::string initial_expert_plan = "";
   bool enable_decoder_warmup_overlap = false;
   std::string decoder_warmup_expert_plan = "";
+  bool enable_erpp_encoder_prefetch = false;
+  std::string erpp_encoder_model_path = "";
+  std::string erpp_encoder_budgets = "fixed_mean";
+  std::string erpp_encoder_layers = "all";
+  bool enable_erpp_encoder_jit_refill = false;
+  int erpp_encoder_jit_refill_window = 1;
+  std::string erpp_encoder_jit_refill_floor_mode = "avg";
+  int erpp_encoder_jit_refill_floor_value = -1;
+  double erpp_encoder_jit_refill_low_watermark_ratio = 0.90;
+  std::string erpp_encoder_jit_refill_layers = "all";
+  int erpp_encoder_jit_refill_per_idle = 1;
+  bool enable_erpp_encoder_jit_topk_cover = false;
 
   int         max_prefetch_layer_distance = -1;
   bool        cache_only = false;

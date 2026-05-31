@@ -90,43 +90,57 @@ def test_precise_queue_remains_before_reclaimable_drain():
     body = _function_body(cpp, "void FetchScheduleWorker::pop_next_task")
     precise_pos = body.index("precise_job_queue")
     drain_pos = body.index("drain_reclaimable_updates")
-    normal_prefetch_pos = body.index("pop_next_normal_prefetch")
+    prefetch_pos = body.index("pop_next_prefetch_for_class(PrefetchClass::kEncoderPredictor")
     assert precise_pos < drain_pos
-    assert drain_pos < normal_prefetch_pos
+    assert drain_pos < prefetch_pos
 
 
 def test_decoder_warmup_drains_before_has_reclaimable_check():
     cpp = _text(PREFETCHER_CPP)
-    body = _function_body(cpp, "bool FetchScheduleWorker::pop_next_decoder_warmup")
-    drain_pos = body.index("drain_reclaimable_updates")
-    has_pos = body.index("cache->has_reclaimable_encoder")
+    body = _function_body(cpp, "bool FetchScheduleWorker::pop_next_prefetch_for_class")
+    warmup_pos = body.index("PrefetchClass::kDecoderWarmup")
+    drain_pos = body.index("drain_reclaimable_updates", warmup_pos)
+    has_pos = body.index("cache->has_reclaimable_encoder", drain_pos)
     assert drain_pos < has_pos
 
 
-def test_decoder_warmup_overlap_uses_chunked_tasks_when_chunk_prefetch_is_enabled():
+def test_decoder_warmup_prefetch_uses_chunked_tasks_in_unified_queue_set():
     hpp = _text(PREFETCHER_HPP)
     cpp = _text(PREFETCHER_CPP)
 
-    assert "struct DecoderWarmupEntry" in hpp
-    assert "int start_mem_buf_idx" in hpp
-    assert "int stop_mem_buf_idx" in hpp
-    assert "std::queue<DecoderWarmupEntry> decoder_warmup_queue" in hpp
+    assert "TaskQueue decoder_warmup_plan_queue" in hpp
+    assert "std::queue<DecoderWarmupEntry> decoder_warmup_queue" not in hpp
 
     rebuild_body = _function_body(cpp, "void FetchScheduleWorker::rebuild_decoder_warmup_queue")
     assert "metas->chunk_prefetch" in rebuild_body
-    assert "decoder_warmup_queue.push({layer_idx, expert_idx, j, j + 1})" in _compact(rebuild_body)
-    assert (
-        "decoder_warmup_queue.push({layer_idx, expert_idx, 0, metas->num_per_expert_param})"
-        in _compact(rebuild_body)
-    )
+    assert "prefetch_queues.decoder_warmup_plan_queue.push" in rebuild_body
+    assert "task.start_mem_buf_idx = metas->chunk_prefetch ? j : 0" in rebuild_body
+    assert "task.stop_mem_buf_idx = metas->chunk_prefetch ? j + 1 : metas->num_per_expert_param" in rebuild_body
 
-    pop_body = _function_body(cpp, "bool FetchScheduleWorker::pop_next_decoder_warmup")
-    assert "auto entry = decoder_warmup_queue.front()" in pop_body
-    assert "task.start_mem_buf_idx = entry.start_mem_buf_idx" in pop_body
-    assert "task.stop_mem_buf_idx = entry.stop_mem_buf_idx" in pop_body
-    assert "expert->num_ready >= entry.stop_mem_buf_idx" in pop_body
-    assert "expert->gpu_data == nullptr && entry.start_mem_buf_idx > 0" in pop_body
-    assert "task.request_type = kCacheRequestDecoderWarmupOverlap" in pop_body
+    pop_body = _function_body(cpp, "bool FetchScheduleWorker::pop_next_prefetch_for_class")
+    assert "PrefetchClass::kDecoderWarmup" in pop_body
+    assert (
+        "CopyTask candidate = prefetch_queues.decoder_warmup_plan_queue.front()" in pop_body
+        or "auto candidate = prefetch_queues.decoder_warmup_plan_queue.front()" in pop_body
+    )
+    assert "candidate.stop_mem_buf_idx" in pop_body
+    assert "candidate.start_mem_buf_idx" in pop_body
+    assert "task = candidate" in pop_body
+    assert "task.request_type = kCacheRequestDecoderWarmupPrefetch" in rebuild_body
+
+
+def test_decoder_warmup_remains_plan_order_fifo_in_unified_queue_set():
+    hpp = _text(PREFETCHER_HPP)
+    cpp = _text(PREFETCHER_CPP)
+
+    assert "TaskQueue decoder_warmup_plan_queue" in hpp
+    rebuild_body = _function_body(cpp, "void FetchScheduleWorker::rebuild_decoder_warmup_queue")
+    pop_body = _function_body(cpp, "bool FetchScheduleWorker::pop_next_prefetch_for_class")
+
+    assert "prefetch_queues.decoder_warmup_plan_queue.push" in rebuild_body
+    assert "for (auto [layer_idx, expert_idx] : parsed)" in rebuild_body
+    assert "prefetch_queues.decoder_warmup_plan_queue.front()" in pop_body
+    assert "prefetch_queues.decoder_warmup_plan_queue.pop()" in pop_body
 
 
 def test_cache_reset_discards_partial_chunk_prefetch_entries_but_not_active_experts():
@@ -156,6 +170,78 @@ def test_cache_manager_destructor_retires_scheduler_aware_policy():
     assert 'metas->cache_policy == "scheduler_aware"' in body
     assert "retired_scheduler_aware_policies().push_back(l.policy)" in body
     assert "l.policy.reset()" in body
+
+
+
+
+def test_encoder_jit_occupancy_uses_cache_count_directly_and_submitted_mask_only_dedupes():
+    cache_hpp = _text(CACHE_HPP)
+    cache_cpp = _text(CACHE_CPP)
+    prefetcher_hpp = _text(PREFETCHER_HPP)
+    prefetcher_cpp = _text(PREFETCHER_CPP)
+
+    assert "encoder_layer_cached_count" in cache_hpp
+    assert "int encoder_layer_cache_occupancy(int layer_idx) const" in cache_hpp
+    assert "CacheMngr::encoder_layer_cache_occupancy(int layer_idx) const" in cache_cpp
+
+    assert "encoder_jit_submitted_mask" in prefetcher_hpp
+    assert "encoder_jit_submitted_count" not in prefetcher_hpp
+    assert "encoder_jit_submitted_count" not in prefetcher_cpp
+    assert "encoder_jit_occupancy" not in prefetcher_hpp
+    assert "FetchScheduleWorker::encoder_jit_occupancy" not in prefetcher_cpp
+
+    mark_body = _function_body(prefetcher_hpp, "void mark_encoder_jit_submitted(int layer_idx, int expert_idx)")
+    assert "encoder_jit_submitted_mask[layer_idx][expert_idx] = 1" in mark_body
+    assert "encoder_jit_submitted_count" not in mark_body
+
+    refill_body = _function_body(prefetcher_cpp, "void FetchScheduleWorker::maybe_enqueue_encoder_jit_refill")
+    assert "const int occupancy = cache->encoder_layer_cache_occupancy(layer_idx);" in refill_body
+    assert "encoder_jit_occupancy" not in refill_body
+
+
+def test_encoder_jit_refill_per_idle_minus_one_disables_enqueue_limit():
+    cpp = _text(PREFETCHER_CPP)
+    body = _function_body(cpp, "void FetchScheduleWorker::maybe_enqueue_encoder_jit_refill")
+
+    assert "metas->erpp_encoder_jit_refill_per_idle > 0" in body
+    assert "enqueued >= metas->erpp_encoder_jit_refill_per_idle" in body
+    assert "reason=per_idle_limit" in body
+
+
+def test_encoder_jit_refill_dispatch_only_requires_reclaimable_or_unused_slot():
+    cpp = _text(PREFETCHER_CPP)
+    body = _function_body(cpp, "bool FetchScheduleWorker::encoder_jit_can_dispatch")
+
+    assert "cache->has_unused_slot_for(task.expert)" in body
+    assert "cache->has_reclaimable_encoder()" in body
+    assert "has_safe_encoder_jit_refill_victim" not in body
+    assert "encoder_jit_floor()" not in body
+    assert "encoder_jit_protected_layers()" not in body
+
+
+def test_encoder_jit_refill_cache_policy_is_reclaimable_only_without_context():
+    cpp = _text(CACHE_CPP)
+    hpp = _text(CACHE_HPP)
+    select_body = _function_body(
+        cpp,
+        "ExpertHandler* CachePolicySchedulerAware::select_for_evict(\n"
+        "    ExpertHandler* incoming,\n"
+        "    CacheRequestType request_type)",
+    )
+
+    assert "first_loaded_candidate(reclaimable_map, reclaimable_encoder_lru)" in select_body
+    assert "request_type == kCacheRequestEncoderJitRefill" not in select_body
+    assert "encoder_jit_refill_context" not in hpp
+    assert "has_safe_encoder_jit_refill_victim" not in hpp
+    assert "set_encoder_jit_refill_context" not in hpp
+    assert "clear_encoder_jit_refill_context" not in hpp
+    assert "first_safe_encoder_jit_refill_candidate" not in cpp
+    prefetcher_cpp = _text(PREFETCHER_CPP)
+    prefetcher_hpp = _text(PREFETCHER_HPP)
+
+    assert "encoder_layer_occupancy" not in cpp
+    assert "encoder_jit_protected_layers" not in prefetcher_cpp
+    assert "encoder_jit_protected_layers" not in prefetcher_hpp
 
 
 def test_scheduler_aware_reset_does_not_depend_on_list_traversal_or_destruction():
@@ -190,10 +276,11 @@ def test_preempt_task_drains_after_layer_preempt_and_queue_cleanup():
     cpp = _text(PREFETCHER_CPP)
     body = _function_body(cpp, "void FetchScheduleWorker::do_one_task_impl(PreemptTask *task)")
     advance_pos = body.index("advance_actual_layer")
-    queue_cleanup_pos = body.rindex("per_layer_job_queues")
+    queue_cleanup_pos = body.index("clear_prefetch_class_for_layer")
     drain_pos = body.index("drain_reclaimable_updates")
     assert advance_pos < drain_pos
     assert queue_cleanup_pos < drain_pos
+    assert "per_layer_job_queues" not in body
 
 
 def test_preempt_layer_deduplicates_experts_before_launch_transition():

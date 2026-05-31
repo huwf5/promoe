@@ -312,6 +312,39 @@ def gen_batch(text_list, do_print=False, max_new_tokens=100):
 dataset_path = f'/mnt/huwf5/promoe/deps/sparse-llm-cache-scripts/dataset/mmlu/professional_law/{cache_configs["dataset"]}/prompt_list.pt'
 print(dataset_path)
 prompts = torch.load(dataset_path)
+original_prompt_indices = list(range(len(prompts)))
+sample_indices_env = os.environ.get("PROMOE_SAMPLE_INDICES", "").strip()
+
+def _parse_sample_indices(spec: str) -> list[int]:
+  result = []
+  for raw_item in spec.split(","):
+    item = raw_item.strip()
+    if not item:
+      continue
+    if "-" in item:
+      start_s, stop_s = item.split("-", 1)
+      start = int(start_s.strip())
+      stop = int(stop_s.strip())
+      if stop < start:
+        raise ValueError(f"invalid descending PROMOE_SAMPLE_INDICES range: {item}")
+      result.extend(range(start, stop + 1))
+    else:
+      result.append(int(item))
+  return result
+
+if sample_indices_env:
+  sample_indices = _parse_sample_indices(sample_indices_env)
+  invalid_indices = [idx for idx in sample_indices if idx < 0 or idx >= len(prompts)]
+  if invalid_indices:
+    raise ValueError(
+      f"PROMOE_SAMPLE_INDICES contains out-of-range indices {invalid_indices}; "
+      f"dataset has {len(prompts)} prompts"
+    )
+  prompts = [prompts[idx] for idx in sample_indices]
+  original_prompt_indices = sample_indices
+  cache_configs["max_num_batch"] = min(cache_configs["max_num_batch"], len(prompts))
+  print(f"PROMOE_SAMPLE_INDICES={sample_indices}", flush=True)
+  print(f"selected_prompt_count={len(prompts)}", flush=True)
 
 from torch.utils.data import Dataset
 class StringListDataset(Dataset):
@@ -335,7 +368,10 @@ with _nvtx_range("promoe/eval_all_batches"):
     if seq_id >= cache_configs['max_num_batch']:
       print("max_num_batch reached")
       break
-    print(f'Seq {seq_id}/{cache_configs["max_num_batch"]}, decoding...', flush=True)
+    batch_start = seq_id * cache_configs['batch_size']
+    batch_stop = min(batch_start + cache_configs['batch_size'], len(original_prompt_indices))
+    original_seq_ids = original_prompt_indices[batch_start:batch_stop]
+    print(f'Seq {seq_id}/{cache_configs["max_num_batch"]}, original_seq_ids={original_seq_ids}, decoding...', flush=True)
     with _nvtx_benchmark_batch(seq_id, _explicit_agg.warmup_samples):
       input_len, output_len = gen_batch(text_list, max_new_tokens=cache_configs['max_new_tokens'], do_print=True)
 eval_time = time.time() - eval_time_start

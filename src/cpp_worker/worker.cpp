@@ -3,7 +3,114 @@
 #include "profiler.hpp"
 #include "prefetcher.hpp"
 #include "nvtx_utils.hpp"
+#include "erpp_encoder_predictor.hpp"
+#include <cstdlib>
+namespace {
+const char* cache_request_label(CacheRequestType request_type) {
+  switch (request_type) {
+    case kCacheRequestDemand: return "demand";
+    case kCacheRequestEncoderPredictorPrefetch: return "encoder_predictor_prefetch";
+    case kCacheRequestEncoderJitRefill: return "encoder_jit_refill";
+    case kCacheRequestDecoderPredictorPrefetch: return "decoder_predictor_prefetch";
+    case kCacheRequestDecoderWarmupPrefetch: return "decoder_warmup_prefetch";
+    case kCacheRequestInitialLoad: return "initial_load";
+  }
+  return "unknown";
+}
+bool log_erpp_encoder_prefetch_enabled() {
+  const char* erpp_flag = std::getenv("SPARSE_CACHE_LOG_ERPP_ENCODER_PREFETCH");
+  if (erpp_flag != nullptr && erpp_flag[0] != '\0' && erpp_flag[0] != '0') {
+    return true;
+  }
+  const char* scheduler_flag = std::getenv("SPARSE_CACHE_LOG_PREFETCH_DECISION");
+  return scheduler_flag != nullptr && scheduler_flag[0] != '\0' && scheduler_flag[0] != '0';
+}
+}  // namespace
 
+void ErppEncoderPredictWorker::do_one_task_impl(ErppEncoderPredictJob job) {
+  const int64_t current_generate_epoch = this->current_generate_epoch.load(std::memory_order_acquire);
+  CHECK(!(job.generate_epoch != current_generate_epoch))
+      << "stale generate task: task_generate_epoch=" << job.generate_epoch
+      << ", current_generate_epoch=" << current_generate_epoch;
+
+  NVTX_RANGE("erpp/predict/thread forward_epoch=" + std::to_string(job.forward_epoch));
+
+  if (log_erpp_encoder_prefetch_enabled()) {
+    LOG(INFO) << "erpp_encoder_prefetch: start predict job"
+              << " forward_epoch=" << job.forward_epoch
+              << " generate_epoch=" << job.generate_epoch;
+  }
+
+  auto predictions = erpp_encoder_predictor->predict_recorded();
+
+  if (log_erpp_encoder_prefetch_enabled()) {
+    LOG(INFO) << "erpp_encoder_prefetch: predict done"
+              << " layers=" << predictions.size();
+  }
+
+  if (metas->enable_erpp_encoder_jit_refill) {
+    ErppEncoderJitRankingsTask task;
+    task.forward_epoch = job.forward_epoch;
+    task.generate_epoch = job.generate_epoch;
+    task.rankings = predictions;
+    task.budgets.reserve(predictions.size());
+    for (int layer_idx = 0; layer_idx < static_cast<int>(predictions.size()); layer_idx++) {
+      task.budgets.push_back(erpp_encoder_predictor->encoder_budget_for_layer(layer_idx));
+    }
+    if (log_erpp_encoder_prefetch_enabled()) {
+      LOG(INFO) << "erpp_encoder_jit_refill: submit scheduler rankings"
+                << " forward_epoch=" << task.forward_epoch
+                << " generate_epoch=" << task.generate_epoch
+                << " layers=" << task.rankings.size();
+    }
+    NVTX_RANGE("erpp/submit_encoder_jit_rankings forward_epoch=" +
+               std::to_string(task.forward_epoch));
+    auto handler = fetch_schedule_thread->add_one_task(&task);
+    fetch_schedule_thread->wait_progress(handler);
+    return;
+  }
+
+  // Not JIT refill, submit prefetch tasks for each layer
+  for (int layer_idx = 0; layer_idx < static_cast<int>(predictions.size()); layer_idx++) {
+    CHECK(layer_idx >= 0 && layer_idx < metas->num_layer)
+        << "ERPP encoder predicted layer out of global cache range: " << layer_idx;
+    if (!erpp_encoder_predictor->should_prefetch_layer(layer_idx)) {
+      if (log_erpp_encoder_prefetch_enabled()) {
+        LOG(INFO) << "erpp_encoder_prefetch: skip disabled predicted layer L" << layer_idx;
+      }
+      continue;
+    }
+    auto& experts = predictions[layer_idx];
+    if (experts.empty()) {
+      if (log_erpp_encoder_prefetch_enabled()) {
+        LOG(INFO) << "erpp_encoder_prefetch: skip empty predicted layer L" << layer_idx;
+      }
+      continue;
+    }
+
+    PrefetchLayerTask task;
+    task.layer_idx = layer_idx;
+    task.forward_epoch = job.forward_epoch;
+    task.generate_epoch = job.generate_epoch;
+    task.expert_idxs = experts.data();
+    task.num_expert = experts.size();
+    task.request_type = kCacheRequestEncoderPredictorPrefetch;
+    {
+      if (log_erpp_encoder_prefetch_enabled()) {
+        LOG(INFO) << "erpp_encoder_prefetch: submit scheduler layer L" << layer_idx
+                  << " num_expert=" << task.num_expert
+                  << " experts=[" << array_to_str(task.expert_idxs, task.num_expert) << "]"
+                  << " forward_epoch=" << task.forward_epoch
+                  << " generate_epoch=" << task.generate_epoch;
+      }
+      NVTX_RANGE("erpp/submit_encoder_prefetch L" + std::to_string(layer_idx) +
+                 " N" + std::to_string(task.num_expert) +
+                 " forward_epoch=" + std::to_string(job.forward_epoch));
+      auto handler = fetch_schedule_thread->add_one_task(&task);
+      fetch_schedule_thread->wait_progress(handler);
+    }
+  }
+}
 void PredictWorker::do_one_task_impl(PredictJob job) {
   const int64_t current_generate_epoch = this->current_generate_epoch.load(std::memory_order_acquire);
   CHECK(!(job.generate_epoch != current_generate_epoch))
@@ -107,6 +214,22 @@ void ExpertUnlockWorker::do_one_task_impl(ExpertHandler *task) {
 }
 void FetchWorker::do_one_task_impl(CopyTask *task) {
   TRACE_EVENT_GURAD(kFetcher, "fetch:" + task->toString());
+  const char* request_label = cache_request_label(task->request_type);
+  if (log_erpp_encoder_prefetch_enabled() &&
+      task->request_type == kCacheRequestEncoderPredictorPrefetch) {
+    LOG(INFO) << "fetcher: start encoder_predictor_prefetch L"
+              << task->expert->layer_idx << " E" << task->expert->expert_idx
+              << " P" << task->start_mem_buf_idx << "-" << task->stop_mem_buf_idx
+              << " forward_epoch=" << task->forward_epoch
+              << " generate_epoch=" << task->generate_epoch;
+  } else if (log_erpp_encoder_prefetch_enabled() &&
+             task->request_type == kCacheRequestEncoderJitRefill) {
+    LOG(INFO) << "fetcher: start encoder_jit_refill L"
+              << task->expert->layer_idx << " E" << task->expert->expert_idx
+              << " P" << task->start_mem_buf_idx << "-" << task->stop_mem_buf_idx
+              << " forward_epoch=" << task->forward_epoch
+              << " generate_epoch=" << task->generate_epoch;
+  }
   NVTX_RANGE("fetch/task L" + std::to_string(task->expert->layer_idx) +
              " E" + std::to_string(task->expert->expert_idx) +
              " P" + std::to_string(task->start_mem_buf_idx) +
@@ -150,6 +273,23 @@ void FetchWorker::do_one_task_impl(CopyTask *task) {
     NVTX_RANGE("fetch/sync L" + std::to_string(task->expert->layer_idx) +
                " E" + std::to_string(task->expert->expert_idx));
     CUDA_CALL(cudaStreamSynchronize(this->stream));
+  }
+  if (log_erpp_encoder_prefetch_enabled() &&
+      task->request_type == kCacheRequestEncoderPredictorPrefetch) {
+    LOG(INFO) << "fetcher: done encoder_predictor_prefetch L"
+              << task->expert->layer_idx << " E" << task->expert->expert_idx
+              << " P" << task->start_mem_buf_idx << "-" << task->stop_mem_buf_idx
+              << " request=" << request_label
+              << " forward_epoch=" << task->forward_epoch
+              << " generate_epoch=" << task->generate_epoch;
+  } else if (log_erpp_encoder_prefetch_enabled() &&
+             task->request_type == kCacheRequestEncoderJitRefill) {
+    LOG(INFO) << "fetcher: done encoder_jit_refill L"
+              << task->expert->layer_idx << " E" << task->expert->expert_idx
+              << " P" << task->start_mem_buf_idx << "-" << task->stop_mem_buf_idx
+              << " request=" << request_label
+              << " forward_epoch=" << task->forward_epoch
+              << " generate_epoch=" << task->generate_epoch;
   }
   fetch_schedule_thread->add_one_task(&fetch_schedule_thread->copy_done_task);
 }
@@ -216,4 +356,19 @@ void PredictWorker::on_moe_layer_logits_recorded(int layer_id, int64_t forward_e
     }
     default: { CHECK(false) << "Unknown predict input mode in on_moe_layer_logits_recorded"; }
   }
+}
+
+void ErppEncoderPredictWorker::on_encoder_layer0_recorded(
+    int64_t forward_epoch, int64_t generate_epoch) {
+  CHECK(erpp_encoder_predictor != nullptr);
+  CHECK(fetch_schedule_thread != nullptr);
+  CHECK(metas != nullptr);
+  current_generate_epoch.store(generate_epoch, std::memory_order_release);
+  ErppEncoderPredictJob job(forward_epoch, generate_epoch);
+  if (log_erpp_encoder_prefetch_enabled()) {
+    LOG(INFO) << "erpp_encoder_prefetch: enqueue predict job"
+              << " forward_epoch=" << job.forward_epoch
+              << " generate_epoch=" << job.generate_epoch;
+  }
+  add_one_task(job);
 }

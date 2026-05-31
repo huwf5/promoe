@@ -17,6 +17,7 @@ setup(
                 'src/cpp_worker/adapter-llama.cpp',
                 'src/cpp_worker/adapter.cpp',
                 'src/cpp_worker/logging.cc',
+                'src/cpp_worker/erpp_encoder_predictor.cpp',
                 'src/cpp_worker/model_loader.cpp',
                 'src/cpp_worker/prefetcher.cpp',
                 'src/cpp_worker/predictor.cpp',

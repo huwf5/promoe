@@ -1,5 +1,6 @@
 # %%
 import argparse
+import re
 
 class CustomBooleanAction(argparse.Action):
   def __init__(self, option_strings, dest, nargs=None, **kwargs):
@@ -18,6 +19,7 @@ class CustomBooleanAction(argparse.Action):
 def prepare_argparser(parser = None):
   if parser is None:
     parser = argparse.ArgumentParser()
+  parser._negative_number_matcher = re.compile(r'^-\d+(?:,-?\d+)*$|^-\d+(?:\.\d*)?$|^-\.\d+$')
   parser.add_argument("--model_id",                     type=str)
   parser.add_argument("--model_revision",               type=str)
 
@@ -48,6 +50,19 @@ def prepare_argparser(parser = None):
   parser.add_argument("--initial_layer_budgets",          type=str) # manual only
   parser.add_argument("--initial_hot_expert_file",        type=str) # hot_expert/hot_encoder_coverage/hot_encoder_balanced_coverage only
   parser.add_argument("--enable_decoder_warmup_overlap",  action=CustomBooleanAction)
+
+  parser.add_argument("--enable_erpp_encoder_prefetch", action=CustomBooleanAction)
+  parser.add_argument("--erpp_encoder_model_path")
+  parser.add_argument("--erpp_encoder_budgets")
+  parser.add_argument("--erpp_encoder_layers")
+  parser.add_argument("--enable_erpp_encoder_jit_refill", action=CustomBooleanAction)
+  parser.add_argument("--erpp_encoder_jit_refill_window", type=int)
+  parser.add_argument("--erpp_encoder_jit_refill_floor_mode", choices=["avg", "fixed"])
+  parser.add_argument("--erpp_encoder_jit_refill_floor_value", type=int)
+  parser.add_argument("--erpp_encoder_jit_refill_low_watermark_ratio", type=float)
+  parser.add_argument("--erpp_encoder_jit_refill_layers")
+  parser.add_argument("--erpp_encoder_jit_refill_per_idle", type=int)
+  parser.add_argument("--enable_erpp_encoder_jit_topk_cover", action=CustomBooleanAction)
 
   parser.add_argument("--trace_event",        action=CustomBooleanAction)
   parser.add_argument("--module_trace_event", action=CustomBooleanAction)

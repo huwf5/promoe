@@ -73,7 +73,7 @@ def test_preserve_forward_epoch_does_not_touch_decoder_warmup_state():
 
     assert "set_phase(kEncoderPhase)" not in preserve_case
     assert "rebuild_decoder_warmup_queue()" not in preserve_case
-    assert "clear_decoder_warmup_queue()" not in preserve_case
+    assert "clear_decoder_warmup_plan_queue()" not in preserve_case
 
 
 def test_clearing_normal_job_queues_preserves_decoder_warmup_queue():
@@ -82,10 +82,10 @@ def test_clearing_normal_job_queues_preserves_decoder_warmup_queue():
 
     assert "clear_all_prefetch_queues()" in body
     assert "precise_job_queue.clear()" in body
-    assert "clear_decoder_warmup_queue()" not in body
+    assert "clear_decoder_warmup_plan_queue()" not in body
 
 
-def test_actual_decoder_layer_clears_decoder_warmup_queue():
+def test_actual_decoder_layer_preserves_decoder_warmup_queue():
     cpp = _read(PREFETCHER_CPP)
     body = _function_body(cpp, "void FetchScheduleWorker::advance_actual_layer")
     set_phase_body = _function_body(cpp, "void FetchScheduleWorker::set_phase")
@@ -93,7 +93,8 @@ def test_actual_decoder_layer_clears_decoder_warmup_queue():
     assert "metas->is_decoder_layer(layer_idx)" in body
     assert "set_phase(kDecoderPredictorPhase)" in body
     assert "phase == kDecoderPredictorPhase" in set_phase_body
-    assert "clear_decoder_warmup_queue()" in set_phase_body
+    assert "clear_decoder_warmup_plan_queue()" not in set_phase_body
+    assert "clear_prefetch_class_up_to_layer(PrefetchClass::kDecoderWarmup" not in body
 
 
 def test_last_layer_forward_epoch_boundary_preserves_decoder_warmup_overlap():
@@ -138,15 +139,17 @@ def test_forward_epoch_boundary_filters_prefetch_queues_by_task_epoch():
         cpp,
         "void FetchScheduleWorker::clear_stale_prefetch_queues_before_epoch",
     )
-    assert "for (auto& queue : per_layer_job_queues)" in body
+    assert "prefetch_queues.encoder_predictor_by_layer" in body
+    assert "prefetch_queues.decoder_predictor_by_layer" in body
+    assert "prefetch_queues.decoder_warmup_plan_queue" not in body
     assert "TaskQueue kept" in body
     assert "CopyTask task = queue.front()" in body
     assert "queue.pop()" in body
     assert "task.forward_epoch >= min_forward_epoch" in body
     assert "kept.push(task)" in body
-    assert "queue.clear()" in body
     assert "queue.push(task)" in body
     assert body.index("kept.push(task)") < body.rindex("queue.push(task)")
+    assert "per_layer_job_queues" not in body
     assert "precise_job_queue" not in body
 
 
@@ -162,6 +165,31 @@ def test_normal_forward_epoch_advance_preserves_future_prefetch_tasks():
     assert "clear_stale_prefetch_queues_before_epoch(current_forward_epoch)" in boundary
     assert "precise_job_queue.clear()" in boundary
     assert "clear_all_job_queues()" not in boundary
+
+
+def test_decoder_warmup_is_not_pruned_by_forward_epoch_or_layer_progress():
+    cpp = _read(PREFETCHER_CPP)
+    body = _function_body(cpp, "void FetchScheduleWorker::prune_prefetch_class")
+    warmup_branch = body[body.rindex("} else {"):]
+
+    assert "prune_decoder_warmup_queue" in warmup_branch
+    assert "prune_queue(prefetch_queues.decoder_warmup_plan_queue" not in warmup_branch
+
+
+def test_send_one_job_does_not_treat_decoder_warmup_as_layer_stale():
+    cpp = _read(PREFETCHER_CPP)
+    body = _function_body(cpp, "bool FetchScheduleWorker::send_one_job")
+    stale_guard = body[body.index("if (task->is_precise == false"):body.index("// nullptr and 0: first time task")]
+
+    assert "task->request_type != kCacheRequestDecoderWarmupPrefetch" in stale_guard
+
+
+def test_decoder_warmup_prefetch_can_run_after_decoder_phase_starts():
+    cpp = _read(PREFETCHER_CPP)
+    body = _function_body(cpp, "bool FetchScheduleWorker::requires_encoder_phase")
+
+    assert "cls == PrefetchClass::kEncoderPredictor" in body
+    assert "PrefetchClass::kDecoderWarmup" not in body
 
 
 def test_reset_still_discards_all_prefetch_and_precise_work():

@@ -5,8 +5,11 @@
 class CacheMngr;
 enum CacheRequestType {
   kCacheRequestDemand = 0,
-  kCacheRequestPrefetch,
-  kCacheRequestDecoderWarmupOverlap,
+  kCacheRequestEncoderPredictorPrefetch,
+  kCacheRequestEncoderJitRefill,
+  kCacheRequestDecoderPredictorPrefetch,
+  kCacheRequestDecoderWarmupPrefetch,
+  kCacheRequestInitialLoad,
 };
 
 class CachePolicy {
@@ -252,7 +255,6 @@ class CachePolicySchedulerAware : public CachePolicy {
   void recycle_node(LL::Node* node);
   void touch(std::unordered_map<ExpertHandler*, LL::Node*>& map, LL& list, ExpertHandler* expert);
   ExpertHandler* first_loaded_candidate(std::unordered_map<ExpertHandler*, LL::Node*>& map, LL& list);
-
  public:
   using CachePolicy::CachePolicy;
   ~CachePolicySchedulerAware();
@@ -312,6 +314,9 @@ class CacheMngr {
   float max_priority = std::numeric_limits<float>::min();
   std::function<float(ExpertHandler*)> priority_get_fn = [](ExpertHandler* e) ->float { return 0; };
   std::function<void(ExpertHandler*, float)> priority_set_fn = [](ExpertHandler* e, float p) {};
+  std::vector<int> encoder_layer_cached_count;
+  void increment_encoder_layer_cached_count(ExpertHandler* expert);
+  void decrement_encoder_layer_cached_count(ExpertHandler* expert);
 
  public:
   std::shared_ptr<CacheOracle> cache_oracle;
@@ -361,6 +366,8 @@ class CacheMngr {
   void mark_layer_reclaimable_except(int layer_idx, const std::unordered_set<int>& needed_eids);
   void mark_layer_reclaimable_except(int layer_idx, const std::vector<uint8_t>& needed_mask);
   bool has_reclaimable_encoder() const;
+  bool has_unused_slot_for(ExpertHandler* expert) const;
+  int encoder_layer_cache_occupancy(int layer_idx) const;
 
   void update_all_priority(torch::Tensor p);
   void update_some_priority(torch::Tensor p, int starting_layer);

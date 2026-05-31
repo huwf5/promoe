@@ -1,20 +1,21 @@
 #pragma once
+#include <algorithm>
 #include <atomic>
-#include <bitset>
-#include <unistd.h>
+#include <cmath>
+#include <mutex>
 #include <unordered_map>
 #include <string>
 #include <unordered_set>
 #include <vector>
 #include <queue>
-#include <cuda_runtime.h>
-#include <semaphore.h>
+#include <sstream>
 #include <ATen/cuda/CUDAContext.h>
 
 #include "worker.hpp"
 #include "utils.hpp"
 #include "model_loader.hpp"
 #include "predictor.hpp"
+#include "erpp_encoder_predictor.hpp"
 #include "cache.hpp"
 #include "profiler.hpp"
 
@@ -30,6 +31,7 @@ class FetchScheduleTaskBase {
     kPreemptOneExpert,
     kForwardEpochStart,
     kReset,
+    kErppEncoderJitRankings,
   };
   TaskType task_type;
   FetchScheduleTaskBase(TaskType task_type) : task_type(task_type) {}
@@ -63,6 +65,7 @@ class PrefetchLayerTask : public FetchScheduleTaskBase {
   int64_t generate_epoch = 0;
   int64_t* expert_idxs;
   size_t num_expert;
+  CacheRequestType request_type = kCacheRequestDecoderPredictorPrefetch;
 };
 class FetchDoneTask : public FetchScheduleTaskBase {
  public:
@@ -88,8 +91,27 @@ class ResetTask : public FetchScheduleTaskBase {
   DecoderWarmupAction action = DecoderWarmupAction::kClear;
 };
 
+class ErppEncoderJitRankingsTask : public FetchScheduleTaskBase {
+ public:
+  ErppEncoderJitRankingsTask() : FetchScheduleTaskBase(kErppEncoderJitRankings) {}
+  int64_t forward_epoch = 0;
+  int64_t generate_epoch = 0;
+  std::vector<std::vector<int64_t>> rankings;
+  std::vector<int> budgets;
+};
+
 class FetchScheduleWorker : public WorkerThread<FetchScheduleTaskBase*> {
   using TaskQueue = Queue<CopyTask>;
+  enum class PrefetchClass {
+    kEncoderPredictor = 0,
+    kDecoderPredictor,
+    kDecoderWarmup,
+  };
+  struct PrefetchQueueSet {
+    std::vector<TaskQueue> encoder_predictor_by_layer;
+    std::vector<TaskQueue> decoder_predictor_by_layer;
+    TaskQueue decoder_warmup_plan_queue;
+  };
 
   ModuleMeta*      metas;
   ModelLoader*     model_loader;
@@ -129,7 +151,7 @@ class FetchScheduleWorker : public WorkerThread<FetchScheduleTaskBase*> {
   /** protected by queue_lock */
   AtomicQueueLock task_queue_lock;
   #endif
-  std::vector<TaskQueue> per_layer_job_queues; // the fetching thread takes out the first task from queue, then execute it.
+  PrefetchQueueSet prefetch_queues;
   /** no lock requried */
   TaskQueue precise_job_queue;
   enum SchedulerPhase {
@@ -137,13 +159,6 @@ class FetchScheduleWorker : public WorkerThread<FetchScheduleTaskBase*> {
     kDecoderPredictorPhase,
   };
   SchedulerPhase phase = kEncoderPhase;
-  struct DecoderWarmupEntry {
-    int layer_idx = -1;
-    int expert_idx = -1;
-    int start_mem_buf_idx = 0;
-    int stop_mem_buf_idx = 0;
-  };
-  std::queue<DecoderWarmupEntry> decoder_warmup_queue;
   std::unordered_set<int64_t> decoder_warmup_seen;
   struct PendingReclaimableUpdate {
     enum Mode {
@@ -162,6 +177,13 @@ class FetchScheduleWorker : public WorkerThread<FetchScheduleTaskBase*> {
   std::vector<int> pending_reclaimable_layers;
   std::vector<uint8_t> pending_reclaimable_layer_mask;
   std::atomic<bool> has_pending_reclaimable_updates{false};
+  std::vector<std::vector<int64_t>> encoder_jit_rankings;
+  std::vector<int> encoder_jit_budgets;
+  std::vector<std::vector<uint8_t>> encoder_jit_submitted_mask;
+  std::vector<uint8_t> encoder_jit_enabled_layer_mask;
+  int64_t encoder_jit_forward_epoch = -1;
+  int64_t encoder_jit_generate_epoch = -1;
+
 
   #ifdef DEAD_CODE
   inline void lock_task_queue() { task_queue_lock.lock(); }
@@ -176,6 +198,7 @@ class FetchScheduleWorker : public WorkerThread<FetchScheduleTaskBase*> {
   void do_one_task_impl(PrefetchLayerTask *task);
   void do_one_task_impl(ForwardEpochStartTask *task);
   void do_one_task_impl(ResetTask *task);
+  void do_one_task_impl(ErppEncoderJitRankingsTask *task);
 
   void pop_next_task(CopyTask &task, bool &found);
 
@@ -196,16 +219,113 @@ class FetchScheduleWorker : public WorkerThread<FetchScheduleTaskBase*> {
   void clear_stale_prefetch_queues_before_epoch(int64_t min_forward_epoch);
   void clear_all_job_queues();
   void set_phase(SchedulerPhase next_phase);
-  void clear_decoder_warmup_queue();
+  void clear_decoder_warmup_plan_queue();
   void rebuild_decoder_warmup_queue();
   bool parse_layer_expert_plan(const std::string& plan, std::vector<std::pair<int, int>>& out);
-  bool pop_next_normal_prefetch(CopyTask& task);
-  bool pop_next_decoder_warmup(CopyTask& task);
+  PrefetchClass prefetch_class_for_request(CacheRequestType request_type) const;
+  CacheRequestType request_type_for_prefetch_class(PrefetchClass cls) const;
+  bool requires_encoder_phase(PrefetchClass cls) const;
+  bool requires_reclaimable_encoder(PrefetchClass cls) const;
+  bool blocks_lower_priority_when_pending(PrefetchClass cls) const;
+  bool replace_same_layer_on_enqueue(PrefetchClass cls) const;
+  bool pop_next_prefetch_for_class(PrefetchClass cls, CopyTask& task, bool* blocked_lower_priority = nullptr);
+  bool has_pending_prefetch_for_class(PrefetchClass cls);
+  void prune_prefetch_class(PrefetchClass cls);
+  TaskQueue* queue_for_class_and_layer(PrefetchClass cls, int layer_idx);
+  const TaskQueue* queue_for_class_and_layer(PrefetchClass cls, int layer_idx) const;
+  void clear_prefetch_class(PrefetchClass cls);
+  void clear_prefetch_class_up_to_layer(PrefetchClass cls, int layer_idx);
+  void clear_prefetch_class_for_layer(PrefetchClass cls, int64_t forward_epoch, int layer_idx);
   int64_t flatten_expert(int layer_idx, int expert_idx) const;
   void ensure_reclaimable_pending_initialized();
   void reset_pending_reclaimable_updates();
   void note_pending_reclaimable_layer_locked(int layer_idx);
   bool is_idle();
+  void store_erpp_encoder_jit_rankings(const ErppEncoderJitRankingsTask& task);
+  void clear_encoder_jit_state() {
+    encoder_jit_rankings.clear();
+    encoder_jit_budgets.clear();
+    encoder_jit_submitted_mask.clear();
+    encoder_jit_forward_epoch = -1;
+    encoder_jit_generate_epoch = -1;
+  }
+  void initialize_encoder_jit_enabled_layer_mask() {
+    encoder_jit_enabled_layer_mask.assign(metas->num_encoder_moe_layer, 0);
+    const std::string& spec = metas->erpp_encoder_jit_refill_layers;
+    if (spec == "all") {
+      std::fill(encoder_jit_enabled_layer_mask.begin(),
+                encoder_jit_enabled_layer_mask.end(),
+                1);
+      return;
+    }
+
+    std::stringstream ss(spec);
+    std::string item;
+    while (std::getline(ss, item, ',')) {
+      if (item.empty()) {
+        continue;
+      }
+      int parsed = std::stoi(item);
+      if (parsed < 0) {
+        parsed += metas->num_encoder_moe_layer;
+      }
+      if (parsed >= 0 && parsed < metas->num_encoder_moe_layer) {
+        encoder_jit_enabled_layer_mask[parsed] = 1;
+      }
+    }
+  }
+  void mark_encoder_jit_submitted(int layer_idx, int expert_idx) {
+    CHECK(layer_idx >= 0 && layer_idx < static_cast<int>(encoder_jit_submitted_mask.size())) << "layer_idx is out of range";
+    CHECK(expert_idx >= 0 && expert_idx < static_cast<int>(encoder_jit_submitted_mask[layer_idx].size())) << "expert_idx is out of range";
+    encoder_jit_submitted_mask[layer_idx][expert_idx] = 1;
+  }
+
+  bool encoder_jit_is_submitted(int layer_idx, int expert_idx) const {
+    return encoder_jit_submitted_mask[layer_idx][expert_idx];
+  }
+
+  // Per-layer minimum expert count (cache + in-flight refill) for encoder JIT refill.
+  // When occupancy drops below low_watermark (floor * ratio), refill ranks experts up to floor.
+  // Also passed to cache eviction as a per-layer retention hint (see encoder_jit_can_dispatch).
+  int encoder_jit_floor() const {
+    int floor_value = 1;
+    if (metas->erpp_encoder_jit_refill_floor_mode == "fixed" &&
+        metas->erpp_encoder_jit_refill_floor_value > 0) {
+      // Explicit cap from --erpp_encoder_jit_refill_floor_value.
+      floor_value = metas->erpp_encoder_jit_refill_floor_value;
+    } else {
+      // "avg": split total GPU expert slots evenly across encoder MoE layers.
+      const int total_slots = cache != nullptr && cache->cache_len > 0
+          ? static_cast<int>(cache->cache_len)
+          : int(std::floor(metas->cache_rate * metas->num_layer * metas->num_expert));
+      floor_value = metas->num_encoder_moe_layer > 0
+          ? total_slots / metas->num_encoder_moe_layer
+          : 1;
+    }
+    return std::max(1, std::min(metas->num_expert, floor_value));
+  }
+
+  // Per-layer minimum expert count (cache + in-flight refill) for encoder JIT refill.
+  // lower threshold for refill
+  int encoder_jit_low_watermark() const {
+    const int floor_value = encoder_jit_floor();
+    return std::max(1, int(std::floor(floor_value * metas->erpp_encoder_jit_refill_low_watermark_ratio))); // clamp to [1, num_expert]
+  }
+
+  bool encoder_jit_layer_enabled(int layer_idx) const{
+    CHECK(layer_idx >= 0 && layer_idx < static_cast<int>(encoder_jit_enabled_layer_mask.size())) << "layer_idx is out of range";
+    return encoder_jit_enabled_layer_mask[layer_idx];
+  }
+  bool encoder_jit_is_missing(int layer_idx, int expert_idx) const;
+  bool encoder_jit_target_in_window(int layer_idx) const {
+    return metas->is_encoder_layer(layer_idx) &&
+           layer_idx > current_layer &&
+           layer_idx <= current_layer + metas->erpp_encoder_jit_refill_window;
+  }
+  std::vector<int> build_encoder_jit_required_experts(
+      int layer_idx, int occupancy, int floor_value, int low_watermark, int budget);
+  bool encoder_jit_can_dispatch(const CopyTask& task) const;
+  void maybe_enqueue_encoder_jit_refill();
 
  public:
   #ifdef DEAD_CODE
@@ -235,6 +355,32 @@ class PrefetchMngr : public std::enable_shared_from_this<PrefetchMngr> {
   std::shared_ptr<FetchWorker>         fetch_thread;
   std::shared_ptr<PredictWorker>       predict_thread;
   std::shared_ptr<ExpertUnlockWorker>  expert_unlocker_thread;
+  std::shared_ptr<ErppEncoderPredictor> erpp_encoder_predictor;
+  std::shared_ptr<ErppEncoderPredictWorker> erpp_encoder_predict_thread;
+  struct EncoderLayerStats {
+    int64_t forward_epoch = -1;
+    int64_t generate_epoch = -1;
+    int64_t needed = 0;
+    int64_t entry_hit = 0;
+    int64_t entry_miss = 0;
+    int64_t actual_hit = 0;
+    int64_t actual_miss = 0;
+    int64_t waited = 0;
+    int64_t wait_us_total = 0;
+    int64_t wait_us_max = 0;
+  };
+  std::vector<EncoderLayerStats> encoder_layer_stats;
+  void ensure_encoder_layer_stats_size();
+  bool encoder_layer_expert_entry_hit(int layer_id, int expert_id) const;
+  void log_encoder_layer_entry_stats(int layer_id, int64_t* experts, int64_t num_expert);
+  void log_encoder_layer_use_stats(
+      int layer_id,
+      int expert_id,
+      bool hit,
+      bool waited,
+      uint64_t wait_us,
+      int status_before);
+  void log_encoder_layer_done_stats(int layer_id);
 
   /**
    * for already in cache, directly lock it
@@ -284,6 +430,7 @@ public:
   void report_moe_attn_logits(int layer_id, torch::Tensor attn_logits);
 
   void report_moe_layer_logits(int layer_id, torch::Tensor layer_logits);
+  void report_erpp_encoder_layer0(torch::Tensor hidden, torch::Tensor attention_mask);
 
   void launch_thread();
   TimerGuard build_timer() { return TimerGuard(this->profiler.get()); }

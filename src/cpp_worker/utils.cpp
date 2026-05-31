@@ -1,6 +1,8 @@
 #include "utils.hpp" 
 #include "logging.hpp"
 
+#include <stdexcept>
+
 
 void AtomicMultiStatusLock::unlock(ExpertStatus from, ExpertStatus to) {
   int actual_cur_status = lock_.exchange(to);
@@ -76,9 +78,10 @@ void ModuleMeta::init_from_map(std::unordered_map<std::string, std::string> conf
     config_map.erase(key);
     return ret;
   };
-  auto optional_int   = [&optional_str](std::string key, int   default_val) -> int   { try { return std::stoi(optional_str(key, std::to_string(default_val))); } catch (const std::invalid_argument& e) { LOG(FATAL) << "invalid key " << key << " with value " << optional_str(key, std::to_string(default_val)); } };
-  auto optional_float = [&optional_str](std::string key, float default_val) -> float { try { return std::stof(optional_str(key, std::to_string(default_val))); } catch (const std::invalid_argument& e) { LOG(FATAL) << "invalid key " << key << " with value " << optional_str(key, std::to_string(default_val)); } };
-  auto optional_bool  = [&optional_str](std::string key, bool  default_val) -> bool  { return string_is_on(optional_str(key, default_val ? "true" : "false")); };
+  auto optional_int    = [&optional_str](std::string key, int    default_val) -> int    { try { return std::stoi(optional_str(key, std::to_string(default_val))); } catch (const std::invalid_argument& e) { LOG(FATAL) << "invalid key " << key << " with value " << optional_str(key, std::to_string(default_val)); } };
+  auto optional_float  = [&optional_str](std::string key, float  default_val) -> float  { try { return std::stof(optional_str(key, std::to_string(default_val))); } catch (const std::invalid_argument& e) { LOG(FATAL) << "invalid key " << key << " with value " << optional_str(key, std::to_string(default_val)); } };
+  auto optional_double = [&optional_str](std::string key, double default_val) -> double { try { return std::stod(optional_str(key, std::to_string(default_val))); } catch (const std::invalid_argument& e) { LOG(FATAL) << "invalid key " << key << " with value " << optional_str(key, std::to_string(default_val)); } };
+  auto optional_bool   = [&optional_str](std::string key, bool   default_val) -> bool   { return string_is_on(optional_str(key, default_val ? "true" : "false")); };
   auto required_int   = [&required_str](std::string key) -> int   { try { return std::stoi(required_str(key)); } catch (const std::invalid_argument& e) { LOG(FATAL) << "invalid key " << key << " with value " << required_str(key); } };
   auto required_float = [&required_str](std::string key) -> float { try { return std::stof(required_str(key)); } catch (const std::invalid_argument& e) { LOG(FATAL) << "invalid key " << key << " with value " << required_str(key); } };
   auto required_bool  = [&required_str](std::string key) -> bool  { return string_is_on(required_str(key)); };
@@ -135,6 +138,18 @@ void ModuleMeta::init_from_map(std::unordered_map<std::string, std::string> conf
   initial_expert_plan = optional_str("initial_expert_plan", initial_expert_plan);
   enable_decoder_warmup_overlap = optional_bool("enable_decoder_warmup_overlap", enable_decoder_warmup_overlap);
   decoder_warmup_expert_plan = optional_str("decoder_warmup_expert_plan", decoder_warmup_expert_plan);
+  enable_erpp_encoder_prefetch = optional_bool("enable_erpp_encoder_prefetch", enable_erpp_encoder_prefetch);
+  erpp_encoder_model_path = optional_str("erpp_encoder_model_path", erpp_encoder_model_path);
+  erpp_encoder_budgets = optional_str("erpp_encoder_budgets", erpp_encoder_budgets);
+  erpp_encoder_layers = optional_str("erpp_encoder_layers", erpp_encoder_layers);
+  enable_erpp_encoder_jit_refill = optional_bool("enable_erpp_encoder_jit_refill", enable_erpp_encoder_jit_refill);
+  erpp_encoder_jit_refill_window = optional_int("erpp_encoder_jit_refill_window", erpp_encoder_jit_refill_window);
+  erpp_encoder_jit_refill_floor_mode = optional_str("erpp_encoder_jit_refill_floor_mode", erpp_encoder_jit_refill_floor_mode);
+  erpp_encoder_jit_refill_floor_value = optional_int("erpp_encoder_jit_refill_floor_value", erpp_encoder_jit_refill_floor_value);
+  erpp_encoder_jit_refill_low_watermark_ratio = optional_double("erpp_encoder_jit_refill_low_watermark_ratio", erpp_encoder_jit_refill_low_watermark_ratio);
+  erpp_encoder_jit_refill_layers = optional_str("erpp_encoder_jit_refill_layers", erpp_encoder_jit_refill_layers);
+  erpp_encoder_jit_refill_per_idle = optional_int("erpp_encoder_jit_refill_per_idle", erpp_encoder_jit_refill_per_idle);
+  enable_erpp_encoder_jit_topk_cover = optional_bool("enable_erpp_encoder_jit_topk_cover", enable_erpp_encoder_jit_topk_cover);
 
   max_prefetch_layer_distance      = optional_int  ("max_prefetch_layer_distance",      max_prefetch_layer_distance);
   cache_only                       = optional_bool ("cache_only",                       cache_only);
@@ -219,6 +234,18 @@ void ModuleMeta::log_configs() {
   LOG_CONFIG(initial_expert_plan);
   LOG_CONFIG_BOOL(enable_decoder_warmup_overlap);
   LOG_CONFIG(decoder_warmup_expert_plan);
+  LOG_CONFIG_BOOL(enable_erpp_encoder_prefetch);
+  LOG_CONFIG(erpp_encoder_model_path);
+  LOG_CONFIG(erpp_encoder_budgets);
+  LOG_CONFIG(erpp_encoder_layers);
+  LOG_CONFIG_BOOL(enable_erpp_encoder_jit_refill);
+  LOG_CONFIG(erpp_encoder_jit_refill_window);
+  LOG_CONFIG(erpp_encoder_jit_refill_floor_mode);
+  LOG_CONFIG(erpp_encoder_jit_refill_floor_value);
+  LOG_CONFIG(erpp_encoder_jit_refill_low_watermark_ratio);
+  LOG_CONFIG(erpp_encoder_jit_refill_layers);
+  LOG_CONFIG(erpp_encoder_jit_refill_per_idle);
+  LOG_CONFIG_BOOL(enable_erpp_encoder_jit_topk_cover);
 
   LOG_CONFIG(max_prefetch_layer_distance);
   LOG_CONFIG_BOOL(cache_only);
@@ -263,6 +290,48 @@ void ModuleMeta::handle_uninited_configs() {
         << "decoder warmup overlap requires per_layer_cache=false";
     CHECK(cache_policy == "scheduler_aware")
         << "decoder warmup overlap requires cache_policy=scheduler_aware";
+  }
+  if (enable_erpp_encoder_jit_refill) {
+    if (!enable_erpp_encoder_prefetch) {
+      throw std::runtime_error("ERPP encoder JIT refill requires enable_erpp_encoder_prefetch=true");
+    }
+    if (num_encoder_moe_layer <= 0) {
+      throw std::runtime_error("ERPP encoder JIT refill requires num_encoder_moe_layer > 0");
+    }
+    if (per_layer_cache) {
+      throw std::runtime_error("ERPP encoder JIT refill requires per_layer_cache=false");
+    }
+    if (cache_policy != "scheduler_aware") {
+      throw std::runtime_error("ERPP encoder JIT refill requires cache_policy=scheduler_aware");
+    }
+    if (erpp_encoder_jit_refill_window < 1) {
+      throw std::runtime_error("ERPP encoder JIT refill requires erpp_encoder_jit_refill_window >= 1");
+    }
+    if (erpp_encoder_jit_refill_per_idle == 0 ||
+        erpp_encoder_jit_refill_per_idle < -1) {
+      throw std::runtime_error("ERPP encoder JIT refill requires erpp_encoder_jit_refill_per_idle == -1 or >= 1");
+    }
+    if (erpp_encoder_jit_refill_low_watermark_ratio <= 0.0 || erpp_encoder_jit_refill_low_watermark_ratio > 1.0) {
+      throw std::runtime_error("ERPP encoder JIT refill requires erpp_encoder_jit_refill_low_watermark_ratio in (0, 1]");
+    }
+    if (erpp_encoder_jit_refill_floor_mode != "avg" && erpp_encoder_jit_refill_floor_mode != "fixed") {
+      throw std::runtime_error("ERPP encoder JIT refill requires erpp_encoder_jit_refill_floor_mode in {avg,fixed}");
+    }
+    if (erpp_encoder_jit_refill_floor_mode == "fixed" && erpp_encoder_jit_refill_floor_value <= 0) {
+      throw std::runtime_error("ERPP encoder JIT refill requires erpp_encoder_jit_refill_floor_value > 0 when floor_mode=fixed");
+    }
+  }
+  if (enable_erpp_encoder_prefetch) {
+    CHECK(num_encoder_moe_layer > 0)
+        << "ERPP encoder prefetch requires num_encoder_moe_layer > 0";
+    CHECK(!erpp_encoder_model_path.empty())
+        << "ERPP encoder prefetch requires erpp_encoder_model_path";
+    if (per_layer_cache) {
+      throw std::runtime_error("ERPP encoder prefetch requires per_layer_cache=false");
+    }
+    if (cache_policy != "scheduler_aware") {
+      throw std::runtime_error("ERPP encoder prefetch requires cache_policy=scheduler_aware");
+    }
   }
   // if (layer_predict_interval == -1) {
   //   layer_predict_interval   = num_layer;
