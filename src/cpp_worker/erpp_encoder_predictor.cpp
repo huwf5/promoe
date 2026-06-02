@@ -24,6 +24,7 @@ bool log_erpp_encoder_prefetch_enabled() {
   return scheduler_flag != nullptr && scheduler_flag[0] != '\0' && scheduler_flag[0] != '0';
 }
 
+
 std::string trim_copy(const std::string& value) {
   const auto start = value.find_first_not_of(" \t\n\r");
   if (start == std::string::npos) {
@@ -36,6 +37,7 @@ std::string trim_copy(const std::string& value) {
 
 ErppEncoderPredictor::ErppEncoderPredictor(ModuleMeta* metas) : metas(metas) {
   CHECK(metas != nullptr) << "ERPP encoder predictor requires ModuleMeta";
+  dynamic_noisy_or_budget = trim_copy(metas->erpp_encoder_budgets) == "dynamic_noisy_or_sum";
   budgets = parse_budgets(metas->erpp_encoder_budgets);
   enabled_layers = parse_enabled_layers(metas->erpp_encoder_layers);
 }
@@ -55,6 +57,8 @@ std::vector<int> ErppEncoderPredictor::parse_budgets(const std::string& spec) co
     parsed = {89, 59, 72, 72, 70, 62};
   } else if (normalized == "fixed_mean") {
     parsed = {70, 49, 56, 55, 55, 51};
+  } else if (normalized == "dynamic_noisy_or_sum") {
+    parsed.assign(metas->num_encoder_moe_layer, 1);
   } else {
     std::stringstream ss(normalized);
     std::string item;
@@ -80,6 +84,24 @@ int ErppEncoderPredictor::encoder_budget_for_layer(int layer_idx) const {
   CHECK(layer_idx >= 0 && layer_idx < static_cast<int>(budgets.size()))
       << "ERPP encoder budget layer out of range: " << layer_idx;
   return budgets[layer_idx];
+}
+
+int erpp_noisy_or_sum_budget(torch::Tensor layer_scores, int num_expert) {
+  CHECK(num_expert > 0) << "ERPP num_expert must be positive";
+  CHECK(layer_scores.defined()) << "ERPP score tensor is undefined";
+  CHECK(layer_scores.dim() == 1) << "ERPP layer scores must be [E]";
+  CHECK(layer_scores.size(0) == num_expert)
+      << "ERPP layer score expert mismatch, got " << layer_scores.size(0)
+      << ", expected " << num_expert;
+  auto sum_tensor = layer_scores.to(torch::kFloat32).sum();
+  const float raw = sum_tensor.item<float>();
+  CHECK(std::isfinite(raw)) << "ERPP dynamic noisy-or budget score sum is not finite";
+  const int budget = static_cast<int>(std::ceil(raw));
+  return std::clamp(budget, 1, num_expert);
+}
+
+int ErppEncoderPredictor::budget_from_scores(torch::Tensor layer_scores) const {
+  return erpp_noisy_or_sum_budget(layer_scores, metas->num_expert);
 }
 
 int ErppEncoderPredictor::encoder_jit_floor() const {
@@ -110,8 +132,19 @@ int ErppEncoderPredictor::encoder_jit_floor() const {
 }
 
 int ErppEncoderPredictor::encoder_jit_ranking_limit(int layer_idx) const {
-  const int budget = encoder_budget_for_layer(layer_idx);
+  return encoder_jit_ranking_limit(layer_idx, encoder_budget_for_layer(layer_idx));
+}
+
+int ErppEncoderPredictor::encoder_jit_ranking_limit(int layer_idx, int budget) const {
+  CHECK(layer_idx >= 0 && layer_idx < metas->num_encoder_moe_layer)
+      << "ERPP encoder JIT ranking layer out of range: " << layer_idx;
+  CHECK(budget > 0 && budget <= metas->num_expert)
+      << "ERPP encoder JIT ranking budget out of range: " << budget
+      << ", expected [1," << metas->num_expert << "]";
   if (!metas->enable_erpp_encoder_jit_refill) {
+    return budget;
+  }
+  if (metas->erpp_encoder_jit_refill_floor_mode == "budget") {
     return budget;
   }
   const int floor_value = encoder_jit_floor();
@@ -244,7 +277,7 @@ void ErppEncoderPredictor::record_encoder_layer0(
   input_recorded = true;
 }
 
-std::vector<std::vector<int64_t>> ErppEncoderPredictor::predict_recorded() {
+ErppEncoderPrediction ErppEncoderPredictor::predict_recorded() {
   if (!input_recorded) {
     if (log_erpp_encoder_prefetch_enabled()) {
       LOG(INFO) << "erpp_encoder_prefetch: no recorded input";
@@ -293,7 +326,7 @@ torch::Tensor ErppEncoderPredictor::normalize_attention_mask(
   return mask.to(torch::kLong).contiguous();
 }
 
-std::vector<std::vector<int64_t>> ErppEncoderPredictor::predict(
+ErppEncoderPrediction ErppEncoderPredictor::predict(
     torch::Tensor hidden,
     torch::Tensor attention_mask) {
   CHECK(hidden.defined()) << "ERPP hidden is undefined";
@@ -303,7 +336,7 @@ std::vector<std::vector<int64_t>> ErppEncoderPredictor::predict(
   return predict_from_cpu_tensors(hidden_cpu, attention_mask_cpu);
 }
 
-std::vector<std::vector<int64_t>> ErppEncoderPredictor::predict_from_cpu_tensors(
+ErppEncoderPrediction ErppEncoderPredictor::predict_from_cpu_tensors(
     torch::Tensor hidden_cpu,
     torch::Tensor attention_mask_cpu) {
   CHECK(loaded) << "ERPP encoder predictor model is not loaded";
@@ -330,12 +363,21 @@ std::vector<std::vector<int64_t>> ErppEncoderPredictor::predict_from_cpu_tensors
       << "ERPP logits expert mismatch, got " << logits.size(2)
       << ", expected " << metas->num_expert;
 
-  std::vector<std::vector<int64_t>> result;
-  result.reserve(metas->num_encoder_moe_layer);
+  ErppEncoderPrediction result;
+  result.rankings.reserve(metas->num_encoder_moe_layer);
+  result.budgets.reserve(metas->num_encoder_moe_layer);
   for (int layer = 0; layer < metas->num_encoder_moe_layer; layer++) {
-    const int budget = encoder_budget_for_layer(layer);
-    const int limit = encoder_jit_ranking_limit(layer);
-    auto top = std::get<1>(logits[0][layer].topk(limit, -1, true, true));
+    if (!should_prefetch_layer(layer)) {
+      result.rankings.emplace_back();
+      result.budgets.push_back(0);
+      continue;
+    }
+    auto layer_scores = logits[0][layer].contiguous();
+    const int budget = dynamic_noisy_or_budget
+        ? budget_from_scores(layer_scores)
+        : encoder_budget_for_layer(layer);
+    const int limit = encoder_jit_ranking_limit(layer, budget);
+    auto top = std::get<1>(layer_scores.topk(limit, -1, true, true));
     auto top_cpu = top.to(torch::kLong).contiguous();
     int64_t* data = top_cpu.data_ptr<int64_t>();
     if (log_erpp_encoder_prefetch_enabled()) {
@@ -344,7 +386,8 @@ std::vector<std::vector<int64_t>> ErppEncoderPredictor::predict_from_cpu_tensors
                 << " ranking_limit=" << limit
                 << " experts=[" << array_to_str(data, limit) << "]";
     }
-    result.emplace_back(data, data + limit);
+    result.rankings.emplace_back(data, data + limit);
+    result.budgets.push_back(budget);
   }
   return result;
 }

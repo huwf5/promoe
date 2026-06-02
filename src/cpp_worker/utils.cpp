@@ -314,8 +314,10 @@ void ModuleMeta::handle_uninited_configs() {
     if (erpp_encoder_jit_refill_low_watermark_ratio <= 0.0 || erpp_encoder_jit_refill_low_watermark_ratio > 1.0) {
       throw std::runtime_error("ERPP encoder JIT refill requires erpp_encoder_jit_refill_low_watermark_ratio in (0, 1]");
     }
-    if (erpp_encoder_jit_refill_floor_mode != "avg" && erpp_encoder_jit_refill_floor_mode != "fixed") {
-      throw std::runtime_error("ERPP encoder JIT refill requires erpp_encoder_jit_refill_floor_mode in {avg,fixed}");
+    if (erpp_encoder_jit_refill_floor_mode != "avg" &&
+        erpp_encoder_jit_refill_floor_mode != "fixed" &&
+        erpp_encoder_jit_refill_floor_mode != "budget") {
+      throw std::runtime_error("ERPP encoder JIT refill requires erpp_encoder_jit_refill_floor_mode in {avg,fixed,budget}");
     }
     if (erpp_encoder_jit_refill_floor_mode == "fixed" && erpp_encoder_jit_refill_floor_value <= 0) {
       throw std::runtime_error("ERPP encoder JIT refill requires erpp_encoder_jit_refill_floor_value > 0 when floor_mode=fixed");

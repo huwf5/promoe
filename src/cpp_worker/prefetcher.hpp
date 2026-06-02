@@ -287,12 +287,17 @@ class FetchScheduleWorker : public WorkerThread<FetchScheduleTaskBase*> {
   // Per-layer minimum expert count (cache + in-flight refill) for encoder JIT refill.
   // When occupancy drops below low_watermark (floor * ratio), refill ranks experts up to floor.
   // Also passed to cache eviction as a per-layer retention hint (see encoder_jit_can_dispatch).
-  int encoder_jit_floor() const {
+  int encoder_jit_floor(int layer_idx) const {
     int floor_value = 1;
     if (metas->erpp_encoder_jit_refill_floor_mode == "fixed" &&
         metas->erpp_encoder_jit_refill_floor_value > 0) {
       // Explicit cap from --erpp_encoder_jit_refill_floor_value.
       floor_value = metas->erpp_encoder_jit_refill_floor_value;
+    } else if (metas->erpp_encoder_jit_refill_floor_mode == "budget") {
+      floor_value = layer_idx >= 0 && layer_idx < static_cast<int>(encoder_jit_budgets.size()) &&
+              encoder_jit_budgets[layer_idx] > 0
+          ? encoder_jit_budgets[layer_idx]
+          : 1;
     } else {
       // "avg": split total GPU expert slots evenly across encoder MoE layers.
       const int total_slots = cache != nullptr && cache->cache_len > 0
@@ -307,8 +312,8 @@ class FetchScheduleWorker : public WorkerThread<FetchScheduleTaskBase*> {
 
   // Per-layer minimum expert count (cache + in-flight refill) for encoder JIT refill.
   // lower threshold for refill
-  int encoder_jit_low_watermark() const {
-    const int floor_value = encoder_jit_floor();
+  int encoder_jit_low_watermark(int layer_idx) const {
+    const int floor_value = encoder_jit_floor(layer_idx);
     return std::max(1, int(std::floor(floor_value * metas->erpp_encoder_jit_refill_low_watermark_ratio))); // clamp to [1, num_expert]
   }
 

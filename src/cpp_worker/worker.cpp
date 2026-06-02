@@ -4,6 +4,7 @@
 #include "prefetcher.hpp"
 #include "nvtx_utils.hpp"
 #include "erpp_encoder_predictor.hpp"
+#include <algorithm>
 #include <cstdlib>
 namespace {
 const char* cache_request_label(CacheRequestType request_type) {
@@ -25,6 +26,7 @@ bool log_erpp_encoder_prefetch_enabled() {
   const char* scheduler_flag = std::getenv("SPARSE_CACHE_LOG_PREFETCH_DECISION");
   return scheduler_flag != nullptr && scheduler_flag[0] != '\0' && scheduler_flag[0] != '0';
 }
+
 }  // namespace
 
 void ErppEncoderPredictWorker::do_one_task_impl(ErppEncoderPredictJob job) {
@@ -41,22 +43,22 @@ void ErppEncoderPredictWorker::do_one_task_impl(ErppEncoderPredictJob job) {
               << " generate_epoch=" << job.generate_epoch;
   }
 
-  auto predictions = erpp_encoder_predictor->predict_recorded();
+  auto prediction = erpp_encoder_predictor->predict_recorded();
+  auto& predictions = prediction.rankings;
+  auto& budgets = prediction.budgets;
 
   if (log_erpp_encoder_prefetch_enabled()) {
     LOG(INFO) << "erpp_encoder_prefetch: predict done"
               << " layers=" << predictions.size();
   }
 
+
   if (metas->enable_erpp_encoder_jit_refill) {
     ErppEncoderJitRankingsTask task;
     task.forward_epoch = job.forward_epoch;
     task.generate_epoch = job.generate_epoch;
     task.rankings = predictions;
-    task.budgets.reserve(predictions.size());
-    for (int layer_idx = 0; layer_idx < static_cast<int>(predictions.size()); layer_idx++) {
-      task.budgets.push_back(erpp_encoder_predictor->encoder_budget_for_layer(layer_idx));
-    }
+    task.budgets = budgets;
     if (log_erpp_encoder_prefetch_enabled()) {
       LOG(INFO) << "erpp_encoder_jit_refill: submit scheduler rankings"
                 << " forward_epoch=" << task.forward_epoch
@@ -93,7 +95,14 @@ void ErppEncoderPredictWorker::do_one_task_impl(ErppEncoderPredictJob job) {
     task.forward_epoch = job.forward_epoch;
     task.generate_epoch = job.generate_epoch;
     task.expert_idxs = experts.data();
-    task.num_expert = experts.size();
+    const int budget = layer_idx < static_cast<int>(budgets.size()) ? budgets[layer_idx] : 0;
+    task.num_expert = std::min<size_t>(experts.size(), static_cast<size_t>(std::max(0, budget)));
+    if (task.num_expert == 0) {
+      if (log_erpp_encoder_prefetch_enabled()) {
+        LOG(INFO) << "erpp_encoder_prefetch: skip zero-budget predicted layer L" << layer_idx;
+      }
+      continue;
+    }
     task.request_type = kCacheRequestEncoderPredictorPrefetch;
     {
       if (log_erpp_encoder_prefetch_enabled()) {

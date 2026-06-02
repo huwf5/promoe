@@ -493,6 +493,105 @@ def build_encoder_balanced_hot_initial_plan(
     )
   return _order_initial_plan_for_encoder_lru(plan, adapter)
 
+def _encoder_l0_priority_quotas(
+    *,
+    total_slots: int,
+    num_encoder_layers: int,
+    num_experts: int,
+    l0_fraction: float,
+) -> list[int]:
+  total_slots = max(0, int(total_slots))
+  num_encoder_layers = int(num_encoder_layers)
+  num_experts = int(num_experts)
+  if num_encoder_layers <= 0:
+    raise ValueError("adapter has no encoder sparse layers")
+  if total_slots > num_encoder_layers * num_experts:
+    raise ValueError(
+      f"encoder capacity {num_encoder_layers * num_experts} is smaller than initial slots {total_slots}"
+    )
+  quotas = [0 for _ in range(num_encoder_layers)]
+  l0_quota = min(total_slots, num_experts, int(num_experts * float(l0_fraction)))
+  quotas[0] = l0_quota
+
+  remaining = total_slots - l0_quota
+  if remaining > 0 and num_encoder_layers > 1:
+    base_quota, extra = divmod(remaining, num_encoder_layers - 1)
+    for stage_layer in range(1, num_encoder_layers):
+      quotas[stage_layer] = min(num_experts, base_quota + (1 if stage_layer - 1 < extra else 0))
+
+  while sum(quotas) < total_slots:
+    progressed = False
+    for stage_layer in range(num_encoder_layers):
+      if sum(quotas) >= total_slots:
+        break
+      if quotas[stage_layer] >= num_experts:
+        continue
+      quotas[stage_layer] += 1
+      progressed = True
+    if not progressed:
+      break
+
+  if sum(quotas) != total_slots:
+    raise ValueError(
+      f"L0 priority quotas have {sum(quotas)} slots, expected {total_slots}"
+    )
+  return quotas
+
+
+def build_encoder_l0_priority_hot_initial_plan(
+    hot_expert_file: str | Path,
+    adapter,
+    *,
+    total_slots: int,
+    l0_fraction: float = 0.75,
+    allow_sequential_fallback: bool = False,
+) -> list[tuple[int, int]]:
+  """Build an encoder-only hot plan that gives L0 a larger fixed quota first."""
+  total_slots = max(0, int(total_slots))
+  if total_slots <= 0:
+    return []
+
+  payload = _read_hot_expert_payload(hot_expert_file)
+  by_layer = _encoder_hot_pairs_by_layer(payload, adapter)
+  if not by_layer:
+    raise ValueError(f"hot expert snapshot has no encoder expert entries: {hot_expert_file}")
+
+  encoder_layers = [
+    adapter.global_layer_id("encoder", stage_layer)
+    for stage_layer in range(int(adapter.num_encoder_sparse_layers))
+  ]
+  quotas = _encoder_l0_priority_quotas(
+    total_slots=total_slots,
+    num_encoder_layers=len(encoder_layers),
+    num_experts=int(adapter.num_expert_per_layer),
+    l0_fraction=float(l0_fraction),
+  )
+
+  plan: list[tuple[int, int]] = []
+  for stage_layer, layer_idx in enumerate(encoder_layers):
+    quota = quotas[stage_layer]
+    selected = _select_hot_prefix_with_fallback(
+      layer_idx=layer_idx,
+      pairs=by_layer.get(layer_idx, []),
+      quota=quota,
+      num_experts=int(adapter.num_expert_per_layer),
+      allow_sequential_fallback=allow_sequential_fallback,
+    )
+    if len(selected) != quota:
+      raise ValueError(
+        f"L0 priority hot initial plan layer {layer_idx} has {len(selected)} entries, "
+        f"expected quota {quota}; pass allow_sequential_fallback=True"
+      )
+    plan.extend(selected)
+
+  if len(plan) != total_slots:
+    raise ValueError(
+      f"L0 priority hot initial plan has {len(plan)} entries, expected {total_slots}; "
+      "reduce cache_rate or pass allow_sequential_fallback=True"
+    )
+  return _order_initial_plan_for_encoder_lru(plan, adapter)
+
+
 def build_encoder_hot_initial_plan(
     hot_expert_file: str | Path,
     adapter,

@@ -3,6 +3,7 @@
 #include "prefetcher.hpp"
 #include "profiler.hpp"
 #include "adapter-llama.hpp"
+#include "erpp_encoder_predictor.hpp"
 
 std::string dump_trace_event_collector_singleton() {
   return TraceEventCollector::singleton().dump_json_to_string();
@@ -148,6 +149,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
   m.def("dump_trace_event_collector_singleton", &dump_trace_event_collector_singleton);
   m.def("to_um", &to_um);
+  m.def("erpp_noisy_or_sum_budget_for_test", &erpp_noisy_or_sum_budget);
   m.def("log_gpu_mem_info", &log_gpu_mem_info);
   m.def("eat_cuda_memory", &eat_cuda_memory);
   m.def("auto_eat_cuda_memory", &auto_eat_cuda_memory);

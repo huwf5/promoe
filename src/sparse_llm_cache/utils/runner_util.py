@@ -46,7 +46,7 @@ def prepare_argparser(parser = None):
   parser.add_argument("--per_layer_cache",         action=CustomBooleanAction)
   parser.add_argument("--promote_hit_in_prefetch", action=CustomBooleanAction)
   parser.add_argument("--cache_policy",            type=str, choices=["lru", "fifo", "nn", "min", "static-1", "static-2", "scheduler_aware"])
-  parser.add_argument("--initial_cache_policy",           type=str, choices=["manual", "hot_expert", "hot_encoder_coverage", "hot_encoder_balanced_coverage"])
+  parser.add_argument("--initial_cache_policy",           type=str, choices=["manual", "hot_expert", "hot_encoder_coverage", "hot_encoder_balanced_coverage", "hot_encoder_l0_priority_coverage"])
   parser.add_argument("--initial_layer_budgets",          type=str) # manual only
   parser.add_argument("--initial_hot_expert_file",        type=str) # hot_expert/hot_encoder_coverage/hot_encoder_balanced_coverage only
   parser.add_argument("--enable_decoder_warmup_overlap",  action=CustomBooleanAction)
@@ -57,7 +57,7 @@ def prepare_argparser(parser = None):
   parser.add_argument("--erpp_encoder_layers")
   parser.add_argument("--enable_erpp_encoder_jit_refill", action=CustomBooleanAction)
   parser.add_argument("--erpp_encoder_jit_refill_window", type=int)
-  parser.add_argument("--erpp_encoder_jit_refill_floor_mode", choices=["avg", "fixed"])
+  parser.add_argument("--erpp_encoder_jit_refill_floor_mode", choices=["avg", "fixed", "budget"])
   parser.add_argument("--erpp_encoder_jit_refill_floor_value", type=int)
   parser.add_argument("--erpp_encoder_jit_refill_low_watermark_ratio", type=float)
   parser.add_argument("--erpp_encoder_jit_refill_layers")

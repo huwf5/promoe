@@ -460,13 +460,6 @@ void FetchScheduleWorker::maybe_enqueue_encoder_jit_refill() {
     return;
   }
 
-  // Per-layer target resident expert count when floor refill runs (avg split or fixed).
-  const int floor_value = encoder_jit_floor();
-  // Trigger floor refill only when occupancy drops below this fraction of floor_value.
-  const int low_watermark = std::max(
-      1,
-      int(std::floor(floor_value * metas->erpp_encoder_jit_refill_low_watermark_ratio)));
-
   int enqueued = 0;
   for (int layer_idx = begin_layer; layer_idx < end_layer; layer_idx++) {
     if (!encoder_jit_layer_enabled(layer_idx)) {
@@ -483,6 +476,8 @@ void FetchScheduleWorker::maybe_enqueue_encoder_jit_refill() {
     const int budget = layer_idx < static_cast<int>(encoder_jit_budgets.size())
         ? encoder_jit_budgets[layer_idx]
         : 0;
+    const int floor_value = encoder_jit_floor(layer_idx);
+    const int low_watermark = encoder_jit_low_watermark(layer_idx);
     if (log_enabled) {
       LOG(INFO) << "erpp_encoder_jit_refill: inspect current=L" << current_layer
                 << " target=L" << layer_idx
@@ -1197,7 +1192,7 @@ bool FetchScheduleWorker::pop_next_prefetch_for_class(PrefetchClass cls, CopyTas
                       << " expert=" << candidate.expert->expert_idx
                       << " reason=no_safe_victim"
                       << " current=L" << current_layer
-                      << " floor=" << encoder_jit_floor();
+                      << " floor=" << encoder_jit_floor(candidate.expert->layer_idx);
           }
           break;
         }
