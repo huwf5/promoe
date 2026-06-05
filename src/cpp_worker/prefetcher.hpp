@@ -183,6 +183,36 @@ class FetchScheduleWorker : public WorkerThread<FetchScheduleTaskBase*> {
   std::vector<uint8_t> encoder_jit_enabled_layer_mask;
   int64_t encoder_jit_forward_epoch = -1;
   int64_t encoder_jit_generate_epoch = -1;
+  std::vector<double> encoder_jit_wait_penalty_ema_us;
+  struct EncoderJitRefillCandidate {
+    int layer_idx = -1;
+    int occupancy = 0;
+    int budget = 0;
+    int floor_value = 0;
+    int low_watermark = 0;
+    int predicted_missing = 0;
+    int occupancy_gap = 0;
+    int distance = 0;
+    double score = 0.0;
+    std::vector<int> required;
+  };
+  struct EncoderPrefetchLayerMetrics {
+    int64_t enqueued_experts = 0;
+    int64_t enqueued_chunks = 0;
+    int64_t dispatched_experts = 0;
+    int64_t dispatched_chunks = 0;
+    int64_t completed_experts = 0;
+    int64_t completed_chunks = 0;
+    int64_t completed_after_entry_experts = 0;
+    int64_t completed_after_entry_chunks = 0;
+    int64_t no_victim_blocks = 0;
+  };
+  std::vector<EncoderPrefetchLayerMetrics> encoder_prefetch_metrics;
+  std::vector<std::vector<uint8_t>> encoder_prefetch_enqueued_mask;
+  std::vector<std::vector<uint8_t>> encoder_prefetch_dispatched_mask;
+  std::vector<std::vector<uint8_t>> encoder_prefetch_completed_mask;
+  std::vector<std::vector<uint8_t>> encoder_prefetch_used_mask;
+  std::vector<uint8_t> encoder_layer_entered_mask;
 
 
   #ifdef DEAD_CODE
@@ -249,10 +279,85 @@ class FetchScheduleWorker : public WorkerThread<FetchScheduleTaskBase*> {
     encoder_jit_forward_epoch = -1;
     encoder_jit_generate_epoch = -1;
   }
+  bool is_encoder_prefetch_request(CacheRequestType request_type) const {
+    return request_type == kCacheRequestEncoderPredictorPrefetch ||
+           request_type == kCacheRequestEncoderJitRefill;
+  }
+  void clear_encoder_prefetch_metrics() {
+    encoder_prefetch_metrics.assign(metas->num_encoder_moe_layer, EncoderPrefetchLayerMetrics());
+    encoder_prefetch_enqueued_mask.assign(
+        metas->num_encoder_moe_layer,
+        std::vector<uint8_t>(metas->num_expert, 0));
+    encoder_prefetch_dispatched_mask.assign(
+        metas->num_encoder_moe_layer,
+        std::vector<uint8_t>(metas->num_expert, 0));
+    encoder_prefetch_completed_mask.assign(
+        metas->num_encoder_moe_layer,
+        std::vector<uint8_t>(metas->num_expert, 0));
+    encoder_prefetch_used_mask.assign(
+        metas->num_encoder_moe_layer,
+        std::vector<uint8_t>(metas->num_expert, 0));
+    encoder_layer_entered_mask.assign(metas->num_encoder_moe_layer, 0);
+  }
+  void ensure_encoder_prefetch_metrics() {
+    if (encoder_prefetch_metrics.size() != static_cast<size_t>(metas->num_encoder_moe_layer) ||
+        encoder_prefetch_enqueued_mask.size() != static_cast<size_t>(metas->num_encoder_moe_layer) ||
+        encoder_prefetch_dispatched_mask.size() != static_cast<size_t>(metas->num_encoder_moe_layer) ||
+        encoder_prefetch_completed_mask.size() != static_cast<size_t>(metas->num_encoder_moe_layer) ||
+        encoder_prefetch_used_mask.size() != static_cast<size_t>(metas->num_encoder_moe_layer) ||
+        encoder_layer_entered_mask.size() != static_cast<size_t>(metas->num_encoder_moe_layer)) {
+      clear_encoder_prefetch_metrics();
+    }
+  }
+  void mark_encoder_prefetch_enqueued(int layer_idx, int expert_idx, int chunks) {
+    if (layer_idx < 0 || layer_idx >= metas->num_encoder_moe_layer ||
+        expert_idx < 0 || expert_idx >= metas->num_expert) {
+      return;
+    }
+    ensure_encoder_prefetch_metrics();
+    auto& metrics = encoder_prefetch_metrics[layer_idx];
+    metrics.enqueued_chunks += chunks;
+    if (!encoder_prefetch_enqueued_mask[layer_idx][expert_idx]) {
+      encoder_prefetch_enqueued_mask[layer_idx][expert_idx] = 1;
+      metrics.enqueued_experts += 1;
+    }
+  }
+  void mark_encoder_prefetch_dispatched(int layer_idx, int expert_idx, int chunks) {
+    if (layer_idx < 0 || layer_idx >= metas->num_encoder_moe_layer ||
+        expert_idx < 0 || expert_idx >= metas->num_expert) {
+      return;
+    }
+    ensure_encoder_prefetch_metrics();
+    auto& metrics = encoder_prefetch_metrics[layer_idx];
+    metrics.dispatched_chunks += chunks;
+    if (!encoder_prefetch_dispatched_mask[layer_idx][expert_idx]) {
+      encoder_prefetch_dispatched_mask[layer_idx][expert_idx] = 1;
+      metrics.dispatched_experts += 1;
+    }
+  }
+  void mark_encoder_prefetch_completed(int layer_idx, int expert_idx, int chunks, bool full_expert) {
+    if (layer_idx < 0 || layer_idx >= metas->num_encoder_moe_layer ||
+        expert_idx < 0 || expert_idx >= metas->num_expert) {
+      return;
+    }
+    ensure_encoder_prefetch_metrics();
+    auto& metrics = encoder_prefetch_metrics[layer_idx];
+    metrics.completed_chunks += chunks;
+    if (encoder_layer_entered_mask[layer_idx]) {
+      metrics.completed_after_entry_chunks += chunks;
+    }
+    if (full_expert && !encoder_prefetch_completed_mask[layer_idx][expert_idx]) {
+      encoder_prefetch_completed_mask[layer_idx][expert_idx] = 1;
+      metrics.completed_experts += 1;
+      if (encoder_layer_entered_mask[layer_idx]) {
+        metrics.completed_after_entry_experts += 1;
+      }
+    }
+  }
   void initialize_encoder_jit_enabled_layer_mask() {
     encoder_jit_enabled_layer_mask.assign(metas->num_encoder_moe_layer, 0);
     const std::string& spec = metas->erpp_encoder_jit_refill_layers;
-    if (spec == "all") {
+    if (spec == "all" || spec == "auto") {
       std::fill(encoder_jit_enabled_layer_mask.begin(),
                 encoder_jit_enabled_layer_mask.end(),
                 1);
@@ -310,16 +415,38 @@ class FetchScheduleWorker : public WorkerThread<FetchScheduleTaskBase*> {
     return std::max(1, std::min(metas->num_expert, floor_value));
   }
 
+  int encoder_jit_low_watermark_for_floor(int floor_value) const {
+    return std::max(1, int(std::floor(floor_value * metas->erpp_encoder_jit_refill_low_watermark_ratio)));
+  }
+
   // Per-layer minimum expert count (cache + in-flight refill) for encoder JIT refill.
   // lower threshold for refill
   int encoder_jit_low_watermark(int layer_idx) const {
-    const int floor_value = encoder_jit_floor(layer_idx);
-    return std::max(1, int(std::floor(floor_value * metas->erpp_encoder_jit_refill_low_watermark_ratio))); // clamp to [1, num_expert]
+    return encoder_jit_low_watermark_for_floor(encoder_jit_floor(layer_idx));
+  }
+
+  int encoder_jit_auto_floor(int layer_idx) const {
+    int floor_value = encoder_jit_floor(layer_idx);
+    if (metas->erpp_encoder_jit_refill_floor_mode == "budget") {
+      const int total_slots = cache != nullptr && cache->cache_len > 0
+          ? static_cast<int>(cache->cache_len)
+          : int(std::floor(metas->cache_rate * metas->num_layer * metas->num_expert));
+      const int first_future_layer = std::max(0, current_layer + 1);
+      const int remaining_future_layers = std::max(
+          1, metas->num_encoder_moe_layer - first_future_layer);
+      const int remaining_capacity_floor = std::max(
+          1, total_slots / remaining_future_layers);
+      floor_value = std::min(floor_value, remaining_capacity_floor);
+    }
+    return std::max(1, std::min(metas->num_expert, floor_value));
   }
 
   bool encoder_jit_layer_enabled(int layer_idx) const{
     CHECK(layer_idx >= 0 && layer_idx < static_cast<int>(encoder_jit_enabled_layer_mask.size())) << "layer_idx is out of range";
     return encoder_jit_enabled_layer_mask[layer_idx];
+  }
+  bool encoder_jit_auto_refill_enabled() const {
+    return metas->erpp_encoder_jit_refill_layers == "auto";
   }
   bool encoder_jit_is_missing(int layer_idx, int expert_idx) const;
   bool encoder_jit_target_in_window(int layer_idx) const {
@@ -329,8 +456,14 @@ class FetchScheduleWorker : public WorkerThread<FetchScheduleTaskBase*> {
   }
   std::vector<int> build_encoder_jit_required_experts(
       int layer_idx, int occupancy, int floor_value, int low_watermark, int budget);
+  void ensure_encoder_jit_wait_penalty();
+  void update_encoder_jit_wait_penalty(int layer_idx, int64_t actual_miss, int64_t wait_us_total);
+  EncoderJitRefillCandidate build_encoder_jit_refill_candidate(int layer_idx);
+  double score_encoder_jit_refill_candidate(const EncoderJitRefillCandidate& candidate) const;
   bool encoder_jit_can_dispatch(const CopyTask& task) const;
   void maybe_enqueue_encoder_jit_refill();
+  void log_encoder_jit_layer_entry_diagnostics(
+      int layer_idx, const int64_t* expert_idxs, size_t num_expert);
 
  public:
   #ifdef DEAD_CODE
@@ -373,6 +506,24 @@ class PrefetchMngr : public std::enable_shared_from_this<PrefetchMngr> {
     int64_t waited = 0;
     int64_t wait_us_total = 0;
     int64_t wait_us_max = 0;
+    int64_t occupancy_at_entry = 0;
+    int64_t prefetch_enqueued_experts = 0;
+    int64_t prefetch_enqueued_chunks = 0;
+    int64_t prefetch_dispatched_experts = 0;
+    int64_t prefetch_dispatched_chunks = 0;
+    int64_t prefetch_completed_experts = 0;
+    int64_t prefetch_completed_chunks = 0;
+    int64_t prefetch_completed_after_entry_experts = 0;
+    int64_t prefetch_completed_after_entry_chunks = 0;
+    int64_t prefetch_no_victim_blocks = 0;
+    int64_t needed_prefetch_completed_at_entry = 0;
+    int64_t needed_prefetch_pending_at_entry = 0;
+    int64_t needed_prefetch_evicted_at_entry = 0;
+    int64_t prefetch_completed_before_use = 0;
+    int64_t prefetch_late_on_use = 0;
+    int64_t prefetch_evicted_before_use = 0;
+    int64_t prefetch_unused_completed = 0;
+    bool done_logged = false;
   };
   std::vector<EncoderLayerStats> encoder_layer_stats;
   void ensure_encoder_layer_stats_size();

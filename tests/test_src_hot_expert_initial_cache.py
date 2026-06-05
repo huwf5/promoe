@@ -11,6 +11,7 @@ from sparse_llm_cache.utils.hot_experts import (
   build_encoder_balanced_hot_initial_plan,
   build_encoder_coverage_initial_plan,
   build_encoder_hot_initial_plan,
+  build_encoder_l0_priority_hot_initial_plan,
   build_hot_initial_plan,
 )
 from sparse_llm_cache.utils.runner_util import parse_args
@@ -336,6 +337,35 @@ def test_build_encoder_balanced_hot_initial_plan_can_fill_missing_slots_sequenti
 
   assert plan == [(1, 3), (1, 0), (1, 1), (0, 2), (0, 0), (0, 1)]
 
+def test_build_encoder_l0_priority_hot_initial_plan_prefers_l0_then_splits_remaining(tmp_path):
+  payload = {
+    "expert_usage_summary": {
+      "encoder.block.1.layer.1.mlp.router.classifier": {
+        "top_token_counts": [
+          {"eid": eid, "count": 100 - eid}
+          for eid in range(8)
+        ],
+      },
+      "encoder.block.3.layer.1.mlp.router.classifier": {
+        "top_token_counts": [
+          {"eid": eid, "count": 60 - eid}
+          for eid in range(8)
+        ],
+      },
+    },
+  }
+  path = tmp_path / "hot.json"
+  path.write_text(json.dumps(payload))
+  adapter = SwitchAdapter(SimpleNamespace(config=_switch_config(num_experts=8)), "google/switch-base-128")
+
+  plan = build_encoder_l0_priority_hot_initial_plan(path, adapter, total_slots=10)
+
+  assert plan == [
+    (1, 0), (1, 1), (1, 2), (1, 3),
+    (0, 0), (0, 1), (0, 2), (0, 3), (0, 4), (0, 5),
+  ]
+
+
 def test_build_hot_initial_plan_uses_encoder_k90_then_even_decoder_slots(tmp_path):
   payload = {
     "expert_usage_summary": {
@@ -530,6 +560,22 @@ def test_runner_util_parses_hot_encoder_balanced_coverage_policy():
   ])
 
   assert parsed["initial_cache_policy"] == "hot_encoder_balanced_coverage"
+  assert parsed["initial_hot_expert_file"] == "/tmp/hot.json"
+
+def test_inject_model_imports_hot_encoder_l0_priority_builder():
+  source = inspect.getsource(inject_model)
+
+  assert "build_encoder_l0_priority_hot_initial_plan" in source
+  assert "from sparse_llm_cache.utils.hot_experts import" in source
+
+
+def test_runner_util_parses_hot_encoder_l0_priority_policy():
+  parsed = parse_args([
+    "--initial_cache_policy", "hot_encoder_l0_priority_coverage",
+    "--initial_hot_expert_file", "/tmp/hot.json",
+  ])
+
+  assert parsed["initial_cache_policy"] == "hot_encoder_l0_priority_coverage"
   assert parsed["initial_hot_expert_file"] == "/tmp/hot.json"
 
 def test_runner_util_parses_decoder_warmup_overlap_and_scheduler_aware_policy():

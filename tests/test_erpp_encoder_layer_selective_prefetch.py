@@ -113,15 +113,49 @@ def test_erpp_predictor_declares_jit_budget_and_floor_helpers():
   assert "int encoder_jit_ranking_limit(int layer_idx) const" in hpp
 
 
+def test_erpp_predictor_skips_topk_and_predicted_log_for_disabled_layers():
+  cpp = _text(ERPP_CPP)
+  body = _function_body(cpp, "ErppEncoderPrediction ErppEncoderPredictor::predict_from_cpu_tensors")
+  compact = _compact(body)
+
+  assert "!should_prefetch_layer(layer)" in body
+  assert "result.rankings.emplace_back()" in body
+  assert "result.budgets.push_back(0)" in body
+  assert compact.index("!should_prefetch_layer(layer)") < compact.index(".topk(limit, -1, true, true)")
+  disabled_block = body[body.index("!should_prefetch_layer(layer)"):body.index(".topk(limit, -1, true, true)")]
+  assert "erpp_encoder_prefetch: predicted layer L" not in disabled_block
+  assert "array_to_str" not in disabled_block
+
+
+def test_erpp_worker_sets_zero_jit_budget_for_disabled_layers():
+  cpp = _text(WORKER_CPP)
+  body = _function_body(cpp, "void ErppEncoderPredictWorker::do_one_task_impl")
+  compact = _compact(body)
+
+  assert "auto prediction = erpp_encoder_predictor->predict_recorded();" in body
+  assert "auto& predictions = prediction.rankings;" in body
+  assert "auto& budgets = prediction.budgets;" in body
+  assert "task.rankings = predictions;" in body
+  assert "task.budgets = budgets;" in body
+  jit_body = body[body.index("if (metas->enable_erpp_encoder_jit_refill)"):body.index("// Not JIT refill")]
+  assert "encoder_budget_for_layer(layer_idx)" not in jit_body
+  assert "task.budgets.push_back" not in jit_body
+  assert "const int budget = layer_idx < static_cast<int>(budgets.size()) ? budgets[layer_idx] : 0;" in body
+  assert "task.num_expert = std::min<size_t>(experts.size(), static_cast<size_t>(std::max(0, budget)));" in body
+  assert "task.num_expert == 0" in body
+  assert compact.index("task.num_expert = std::min<size_t>") < compact.index("array_to_str(task.expert_idxs, task.num_expert)")
+
+
 def test_erpp_predictor_uses_max_floor_budget_ranking_limit_in_jit_mode():
   cpp = _text(ERPP_CPP)
-  limit_body = _function_body(cpp, "int ErppEncoderPredictor::encoder_jit_ranking_limit")
+  legacy_limit_body = _function_body(cpp, "int ErppEncoderPredictor::encoder_jit_ranking_limit(int layer_idx) const")
+  limit_body = _function_body(cpp, "int ErppEncoderPredictor::encoder_jit_ranking_limit(int layer_idx, int budget) const")
   floor_body = _function_body(cpp, "int ErppEncoderPredictor::encoder_jit_floor")
-  predict_body = _function_body(cpp, "std::vector<std::vector<int64_t>> ErppEncoderPredictor::predict_from_cpu_tensors")
+  predict_body = _function_body(cpp, "ErppEncoderPrediction ErppEncoderPredictor::predict_from_cpu_tensors")
   compact_floor = _compact(floor_body)
   compact_predict = _compact(predict_body)
 
-  assert "encoder_budget_for_layer(layer_idx)" in limit_body
+  assert "encoder_budget_for_layer(layer_idx)" in legacy_limit_body
   assert "encoder_jit_floor()" in limit_body
   assert "std::max" in limit_body
   assert "std::min" in limit_body
@@ -131,12 +165,12 @@ def test_erpp_predictor_uses_max_floor_budget_ranking_limit_in_jit_mode():
   assert "std::floor(metas->cache_rate * metas->num_layer * metas->num_expert)" in compact_floor
   assert "/ metas->num_encoder_moe_layer" in compact_floor
   assert "std::clamp" in floor_body
-  assert "const int limit = encoder_jit_ranking_limit(layer);" in predict_body
+  assert "const int limit = encoder_jit_ranking_limit(layer, budget);" in predict_body
   assert ".topk(limit, -1, true, true)" in predict_body
   assert "budget=" in predict_body
   assert "ranking_limit=" in predict_body
   assert "array_to_str(data, limit)" in predict_body
-  assert "result.emplace_back(data, data + limit)" in predict_body
+  assert "result.rankings.emplace_back(data, data + limit)" in predict_body
   assert ".topk(budgets[layer], -1, true, true)" not in compact_predict
 
 
@@ -568,16 +602,53 @@ def test_erpp_worker_jit_mode_submits_rankings_not_legacy_prefetch():
 def test_scheduler_declares_encoder_jit_candidate_helpers():
   hpp = _text(PREFETCHER_HPP)
 
-  assert "int encoder_jit_floor() const" in hpp
-  assert "int encoder_jit_low_watermark() const" in hpp
+  assert "int encoder_jit_floor(int layer_idx) const" in hpp
+  assert "int encoder_jit_low_watermark(int layer_idx) const" in hpp
   assert "int encoder_jit_occupancy(int layer_idx) const" in hpp
   assert "bool encoder_jit_layer_enabled(int layer_idx) const" in hpp
   assert "void maybe_enqueue_encoder_jit_refill()" in hpp
   assert "std::vector<int> build_encoder_jit_required_experts" in hpp
 
 
+def test_scheduler_budget_floor_mode_uses_per_layer_prediction_budget():
+  hpp = _text(PREFETCHER_HPP)
+  cpp = _text(PREFETCHER_CPP)
+  floor_body = _function_body(hpp, "int encoder_jit_floor(int layer_idx) const")
+  low_body = _function_body(hpp, "int encoder_jit_low_watermark(int layer_idx) const")
+  maybe_body = _function_body(cpp, "void FetchScheduleWorker::maybe_enqueue_encoder_jit_refill()")
+  compact_maybe = _compact(maybe_body)
+
+  assert "int encoder_jit_floor(int layer_idx) const" in hpp
+  assert "int encoder_jit_low_watermark(int layer_idx) const" in hpp
+  assert 'erpp_encoder_jit_refill_floor_mode == "budget"' in floor_body
+  assert "encoder_jit_budgets" in floor_body
+  assert "layer_idx" in floor_body
+  assert "return std::max(1, std::min(metas->num_expert, floor_value));" in floor_body
+  assert "encoder_jit_floor(layer_idx)" in low_body
+  assert "encoder_jit_floor()" not in hpp
+  assert "encoder_jit_floor()" not in cpp
+  assert "encoder_jit_low_watermark()" not in hpp
+  assert "encoder_jit_low_watermark()" not in cpp
+
+  budget_expr = (
+      "const int budget = layer_idx < static_cast<int>(encoder_jit_budgets.size()) "
+      "? encoder_jit_budgets[layer_idx] : 0;"
+  )
+  assert budget_expr in compact_maybe
+  assert "const int floor_value = encoder_jit_floor(layer_idx);" in maybe_body
+  assert "const int low_watermark = encoder_jit_low_watermark(layer_idx);" in maybe_body
+  assert compact_maybe.index(budget_expr) < compact_maybe.index(
+      "const int floor_value = encoder_jit_floor(layer_idx);"
+  )
+  assert compact_maybe.index("const int low_watermark = encoder_jit_low_watermark(layer_idx);") < compact_maybe.index(
+      "build_encoder_jit_required_experts("
+  )
+
+
 def test_scheduler_candidate_logic_has_floor_deficit_and_topk_cover():
   cpp = _text(PREFETCHER_CPP)
+  body = _function_body(cpp, "std::vector<int> FetchScheduleWorker::build_encoder_jit_required_experts")
+  compact = _compact(body)
 
   assert "build_encoder_jit_required_experts" in cpp
   assert "floor_deficit" in cpp
@@ -586,6 +657,9 @@ def test_scheduler_candidate_logic_has_floor_deficit_and_topk_cover():
   assert "reason=topk_cover" in cpp
   assert "kCacheRequestEncoderJitRefill" in cpp
   assert "erpp_encoder_jit_refill_per_idle" in cpp
+  assert compact.index("if (occupancy < low_watermark)") < compact.index(
+      "if (metas->enable_erpp_encoder_jit_topk_cover && budget > 0)"
+  )
 
 
 def test_cache_policy_treats_encoder_jit_refill_as_safe_victim_request():
@@ -608,13 +682,30 @@ def test_scheduler_clears_encoder_jit_pending_mask():
 
 
 
+def test_erpp_predictor_jit_ranking_limit_respects_budget_floor_mode():
+  cpp = _text(ERPP_CPP)
+  limit_body = _function_body(cpp, "int ErppEncoderPredictor::encoder_jit_ranking_limit(int layer_idx, int budget) const")
+  budget_mode = 'metas->erpp_encoder_jit_refill_floor_mode == "budget"'
+
+  assert budget_mode in limit_body
+  assert "encoder_jit_floor()" in limit_body
+  assert "std::max(floor_value, budget)" in limit_body
+
+  budget_branch_idx = limit_body.index(budget_mode)
+  floor_idx = limit_body.index("encoder_jit_floor()")
+  assert budget_branch_idx < floor_idx
+  assert "return budget;" in limit_body[budget_branch_idx:floor_idx]
+
+
 def test_erpp_predictor_jit_ranking_limit_respects_fixed_floor_and_legacy_budget():
   cpp = _text(ERPP_CPP)
   floor_body = _function_body(cpp, "int ErppEncoderPredictor::encoder_jit_floor")
-  limit_body = _function_body(cpp, "int ErppEncoderPredictor::encoder_jit_ranking_limit")
+  legacy_limit_body = _function_body(cpp, "int ErppEncoderPredictor::encoder_jit_ranking_limit(int layer_idx) const")
+  limit_body = _function_body(cpp, "int ErppEncoderPredictor::encoder_jit_ranking_limit(int layer_idx, int budget) const")
 
   assert 'metas->erpp_encoder_jit_refill_floor_mode == "fixed"' in floor_body
   assert "metas->erpp_encoder_jit_refill_floor_value" in floor_body
+  assert "encoder_budget_for_layer(layer_idx)" in legacy_limit_body
   assert "!metas->enable_erpp_encoder_jit_refill" in limit_body
   assert "return budget" in limit_body
   assert "std::max(floor_value, budget)" in limit_body

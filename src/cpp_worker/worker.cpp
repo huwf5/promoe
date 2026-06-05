@@ -27,6 +27,10 @@ bool log_erpp_encoder_prefetch_enabled() {
   return scheduler_flag != nullptr && scheduler_flag[0] != '\0' && scheduler_flag[0] != '0';
 }
 
+bool log_erpp_encoder_diagnostics_enabled() {
+  const char* flag = std::getenv("SPARSE_CACHE_LOG_ERPP_ENCODER_DIAGNOSTICS");
+  return flag != nullptr && flag[0] != '\0' && flag[0] != '0';
+}
 }  // namespace
 
 void ErppEncoderPredictWorker::do_one_task_impl(ErppEncoderPredictJob job) {
@@ -52,6 +56,27 @@ void ErppEncoderPredictWorker::do_one_task_impl(ErppEncoderPredictJob job) {
               << " layers=" << predictions.size();
   }
 
+  if (log_erpp_encoder_diagnostics_enabled()) {
+    int64_t ranking_experts_total = 0;
+    int64_t budget_experts_total = 0;
+    int enabled_layers = 0;
+    for (int layer_idx = 0; layer_idx < static_cast<int>(predictions.size()); layer_idx++) {
+      ranking_experts_total += static_cast<int64_t>(predictions[layer_idx].size());
+      const int budget = layer_idx < static_cast<int>(budgets.size()) ? budgets[layer_idx] : 0;
+      budget_experts_total += budget;
+      if (budget > 0 || !predictions[layer_idx].empty()) {
+        enabled_layers += 1;
+      }
+    }
+    LOG(INFO) << "erpp_encoder_diagnostics: prediction_summary"
+              << " forward_epoch=" << job.forward_epoch
+              << " generate_epoch=" << job.generate_epoch
+              << " layers=" << predictions.size()
+              << " enabled_layers=" << enabled_layers
+              << " ranking_experts_total=" << ranking_experts_total
+              << " budget_experts_total=" << budget_experts_total
+              << " jit_refill=" << metas->enable_erpp_encoder_jit_refill;
+  }
 
   if (metas->enable_erpp_encoder_jit_refill) {
     ErppEncoderJitRankingsTask task;

@@ -1,6 +1,7 @@
 import os
 import re
 import math
+import hashlib
 
 from . import hooks
 from .hooks import *
@@ -84,11 +85,33 @@ def move_non_moe_to_gpu(model, device='cuda', filter=RegexFilter(r'.*layers\.(\d
       module.to(device)
   recursive_traverse_childrens_leaf_only(model, f, filter)
 
+# def _runtime_expert_set_diagnostics_enabled():
+#   flag = os.environ.get("SPARSE_CACHE_LOG_RUNTIME_EXPERT_SET", "")
+#   return flag not in ("", "0", "false", "False")
+
+# def _runtime_expert_set_hash(experts):
+#   values = [int(item) for item in experts.detach().cpu().reshape(-1).tolist()]
+#   digest = hashlib.sha1(",".join(str(item) for item in values).encode("ascii")).hexdigest()[:12]
+#   return values, digest
+
 def replace_mlp_report_experts(model, prefetch_mngr, predictor, num_moe_layer, num_expert, num_predict_expert, filter=RegexFilter(r'.*layers\.([1-9]\d*)\.mlp$'), adapter=None):
   def f(module, name):
     if adapter is not None and not adapter.should_patch_report_experts(module):
       return
     def new_report_experts(experts):
+      # if _runtime_expert_set_diagnostics_enabled():
+      #   values, digest = _runtime_expert_set_hash(experts)
+      #   print(
+      #     "runtime_expert_set:"
+      #     f" stage={getattr(module, '_stage', None)}"
+      #     f" stage_layer={getattr(module, '_stage_layer_id', None)}"
+      #     f" global_layer={getattr(module, '_layer_id', None)}"
+      #     f" training={1 if getattr(module, 'training', False) else 0}"
+      #     f" n={len(values)}"
+      #     f" hash={digest}"
+      #     f" experts={values}",
+      #     flush=True,
+      #   )
       prefetch_mngr.report_one_layer(module._layer_id, experts)
 
       return experts

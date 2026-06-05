@@ -13,7 +13,7 @@ from pathlib import Path
 THIS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(THIS_DIR))
 
-from utils import ContractWriter, SwitchRunner, Verifier  # noqa: E402
+from utils import ContractWriter, SWITCH_NUM_ENCODER_MOE_LAYERS, SwitchRunner, Verifier  # noqa: E402
 
 TRAIN_SCRIPT_ENV = "PROMOE_SWITCH_TRACE_TRAIN_SCRIPT"
 
@@ -40,8 +40,8 @@ def _resolve_train_script_path(train_script_path: Path | None) -> Path | None:
     return None
 
 
-def _smoke_train_cmd(trace_dir: Path, model_dir: Path, train_script: Path) -> list[str]:
-    return [
+def _smoke_train_cmd(trace_dir: Path, model_dir: Path, train_script: Path, stage: str) -> list[str]:
+    cmd = [
         sys.executable, str(train_script),
         "--logits_path", str(trace_dir),
         "--predict_model_path", str(model_dir),
@@ -54,8 +54,10 @@ def _smoke_train_cmd(trace_dir: Path, model_dir: Path, train_script: Path) -> li
         "--lr", "0.001",
         "--threshold", "1.0",
         "--threshold_window", "1",
-        "--model_index", "0",
     ]
+    model_index = "0" if stage == "encoder" else str(SWITCH_NUM_ENCODER_MOE_LAYERS)
+    cmd.extend(["--model_index", model_index])
+    return cmd
 
 
 def _run_smoke_train(output_dir: Path, train_script_path: Path | None = None) -> int:
@@ -74,7 +76,7 @@ def _run_smoke_train(output_dir: Path, train_script_path: Path | None = None) ->
         trace_dir = output_dir / stage
         model_dir = output_dir / "smoke_train" / stage
         print(f"Smoke training {stage} trace with {train_script}")
-        r = subprocess.run(_smoke_train_cmd(trace_dir, model_dir, train_script))
+        r = subprocess.run(_smoke_train_cmd(trace_dir, model_dir, train_script, stage))
         if r.returncode != 0:
             print(f"Smoke training failed for {stage} with exit code {r.returncode}", file=sys.stderr)
             return r.returncode
@@ -91,8 +93,19 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Output dir; will create encoder/ and decoder/ subdirs.")
     p.add_argument("--max-new-tokens", type=int, default=64)
     p.add_argument("--batch-size", type=int, default=8)
+    p.add_argument(
+        "--max-input-tokens",
+        type=int,
+        default=512,
+        help="Tokenizer truncation length for encoder prompts; set <=0 to disable truncation.",
+    )
     p.add_argument("--device", type=str, default="cuda:0")
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument(
+        "--print-status",
+        action="store_true",
+        help="Print batch-level runtime status to stdout.",
+    )
     p.add_argument("--verify", action="store_true",
                    help="Run contract-level Verifier on both subdirs after writing.")
     p.add_argument("--smoke-train", action="store_true",
@@ -110,15 +123,27 @@ def main(argv: list[str] | None = None) -> int:
         print("No prompts to process.", file=sys.stderr)
         return 1
 
-    runner = SwitchRunner(model_path=str(args.model_path), device=args.device, seed=args.seed)
+    runner = SwitchRunner(
+        model_path=str(args.model_path),
+        device=args.device,
+        seed=args.seed,
+        verbose=args.print_status,
+    )
+    max_input_tokens = int(args.max_input_tokens) if args.max_input_tokens > 0 else None
     t0 = time.time()
-    enc_acc, dec_acc = runner.run(prompts, args.max_new_tokens, args.batch_size)
+    enc_acc, dec_acc = runner.run(
+        prompts,
+        args.max_new_tokens,
+        args.batch_size,
+        max_input_tokens=max_input_tokens,
+    )
     elapsed = time.time() - t0
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     extra = {
         "seed": args.seed,
         "max_new_tokens": args.max_new_tokens,
+        "max_input_tokens": args.max_input_tokens,
         "batch_size": args.batch_size,
         "model_path": str(args.model_path),
     }
@@ -128,6 +153,7 @@ def main(argv: list[str] | None = None) -> int:
     log = {
         "seed": args.seed,
         "max_new_tokens": args.max_new_tokens,
+        "max_input_tokens": args.max_input_tokens,
         "batch_size": args.batch_size,
         "n_prompts": len(prompts),
         "N_enc": enc_acc.total_tokens(),

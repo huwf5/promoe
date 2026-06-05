@@ -38,6 +38,11 @@ bool log_encoder_layer_stats_enabled() {
   return flag != nullptr && flag[0] != '\0' && flag[0] != '0';
 }
 
+bool log_erpp_encoder_diagnostics_enabled() {
+  const char* flag = std::getenv("SPARSE_CACHE_LOG_ERPP_ENCODER_DIAGNOSTICS");
+  return flag != nullptr && flag[0] != '\0' && flag[0] != '0';
+}
+
 void log_encoder_experts_in_cache_on_decoder_entry(
     ModuleMeta* metas,
     ModelLoader* model_loader,
@@ -423,29 +428,311 @@ std::vector<int> FetchScheduleWorker::build_encoder_jit_required_experts(
   return required;
 }
 
+void FetchScheduleWorker::ensure_encoder_jit_wait_penalty() {
+  if (encoder_jit_wait_penalty_ema_us.size() !=
+      static_cast<size_t>(metas->num_encoder_moe_layer)) {
+    encoder_jit_wait_penalty_ema_us.assign(metas->num_encoder_moe_layer, 1000.0);
+  }
+}
+
+void FetchScheduleWorker::update_encoder_jit_wait_penalty(
+    int layer_idx, int64_t actual_miss, int64_t wait_us_total) {
+  if (layer_idx < 0 || layer_idx >= metas->num_encoder_moe_layer) {
+    return;
+  }
+  ensure_encoder_jit_wait_penalty();
+  double& ema = encoder_jit_wait_penalty_ema_us[layer_idx];
+  if (actual_miss > 0 && wait_us_total > 0) {
+    const double observed = static_cast<double>(wait_us_total) /
+        static_cast<double>(actual_miss);
+    ema = ema <= 0.0 ? observed : ema * 0.80 + observed * 0.20;
+  } else {
+    ema = std::max(100.0, ema * 0.95);
+  }
+}
+
+FetchScheduleWorker::EncoderJitRefillCandidate
+FetchScheduleWorker::build_encoder_jit_refill_candidate(int layer_idx) {
+  EncoderJitRefillCandidate candidate;
+  candidate.layer_idx = layer_idx;
+  if (layer_idx < 0 || layer_idx >= metas->num_encoder_moe_layer ||
+      layer_idx >= static_cast<int>(encoder_jit_rankings.size())) {
+    return candidate;
+  }
+  candidate.occupancy = cache->encoder_layer_cache_occupancy(layer_idx);
+  candidate.budget = layer_idx < static_cast<int>(encoder_jit_budgets.size())
+      ? encoder_jit_budgets[layer_idx]
+      : 0;
+  candidate.floor_value = encoder_jit_auto_floor(layer_idx);
+  if (metas->erpp_encoder_jit_refill_floor_mode == "budget" &&
+      candidate.budget > candidate.floor_value) {
+    // In auto mode, the predicted top-k cover width must obey the same
+    // capacity-aware cap as the floor. Otherwise a 4GB run keeps chasing
+    // ~55 predicted experts per layer even when the layer can only retain ~32.
+    candidate.budget = candidate.floor_value;
+  }
+  candidate.low_watermark = encoder_jit_low_watermark_for_floor(candidate.floor_value);
+  candidate.occupancy_gap = std::max(0, candidate.floor_value - candidate.occupancy);
+  candidate.distance = layer_idx - current_layer;
+
+  const auto& ranking = encoder_jit_rankings[layer_idx];
+  if (candidate.budget > 0) {
+    const int limit = std::min<int>(candidate.budget, ranking.size());
+    for (int rank = 0; rank < limit; rank++) {
+      if (encoder_jit_is_missing(layer_idx, ranking[rank])) {
+        candidate.predicted_missing += 1;
+      }
+    }
+  }
+  candidate.required = build_encoder_jit_required_experts(
+      layer_idx, candidate.occupancy, candidate.floor_value,
+      candidate.low_watermark, candidate.budget);
+  candidate.score = score_encoder_jit_refill_candidate(candidate);
+  return candidate;
+}
+
+double FetchScheduleWorker::score_encoder_jit_refill_candidate(
+    const EncoderJitRefillCandidate& candidate) const {
+  if (candidate.layer_idx < 0 || candidate.required.empty() ||
+      candidate.distance <= 0) {
+    return 0.0;
+  }
+
+  const int predicted_signal = std::max(1, candidate.predicted_missing);
+  double gap_signal = 1.0 + static_cast<double>(candidate.occupancy_gap);
+  if (candidate.occupancy >= candidate.low_watermark &&
+      candidate.occupancy_gap == 0) {
+    // Top-k cover can still be useful when the layer is above its floor, but it
+    // should not steal refill bandwidth from layers below watermark.
+    gap_signal = 0.25;
+  }
+
+  double wait_penalty = 1.0;
+  if (candidate.layer_idx >= 0 &&
+      candidate.layer_idx < static_cast<int>(encoder_jit_wait_penalty_ema_us.size())) {
+    wait_penalty = encoder_jit_wait_penalty_ema_us[candidate.layer_idx] / 1000.0;
+  }
+  wait_penalty = std::max(0.25, std::min(20.0, wait_penalty));
+
+  double deadline_weight = 1.0;
+  if (candidate.distance == 1) {
+    deadline_weight = 3.0;
+  } else if (candidate.distance == 2) {
+    deadline_weight = 2.0;
+  } else if (candidate.distance == 3) {
+    deadline_weight = 1.4;
+  }
+
+  double slack_weight = 0.7;
+  if (candidate.distance == 1) {
+    slack_weight = 0.8;
+  } else if (candidate.distance == 2) {
+    slack_weight = 1.2;
+  } else if (candidate.distance == 3) {
+    slack_weight = 1.1;
+  }
+
+  return gap_signal * static_cast<double>(predicted_signal) *
+      wait_penalty * deadline_weight * slack_weight;
+}
+
+void FetchScheduleWorker::log_encoder_jit_layer_entry_diagnostics(
+    int layer_idx, const int64_t* expert_idxs, size_t num_expert) {
+  if (metas == nullptr || cache == nullptr || model_loader == nullptr) {
+    return;
+  }
+  if (!metas->enable_erpp_encoder_jit_refill || !metas->is_encoder_layer(layer_idx)) {
+    return;
+  }
+  if (!log_encoder_layer_stats_enabled() &&
+      !log_prefetch_decision_enabled() &&
+      !log_erpp_encoder_diagnostics_enabled()) {
+    return;
+  }
+
+  const bool ranking_available =
+      !encoder_jit_rankings.empty() &&
+      encoder_jit_generate_epoch == current_generate_epoch &&
+      encoder_jit_forward_epoch == current_forward_epoch &&
+      layer_idx >= 0 &&
+      layer_idx < static_cast<int>(encoder_jit_rankings.size());
+  const int budget = layer_idx >= 0 && layer_idx < static_cast<int>(encoder_jit_budgets.size())
+      ? encoder_jit_budgets[layer_idx]
+      : 0;
+  const int occupancy = cache->encoder_layer_cache_occupancy(layer_idx);
+  const int floor_value = encoder_jit_floor(layer_idx);
+  const int low_watermark = encoder_jit_low_watermark(layer_idx);
+
+  int predicted_cover = 0;
+  int ready_cover = 0;
+  int submitted_not_ready = 0;
+  int predicted_not_ready = 0;
+  int outside_ranking = 0;
+
+  struct DemandDiagnostic {
+    int expert_idx = -1;
+    int rank = -1;
+    bool within_budget = false;
+    bool submitted = false;
+    bool in_cache = false;
+    bool ready = false;
+    bool is_current_copy = false;
+    int num_ready = 0;
+    int status = 0;
+  };
+  std::vector<DemandDiagnostic> diagnostics;
+  diagnostics.reserve(num_expert);
+
+  for (size_t i = 0; i < num_expert; i++) {
+    DemandDiagnostic diag;
+    diag.expert_idx = static_cast<int>(expert_idxs[i]);
+    if (diag.expert_idx < 0 || diag.expert_idx >= metas->num_expert) {
+      outside_ranking += 1;
+      diagnostics.push_back(diag);
+      continue;
+    }
+
+    if (ranking_available) {
+      const auto& ranking = encoder_jit_rankings[layer_idx];
+      auto it = std::find(ranking.begin(), ranking.end(), diag.expert_idx);
+      if (it != ranking.end()) {
+        diag.rank = static_cast<int>(std::distance(ranking.begin(), it));
+      }
+    }
+    diag.within_budget = diag.rank >= 0 && diag.rank < budget;
+    if (diag.within_budget) {
+      predicted_cover += 1;
+    } else if (diag.rank < 0) {
+      outside_ranking += 1;
+    }
+
+    if (layer_idx >= 0 && layer_idx < static_cast<int>(encoder_jit_submitted_mask.size()) &&
+        diag.expert_idx < static_cast<int>(encoder_jit_submitted_mask[layer_idx].size())) {
+      diag.submitted = encoder_jit_submitted_mask[layer_idx][diag.expert_idx] != 0;
+    }
+
+    ExpertHandler* expert = model_loader->get_source(layer_idx, diag.expert_idx);
+    diag.in_cache = cache->is_in_cache(expert);
+    diag.is_current_copy = current_task.expert == expert;
+    diag.num_ready = expert->num_ready;
+    diag.status = int(expert->expert_status.get());
+    diag.ready = diag.status == int(kReady) || diag.status == int(kLaunching);
+
+    if (diag.within_budget && diag.ready) {
+      ready_cover += 1;
+    }
+    if (diag.submitted && !diag.ready) {
+      submitted_not_ready += 1;
+    }
+    if (diag.rank >= 0 && !diag.ready) {
+      predicted_not_ready += 1;
+    }
+    diagnostics.push_back(diag);
+  }
+
+  LOG(INFO) << "erpp_encoder_jit_refill: demand_summary"
+            << " current=L" << current_layer
+            << " target=L" << layer_idx
+            << " needed=" << num_expert
+            << " predicted_cover=" << predicted_cover
+            << " ready_cover=" << ready_cover
+            << " submitted_not_ready=" << submitted_not_ready
+            << " predicted_not_ready=" << predicted_not_ready
+            << " outside_ranking=" << outside_ranking
+            << " ranking_available=" << ranking_available
+            << " budget=" << budget
+            << " occupancy=" << occupancy
+            << " floor=" << floor_value
+            << " low=" << low_watermark
+            << " forward_epoch=" << current_forward_epoch
+            << " generate_epoch=" << current_generate_epoch
+            << " ranking_forward_epoch=" << encoder_jit_forward_epoch
+            << " ranking_generate_epoch=" << encoder_jit_generate_epoch;
+
+  if (log_erpp_encoder_diagnostics_enabled()) {
+    LOG(INFO) << "erpp_encoder_diagnostics: demand_coverage"
+              << " current_layer=" << current_layer
+              << " target_layer=" << layer_idx
+              << " needed=" << num_expert
+              << " predicted_cover=" << predicted_cover
+              << " ready_cover=" << ready_cover
+              << " submitted_not_ready=" << submitted_not_ready
+              << " predicted_not_ready=" << predicted_not_ready
+              << " outside_ranking=" << outside_ranking
+              << " ranking_available=" << ranking_available
+              << " budget=" << budget
+              << " occupancy=" << occupancy
+              << " floor=" << floor_value
+              << " low=" << low_watermark
+              << " forward_epoch=" << current_forward_epoch
+              << " generate_epoch=" << current_generate_epoch;
+  }
+
+  for (const auto& diag : diagnostics) {
+    LOG(INFO) << "erpp_encoder_jit_refill: demand_detail"
+              << " current=L" << current_layer
+              << " target=L" << layer_idx
+              << " expert=" << diag.expert_idx
+              << " rank=" << diag.rank
+              << " within_budget=" << diag.within_budget
+              << " submitted=" << diag.submitted
+              << " in_cache=" << diag.in_cache
+              << " ready=" << diag.ready
+              << " is_current_copy=" << diag.is_current_copy
+              << " num_ready=" << diag.num_ready
+              << " status=" << diag.status
+              << " forward_epoch=" << current_forward_epoch
+              << " generate_epoch=" << current_generate_epoch;
+  }
+}
+
 void FetchScheduleWorker::maybe_enqueue_encoder_jit_refill() {
   if (!metas->enable_erpp_encoder_jit_refill || phase != kEncoderPhase) {
     return;
   }
   const bool log_enabled = log_prefetch_decision_enabled();
+  const bool diagnostics_enabled = log_erpp_encoder_diagnostics_enabled();
+  const bool auto_refill = encoder_jit_auto_refill_enabled();
+  const int effective_per_idle_limit = metas->erpp_encoder_jit_refill_per_idle;
+  ensure_encoder_jit_wait_penalty();
+  int inspected_layers = 0;
+  int required_experts = 0;
+  int enqueued_experts = 0;
+  int skipped_disabled_layers = 0;
+  int per_idle_limited = 0;
+  auto log_jit_enqueue_summary = [&](const char* stop_reason) {
+    if (!diagnostics_enabled) {
+      return;
+    }
+    LOG(INFO) << "erpp_encoder_diagnostics: jit_enqueue_summary"
+              << " reason=" << stop_reason
+              << " mode=" << (auto_refill ? "auto" : "ordered")
+              << " current_layer=" << current_layer
+              << " inspected_layers=" << inspected_layers
+              << " required_experts=" << required_experts
+              << " enqueued_experts=" << enqueued_experts
+              << " skipped_disabled_layers=" << skipped_disabled_layers
+              << " per_idle_limited=" << per_idle_limited
+              << " effective_per_idle_limit=" << effective_per_idle_limit
+              << " pending_encoder_prefetch="
+              << has_pending_prefetch_for_class(PrefetchClass::kEncoderPredictor)
+              << " has_reclaimable_encoder=" << cache->has_reclaimable_encoder()
+              << " forward_epoch=" << current_forward_epoch
+              << " generate_epoch=" << current_generate_epoch;
+  };
   if (encoder_jit_rankings.empty()) {
     if (log_enabled) {
       LOG(INFO) << "erpp_encoder_jit_refill: skip reason=no_ranking"
                 << " current=L" << current_layer
                 << " forward_epoch=" << current_forward_epoch;
     }
+    log_jit_enqueue_summary("no_ranking");
     return;
   }
   if (encoder_jit_generate_epoch != current_generate_epoch ||
       encoder_jit_forward_epoch != current_forward_epoch) {
         CHECK(false) << "erpp_encoder_jit_refill: skip reason=stale_ranking";
-    // if (log_enabled) {
-    //   LOG(INFO) << "erpp_encoder_jit_refill: skip reason=stale_ranking"
-    //             << " ranking_forward_epoch=" << encoder_jit_forward_epoch
-    //             << " current_forward_epoch=" << current_forward_epoch
-    //             << " ranking_generate_epoch=" << encoder_jit_generate_epoch
-    //             << " current_generate_epoch=" << current_generate_epoch;
-    // }
+    log_jit_enqueue_summary("stale_ranking");
     return;
   }
 
@@ -457,22 +744,133 @@ void FetchScheduleWorker::maybe_enqueue_encoder_jit_refill() {
                 << " current=L" << current_layer
                 << " window=" << metas->erpp_encoder_jit_refill_window;
     }
+    log_jit_enqueue_summary("no_future_layer_in_window");
     return;
   }
 
+  auto enqueue_one = [&](int layer_idx, int expert_idx, const char* mode,
+                         double score, int occupancy, int floor_value,
+                         int low_watermark, int predicted_missing,
+                         int occupancy_gap, int distance) {
+    TaskQueue* queue = queue_for_class_and_layer(PrefetchClass::kEncoderPredictor, layer_idx);
+    if (queue == nullptr) {
+      return false;
+    }
+    if (metas->chunk_prefetch) {
+      add_separate_tasks_for_one_expert(layer_idx, expert_idx, queue, 0,
+                                        metas->num_per_expert_param, false,
+                                        current_forward_epoch,
+                                        kCacheRequestEncoderJitRefill);
+    } else {
+      add_single_tasks_for_one_expert(layer_idx, expert_idx, queue, 0,
+                                      metas->num_per_expert_param, false,
+                                      current_forward_epoch,
+                                      kCacheRequestEncoderJitRefill);
+    }
+    mark_encoder_jit_submitted(layer_idx, expert_idx);
+    enqueued_experts += 1;
+    if (log_enabled) {
+      int rank = -1;
+      if (layer_idx >= 0 && layer_idx < static_cast<int>(encoder_jit_rankings.size())) {
+        const auto& ranking = encoder_jit_rankings[layer_idx];
+        auto it = std::find(ranking.begin(), ranking.end(), expert_idx);
+        if (it != ranking.end()) {
+          rank = static_cast<int>(std::distance(ranking.begin(), it));
+        }
+      }
+      const int budget = layer_idx < static_cast<int>(encoder_jit_budgets.size())
+          ? encoder_jit_budgets[layer_idx]
+          : 0;
+      const char* reason = metas->enable_erpp_encoder_jit_topk_cover &&
+              rank >= 0 && rank < budget
+          ? "topk_cover"
+          : "floor_deficit";
+      LOG(INFO) << "erpp_encoder_jit_refill: enqueue target=L" << layer_idx
+                << " expert=" << expert_idx
+                << " rank=" << rank
+                << " reason=" << reason
+                << " mode=" << mode
+                << " score=" << score
+                << " occupancy=" << occupancy
+                << " floor=" << floor_value
+                << " low=" << low_watermark
+                << " predicted_missing=" << predicted_missing
+                << " occupancy_gap=" << occupancy_gap
+                << " distance=" << distance
+                << " forward_epoch=" << current_forward_epoch;
+    }
+    return true;
+  };
+
   int enqueued = 0;
+  if (auto_refill) {
+    while (effective_per_idle_limit < 0 || enqueued < effective_per_idle_limit) {
+      EncoderJitRefillCandidate best;
+      for (int layer_idx = begin_layer; layer_idx < end_layer; layer_idx++) {
+        if (!encoder_jit_layer_enabled(layer_idx)) {
+          skipped_disabled_layers += 1;
+          if (log_enabled) {
+            LOG(INFO) << "erpp_encoder_jit_refill: skip target=L" << layer_idx
+                      << " reason=layer_disabled"
+                      << " mode=auto";
+          }
+          continue;
+        }
+        inspected_layers += 1;
+        auto candidate = build_encoder_jit_refill_candidate(layer_idx);
+        required_experts += static_cast<int>(candidate.required.size());
+        if (log_enabled) {
+          LOG(INFO) << "erpp_encoder_jit_refill: inspect current=L" << current_layer
+                    << " target=L" << layer_idx
+                    << " mode=auto"
+                    << " occupancy=" << candidate.occupancy
+                    << " floor=" << candidate.floor_value
+                    << " low=" << candidate.low_watermark
+                    << " budget=" << candidate.budget
+                    << " predicted_missing=" << candidate.predicted_missing
+                    << " occupancy_gap=" << candidate.occupancy_gap
+                    << " distance=" << candidate.distance
+                    << " required=" << candidate.required.size()
+                    << " score=" << candidate.score
+                    << " wait_penalty_us="
+                    << (layer_idx < static_cast<int>(encoder_jit_wait_penalty_ema_us.size())
+                        ? encoder_jit_wait_penalty_ema_us[layer_idx]
+                        : 0.0);
+        }
+        if (!candidate.required.empty() && candidate.score > best.score) {
+          best = std::move(candidate);
+        }
+      }
+      if (best.layer_idx < 0 || best.required.empty() || best.score <= 0.0) {
+        log_jit_enqueue_summary(enqueued > 0 ? "complete" : "no_candidate");
+        return;
+      }
+      if (!enqueue_one(best.layer_idx, best.required.front(), "auto",
+                       best.score, best.occupancy, best.floor_value,
+                       best.low_watermark, best.predicted_missing,
+                       best.occupancy_gap, best.distance)) {
+        log_jit_enqueue_summary("queue_unavailable");
+        return;
+      }
+      enqueued += 1;
+    }
+    per_idle_limited += 1;
+    log_jit_enqueue_summary("per_idle_limit");
+    return;
+  }
+
   for (int layer_idx = begin_layer; layer_idx < end_layer; layer_idx++) {
     if (!encoder_jit_layer_enabled(layer_idx)) {
+      skipped_disabled_layers += 1;
       if (log_enabled) {
         LOG(INFO) << "erpp_encoder_jit_refill: skip target=L" << layer_idx
                   << " reason=layer_disabled";
       }
       continue;
     }
+    inspected_layers += 1;
 
-    // Experts currently resident in GPU cache for this layer (not in-flight refill).
     const int occupancy = cache->encoder_layer_cache_occupancy(layer_idx);
-    // ERPP top-k cover width for this layer; 0 if budgets are unavailable.
     const int budget = layer_idx < static_cast<int>(encoder_jit_budgets.size())
         ? encoder_jit_budgets[layer_idx]
         : 0;
@@ -489,59 +887,32 @@ void FetchScheduleWorker::maybe_enqueue_encoder_jit_refill() {
     }
     auto required = build_encoder_jit_required_experts(
         layer_idx, occupancy, floor_value, low_watermark, budget);
+    required_experts += static_cast<int>(required.size());
     for (int expert_idx : required) {
       if (metas->erpp_encoder_jit_refill_per_idle > 0 &&
           enqueued >= metas->erpp_encoder_jit_refill_per_idle) {
+        per_idle_limited += 1;
         if (log_enabled) {
           LOG(INFO) << "erpp_encoder_jit_refill: skip target=L" << layer_idx
                     << " expert=" << expert_idx
                     << " reason=per_idle_limit"
                     << " limit=" << metas->erpp_encoder_jit_refill_per_idle;
         }
+        log_jit_enqueue_summary("per_idle_limit");
         return;
       }
-      TaskQueue* queue = queue_for_class_and_layer(PrefetchClass::kEncoderPredictor, layer_idx);
-      if (queue == nullptr) {
+      if (!enqueue_one(layer_idx, expert_idx, "ordered", 0.0, occupancy,
+                       floor_value, low_watermark, 0,
+                       std::max(0, floor_value - occupancy),
+                       layer_idx - current_layer)) {
+        log_jit_enqueue_summary("queue_unavailable");
         return;
       }
-      if (metas->chunk_prefetch) {
-        add_separate_tasks_for_one_expert(layer_idx, expert_idx, queue, 0,
-                                          metas->num_per_expert_param, false,
-                                          current_forward_epoch,
-                                          kCacheRequestEncoderJitRefill);
-      } else {
-        add_single_tasks_for_one_expert(layer_idx, expert_idx, queue, 0,
-                                        metas->num_per_expert_param, false,
-                                        current_forward_epoch,
-                                        kCacheRequestEncoderJitRefill);
-      }
-      mark_encoder_jit_submitted(layer_idx, expert_idx);
       enqueued += 1;
-      if (log_enabled) {
-        int rank = -1;
-        if (layer_idx >= 0 && layer_idx < static_cast<int>(encoder_jit_rankings.size())) {
-          const auto& ranking = encoder_jit_rankings[layer_idx];
-          auto it = std::find(ranking.begin(), ranking.end(), expert_idx);
-          if (it != ranking.end()) {
-            rank = static_cast<int>(std::distance(ranking.begin(), it));
-          }
-        }
-        const int budget = layer_idx < static_cast<int>(encoder_jit_budgets.size())
-            ? encoder_jit_budgets[layer_idx]
-            : 0;
-        const char* reason = metas->enable_erpp_encoder_jit_topk_cover &&
-                rank >= 0 && rank < budget
-            ? "topk_cover"
-            : "floor_deficit";
-        LOG(INFO) << "erpp_encoder_jit_refill: enqueue target=L" << layer_idx
-                  << " expert=" << expert_idx
-                  << " rank=" << rank
-                  << " reason=" << reason
-                  << " forward_epoch=" << current_forward_epoch;
-      }
     }
   }
 
+  log_jit_enqueue_summary("complete");
 }
 
 void FetchScheduleWorker::store_erpp_encoder_jit_rankings(
@@ -681,6 +1052,7 @@ void FetchScheduleWorker::start_forward_epoch(
     current_forward_epoch = forward_epoch;
     current_layer = -1;
     clear_encoder_jit_state();
+    clear_encoder_prefetch_metrics();
     clear_stale_prefetch_queues_before_epoch(current_forward_epoch);
     precise_job_queue.clear();
   }
@@ -705,6 +1077,7 @@ void FetchScheduleWorker::advance_actual_layer(int64_t forward_epoch, int layer_
     current_forward_epoch = forward_epoch;
     current_layer = -1;
     clear_encoder_jit_state();
+    clear_encoder_prefetch_metrics();
     clear_stale_prefetch_queues_before_epoch(current_forward_epoch);
     precise_job_queue.clear();
   }
@@ -849,6 +1222,9 @@ void FetchScheduleWorker::add_single_tasks_for_one_expert(int layer_idx, int exp
   task.request_type = request_type;
   LOG(TRACE) << "scheduler: add prefetch task for one param " << task.toString();
   queue->push(task);
+  if (!is_precise && is_encoder_prefetch_request(request_type)) {
+    mark_encoder_prefetch_enqueued(layer_idx, expert_idx, stop_mem_buffer - starting_mem_buffer);
+  }
 }
 
 void FetchScheduleWorker::add_separate_tasks_for_one_expert(int layer_idx, int expert_idx, TaskQueue *queue, int start_mem_buf_idx, int stop_mem_buf_idx, bool is_precise, int64_t forward_epoch, CacheRequestType request_type) {
@@ -1181,6 +1557,16 @@ bool FetchScheduleWorker::pop_next_prefetch_for_class(PrefetchClass cls, CopyTas
                       << " current_layer=" << current_layer
                       << " forward_epoch=" << current_forward_epoch;
           }
+          if (log_erpp_encoder_diagnostics_enabled()) {
+            LOG(INFO) << "erpp_encoder_diagnostics: scheduler_block"
+                      << " reason=no_reclaimable_encoder"
+                      << " request=encoder_predictor_prefetch"
+                      << " target_layer=" << candidate.expert->layer_idx
+                      << " expert=" << candidate.expert->expert_idx
+                      << " current_layer=" << current_layer
+                      << " forward_epoch=" << current_forward_epoch
+                      << " generate_epoch=" << current_generate_epoch;
+          }
           break;
         }
         if (candidate.request_type == kCacheRequestEncoderJitRefill &&
@@ -1193,6 +1579,23 @@ bool FetchScheduleWorker::pop_next_prefetch_for_class(PrefetchClass cls, CopyTas
                       << " reason=no_safe_victim"
                       << " current=L" << current_layer
                       << " floor=" << encoder_jit_floor(candidate.expert->layer_idx);
+          }
+          if (log_erpp_encoder_diagnostics_enabled()) {
+            LOG(INFO) << "erpp_encoder_diagnostics: scheduler_block"
+                      << " reason=no_safe_victim"
+                      << " request=encoder_jit_refill"
+                      << " target_layer=" << candidate.expert->layer_idx
+                      << " expert=" << candidate.expert->expert_idx
+                      << " current_layer=" << current_layer
+                      << " floor=" << encoder_jit_floor(candidate.expert->layer_idx)
+                      << " has_reclaimable_encoder=" << cache->has_reclaimable_encoder()
+                      << " forward_epoch=" << current_forward_epoch
+                      << " generate_epoch=" << current_generate_epoch;
+          }
+          ensure_encoder_prefetch_metrics();
+          if (candidate.expert->layer_idx >= 0 &&
+              candidate.expert->layer_idx < static_cast<int>(encoder_prefetch_metrics.size())) {
+            encoder_prefetch_metrics[candidate.expert->layer_idx].no_victim_blocks += 1;
           }
           break;
         }
@@ -1210,6 +1613,19 @@ bool FetchScheduleWorker::pop_next_prefetch_for_class(PrefetchClass cls, CopyTas
                     << " P" << candidate.start_mem_buf_idx << "-" << candidate.stop_mem_buf_idx
                     << " current_layer=" << current_layer
                     << " forward_epoch=" << current_forward_epoch;
+        }
+        if (log_erpp_encoder_diagnostics_enabled()) {
+          LOG(INFO) << "erpp_encoder_diagnostics: scheduler_dispatch"
+                    << " request="
+                    << (candidate.request_type == kCacheRequestEncoderJitRefill
+                            ? "encoder_jit_refill"
+                            : "encoder_predictor_prefetch")
+                    << " target_layer=" << candidate.expert->layer_idx
+                    << " expert=" << candidate.expert->expert_idx
+                    << " part=" << candidate.start_mem_buf_idx << "-" << candidate.stop_mem_buf_idx
+                    << " current_layer=" << current_layer
+                    << " forward_epoch=" << current_forward_epoch
+                    << " generate_epoch=" << current_generate_epoch;
         }
         task = candidate;
         return true;
@@ -1450,6 +1866,10 @@ void PrefetchMngr::log_encoder_layer_entry_stats(
     int layer_id,
     int64_t* experts,
     int64_t num_expert) {
+  if (!log_encoder_layer_stats_enabled() &&
+      !log_erpp_encoder_diagnostics_enabled()) {
+    return;
+  }
   if (!metas->is_encoder_layer(layer_id)) {
     return;
   }
@@ -1459,16 +1879,52 @@ void PrefetchMngr::log_encoder_layer_entry_stats(
   stats.forward_epoch = forward_epoch;
   stats.generate_epoch = generate_epoch;
   stats.needed = num_expert;
+  if (fetch_schedule_thread != nullptr) {
+    fetch_schedule_thread->ensure_encoder_prefetch_metrics();
+    if (layer_id >= 0 && layer_id < static_cast<int>(fetch_schedule_thread->encoder_prefetch_metrics.size())) {
+      const auto& metrics = fetch_schedule_thread->encoder_prefetch_metrics[layer_id];
+      stats.occupancy_at_entry = cache->encoder_layer_cache_occupancy(layer_id);
+      stats.prefetch_enqueued_experts = metrics.enqueued_experts;
+      stats.prefetch_enqueued_chunks = metrics.enqueued_chunks;
+      stats.prefetch_dispatched_experts = metrics.dispatched_experts;
+      stats.prefetch_dispatched_chunks = metrics.dispatched_chunks;
+      stats.prefetch_completed_experts = metrics.completed_experts;
+      stats.prefetch_completed_chunks = metrics.completed_chunks;
+      stats.prefetch_completed_after_entry_experts = metrics.completed_after_entry_experts;
+      stats.prefetch_completed_after_entry_chunks = metrics.completed_after_entry_chunks;
+      stats.prefetch_no_victim_blocks = metrics.no_victim_blocks;
+      fetch_schedule_thread->encoder_layer_entered_mask[layer_id] = 1;
+    }
+  }
+  std::vector<uint8_t> seen(metas->num_expert, 0);
   for (int64_t i = 0; i < num_expert; i++) {
     int expert_id = int(experts[i]);
     if (expert_id < 0 || expert_id >= metas->num_expert) {
       stats.entry_miss += 1;
       continue;
     }
-    if (encoder_layer_expert_entry_hit(layer_id, expert_id)) {
+    const bool entry_hit = encoder_layer_expert_entry_hit(layer_id, expert_id);
+    if (entry_hit) {
       stats.entry_hit += 1;
     } else {
       stats.entry_miss += 1;
+    }
+    if (seen[expert_id]) {
+      continue;
+    }
+    seen[expert_id] = 1;
+    if (fetch_schedule_thread != nullptr &&
+        layer_id >= 0 &&
+        layer_id < static_cast<int>(fetch_schedule_thread->encoder_prefetch_completed_mask.size())) {
+      const bool completed = fetch_schedule_thread->encoder_prefetch_completed_mask[layer_id][expert_id] != 0;
+      const bool dispatched = fetch_schedule_thread->encoder_prefetch_dispatched_mask[layer_id][expert_id] != 0;
+      if (completed && entry_hit) {
+        stats.needed_prefetch_completed_at_entry += 1;
+      } else if (completed && !entry_hit) {
+        stats.needed_prefetch_evicted_at_entry += 1;
+      } else if (dispatched && !entry_hit) {
+        stats.needed_prefetch_pending_at_entry += 1;
+      }
     }
   }
   if (log_encoder_layer_stats_enabled()) {
@@ -1479,6 +1935,17 @@ void PrefetchMngr::log_encoder_layer_entry_stats(
               << " miss=" << stats.entry_miss
               << " entry_hit=" << stats.entry_hit
               << " entry_miss=" << stats.entry_miss
+              << " occupancy_at_entry=" << stats.occupancy_at_entry
+              << " prefetch_enqueued_experts=" << stats.prefetch_enqueued_experts
+              << " prefetch_enqueued_chunks=" << stats.prefetch_enqueued_chunks
+              << " prefetch_dispatched_experts=" << stats.prefetch_dispatched_experts
+              << " prefetch_dispatched_chunks=" << stats.prefetch_dispatched_chunks
+              << " prefetch_completed_experts=" << stats.prefetch_completed_experts
+              << " prefetch_completed_chunks=" << stats.prefetch_completed_chunks
+              << " needed_prefetch_completed_at_entry=" << stats.needed_prefetch_completed_at_entry
+              << " needed_prefetch_pending_at_entry=" << stats.needed_prefetch_pending_at_entry
+              << " needed_prefetch_evicted_at_entry=" << stats.needed_prefetch_evicted_at_entry
+              << " prefetch_no_victim_blocks=" << stats.prefetch_no_victim_blocks
               << " forward_epoch=" << stats.forward_epoch
               << " generate_epoch=" << stats.generate_epoch;
   }
@@ -1491,6 +1958,10 @@ void PrefetchMngr::log_encoder_layer_use_stats(
     bool waited,
     uint64_t wait_us,
     int status_before) {
+  if (!log_encoder_layer_stats_enabled() &&
+      !log_erpp_encoder_diagnostics_enabled()) {
+    return;
+  }
   if (!metas->is_encoder_layer(layer_id)) {
     return;
   }
@@ -1501,10 +1972,28 @@ void PrefetchMngr::log_encoder_layer_use_stats(
     stats.forward_epoch = forward_epoch;
     stats.generate_epoch = generate_epoch;
   }
+  bool completed_by_prefetch = false;
+  bool dispatched_by_prefetch = false;
+  if (fetch_schedule_thread != nullptr &&
+      layer_id >= 0 && layer_id < metas->num_encoder_moe_layer &&
+      expert_id >= 0 && expert_id < metas->num_expert) {
+    fetch_schedule_thread->ensure_encoder_prefetch_metrics();
+    fetch_schedule_thread->encoder_prefetch_used_mask[layer_id][expert_id] = 1;
+    completed_by_prefetch = fetch_schedule_thread->encoder_prefetch_completed_mask[layer_id][expert_id] != 0;
+    dispatched_by_prefetch = fetch_schedule_thread->encoder_prefetch_dispatched_mask[layer_id][expert_id] != 0;
+  }
   if (hit) {
     stats.actual_hit += 1;
+    if (completed_by_prefetch) {
+      stats.prefetch_completed_before_use += 1;
+    }
   } else {
     stats.actual_miss += 1;
+    if (completed_by_prefetch) {
+      stats.prefetch_evicted_before_use += 1;
+    } else if (dispatched_by_prefetch) {
+      stats.prefetch_late_on_use += 1;
+    }
   }
   if (waited) {
     stats.waited += 1;
@@ -1523,17 +2012,49 @@ void PrefetchMngr::log_encoder_layer_use_stats(
               << " actual_hit=" << stats.actual_hit
               << " actual_miss=" << stats.actual_miss
               << " wait_us_total=" << stats.wait_us_total
+              << " prefetch_completed_before_use=" << stats.prefetch_completed_before_use
+              << " prefetch_late_on_use=" << stats.prefetch_late_on_use
+              << " prefetch_evicted_before_use=" << stats.prefetch_evicted_before_use
               << " forward_epoch=" << stats.forward_epoch
               << " generate_epoch=" << stats.generate_epoch;
   }
 }
 
 void PrefetchMngr::log_encoder_layer_done_stats(int layer_id) {
+  if (!log_encoder_layer_stats_enabled() &&
+      !log_erpp_encoder_diagnostics_enabled()) {
+    return;
+  }
   if (!metas->is_encoder_layer(layer_id)) {
     return;
   }
   ensure_encoder_layer_stats_size();
-  const auto& stats = encoder_layer_stats[layer_id];
+  auto& stats = encoder_layer_stats[layer_id];
+  if (stats.done_logged) {
+    return;
+  }
+  stats.prefetch_unused_completed = 0;
+  if (fetch_schedule_thread != nullptr &&
+      layer_id >= 0 && layer_id < metas->num_encoder_moe_layer) {
+    fetch_schedule_thread->ensure_encoder_prefetch_metrics();
+    if (layer_id < static_cast<int>(fetch_schedule_thread->encoder_prefetch_completed_mask.size())) {
+      for (int expert_id = 0; expert_id < metas->num_expert; expert_id++) {
+        if (fetch_schedule_thread->encoder_prefetch_completed_mask[layer_id][expert_id] &&
+            !fetch_schedule_thread->encoder_prefetch_used_mask[layer_id][expert_id]) {
+          stats.prefetch_unused_completed += 1;
+        }
+      }
+      const auto& metrics = fetch_schedule_thread->encoder_prefetch_metrics[layer_id];
+      stats.prefetch_completed_after_entry_experts = metrics.completed_after_entry_experts;
+      stats.prefetch_completed_after_entry_chunks = metrics.completed_after_entry_chunks;
+      stats.prefetch_no_victim_blocks = metrics.no_victim_blocks;
+    }
+  }
+  if (fetch_schedule_thread != nullptr) {
+    fetch_schedule_thread->update_encoder_jit_wait_penalty(
+        layer_id, stats.actual_miss, stats.wait_us_total);
+  }
+  stats.done_logged = true;
   if (log_encoder_layer_stats_enabled()) {
     LOG(INFO) << "encoder_layer_stats: phase=done"
               << " L=" << layer_id
@@ -1545,6 +2066,23 @@ void PrefetchMngr::log_encoder_layer_done_stats(int layer_id) {
               << " waited=" << stats.waited
               << " wait_us_total=" << stats.wait_us_total
               << " wait_us_max=" << stats.wait_us_max
+              << " occupancy_at_entry=" << stats.occupancy_at_entry
+              << " prefetch_enqueued_experts=" << stats.prefetch_enqueued_experts
+              << " prefetch_enqueued_chunks=" << stats.prefetch_enqueued_chunks
+              << " prefetch_dispatched_experts=" << stats.prefetch_dispatched_experts
+              << " prefetch_dispatched_chunks=" << stats.prefetch_dispatched_chunks
+              << " prefetch_completed_experts=" << stats.prefetch_completed_experts
+              << " prefetch_completed_chunks=" << stats.prefetch_completed_chunks
+              << " prefetch_completed_after_entry_experts=" << stats.prefetch_completed_after_entry_experts
+              << " prefetch_completed_after_entry_chunks=" << stats.prefetch_completed_after_entry_chunks
+              << " needed_prefetch_completed_at_entry=" << stats.needed_prefetch_completed_at_entry
+              << " needed_prefetch_pending_at_entry=" << stats.needed_prefetch_pending_at_entry
+              << " needed_prefetch_evicted_at_entry=" << stats.needed_prefetch_evicted_at_entry
+              << " prefetch_completed_before_use=" << stats.prefetch_completed_before_use
+              << " prefetch_late_on_use=" << stats.prefetch_late_on_use
+              << " prefetch_evicted_before_use=" << stats.prefetch_evicted_before_use
+              << " prefetch_unused_completed=" << stats.prefetch_unused_completed
+              << " prefetch_no_victim_blocks=" << stats.prefetch_no_victim_blocks
               << " forward_epoch=" << stats.forward_epoch
               << " generate_epoch=" << stats.generate_epoch;
   }
@@ -1559,6 +2097,10 @@ void PrefetchMngr::report_one_layer(int layer_id, int64_t* experts, int64_t num_
   NVTX_DETAIL_MARK("demand/layer_experts L" + std::to_string(layer_id) +
                    " experts=[" + array_to_str(experts, num_expert) + "]");
   cache_stats->forward();
+  const int previous_layer = layer_id - 1;
+  if (previous_layer >= 0 && metas->is_encoder_layer(previous_layer)) {
+    log_encoder_layer_done_stats(previous_layer);
+  }
   log_encoder_layer_entry_stats(layer_id, experts, num_expert);
   if (metas->is_decoder_layer(layer_id)) {
     LOG(INFO) << "prefetcher: consume prefetch layer progress at layer " << layer_id;
@@ -1782,11 +2324,16 @@ PrefetchMngr::PrefetchMngr(std::shared_ptr<ModuleMeta> metas,
     auto num_used_expert_tensor = p->to_tensor(TimeProfiler::kCntActivatedExpert);
     // auto idx_is_prefill = num_used_expert_tensor >  (metas->num_expert_per_token * metas->num_layer);
     // auto idx_is_decode  = num_used_expert_tensor <= (metas->num_expert_per_token * metas->num_layer);
-    auto idx_is_prefill = p->to_tensor(TimeProfiler::kSeqLen) > 1;
-    auto idx_is_decode  = p->to_tensor(TimeProfiler::kSeqLen) <= 1;
-    auto prefill_idxs = torch::nonzero(idx_is_prefill).squeeze();
+    auto seq_len_tensor = p->to_tensor(TimeProfiler::kSeqLen);
+    if (seq_len_tensor.numel() == 0) {
+      return;
+    }
+    auto idx_is_prefill = seq_len_tensor > 1;
+    auto idx_is_decode  = seq_len_tensor <= 1;
+    auto prefill_idxs = torch::nonzero(idx_is_prefill).flatten();
     int num_first_prompts_to_skip = 0;
-    if ((prefill_idxs[1].item<int>() == 1) && (prefill_idxs[2].item<int>() == 2)) {
+    if (prefill_idxs.numel() >= 3 &&
+        (prefill_idxs[1].item<int>() == 1) && (prefill_idxs[2].item<int>() == 2)) {
       // we are in llama.cpp, where it includes a system prompt, warm with <bos><eos>, and 3 warm requests
       num_first_prompts_to_skip = 5;
     } else {
@@ -2031,6 +2578,7 @@ void FetchScheduleWorker::do_one_task_impl(PreemptTask *task) {
   TRACE_EVENT_GURAD(kFetchScheduler, "do preempt");
   NVTX_RANGE("sched/preempt_layer L" + std::to_string(task->layer_idx) + " N" + std::to_string(task->num_expert));
   advance_actual_layer(task->forward_epoch, task->layer_idx);
+  log_encoder_jit_layer_entry_diagnostics(task->layer_idx, task->expert_idxs, task->num_expert);
   if (metas->reorder_experts) {
     this->reorder_experts(task->layer_idx, task->expert_idxs, task->num_expert);
   }
@@ -2055,6 +2603,7 @@ void FetchScheduleWorker::do_one_task_impl(ResetTask *task) {
   clear_all_job_queues();
   clear_decoder_warmup_plan_queue();
   clear_encoder_jit_state();
+  clear_encoder_prefetch_metrics();
   reset_pending_reclaimable_updates();
   current_layer = -1;
   current_forward_epoch = task->next_forward_epoch;
@@ -2089,6 +2638,7 @@ void FetchScheduleWorker::init(ModuleMeta *metas, ModelLoader *model_loader,
   prefetch_queues.encoder_predictor_by_layer.resize(metas->num_layer);
   prefetch_queues.decoder_predictor_by_layer.resize(metas->num_layer);
   initialize_encoder_jit_enabled_layer_mask();
+  clear_encoder_prefetch_metrics();
   pending_reclaimable_updates.assign(metas->num_layer, PendingReclaimableUpdate());
   pending_reclaimable_layers.clear();
   pending_reclaimable_layer_mask.assign(metas->num_layer, 0);
@@ -2102,6 +2652,13 @@ void FetchScheduleWorker::do_one_task_impl(FetchDoneTask *_) {
   TRACE_EVENT_GURAD(kFetchScheduler, "one fetch done " + current_task.toString());
   LOG(TRACE) << "scheduler: received one fetch job done " << current_task.toString();
   current_task.expert->num_ready = current_task.stop_mem_buf_idx;
+  if (!current_task.is_precise && is_encoder_prefetch_request(current_task.request_type)) {
+    mark_encoder_prefetch_completed(
+        current_task.expert->layer_idx,
+        current_task.expert->expert_idx,
+        current_task.stop_mem_buf_idx - current_task.start_mem_buf_idx,
+        current_task.stop_mem_buf_idx == metas->num_per_expert_param);
+  }
   if (current_task.stop_mem_buf_idx == metas->num_per_expert_param) {
     LOG(TRACE) << "scheduler: all fetch job done for expert " << current_task.toString();
 
@@ -2273,6 +2830,13 @@ bool FetchScheduleWorker::send_one_job(CopyTask *task) {
                   << " current_layer=" << current_layer
                   << " forward_epoch=" << current_forward_epoch;
       }
+      if (is_encoder_prefetch_request(task->request_type)) {
+        ensure_encoder_prefetch_metrics();
+        if (task->expert->layer_idx >= 0 &&
+            task->expert->layer_idx < static_cast<int>(encoder_prefetch_metrics.size())) {
+          encoder_prefetch_metrics[task->expert->layer_idx].no_victim_blocks += 1;
+        }
+      }
       return false;
     }
     task->expert->expert_status.transfer(kIdle, kFetching);
@@ -2329,6 +2893,12 @@ bool FetchScheduleWorker::send_one_job(CopyTask *task) {
     }
     current_task = *task;
     current_task.lambda_wait = lambda_wait;
+    if (!current_task.is_precise && is_encoder_prefetch_request(current_task.request_type)) {
+      mark_encoder_prefetch_dispatched(
+          current_task.expert->layer_idx,
+          current_task.expert->expert_idx,
+          current_task.stop_mem_buf_idx - current_task.start_mem_buf_idx);
+    }
     fetch_thread->add_one_task(&current_task);
   }
   return true;

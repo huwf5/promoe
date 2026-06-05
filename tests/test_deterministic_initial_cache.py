@@ -156,6 +156,13 @@ def test_resolve_initial_cache_inputs_accepts_hot_encoder_balanced_coverage():
   assert "initial_hot_expert_policy" not in hot
   assert hot["per_layer_cache"] is False
 
+def test_resolve_initial_cache_inputs_accepts_hot_encoder_l0_priority_coverage():
+  hot = _resolve_initial_cache_inputs("hot_encoder_l0_priority_coverage", None, "/tmp/hot.json", None)
+
+  assert hot["initial_cache_policy"] == "manual"
+  assert hot["initial_hot_expert_file"] == "/tmp/hot.json"
+  assert hot["per_layer_cache"] is False
+
 def test_adapter_pybind_does_not_expose_internal_initial_cache_knobs():
   adapter_cpp = Path(__file__).resolve().parents[1] / "src" / "cpp_worker" / "adapter.cpp"
   contents = adapter_cpp.read_text()
@@ -193,6 +200,15 @@ def test_cpp_initial_cache_has_no_order_or_barrier_config_fields():
   assert "initial_expert_order" not in cache_contents
   assert "initial_cache_ready_barrier" not in cache_contents
   assert "expert->expert_status.get() == kReady" in cache_contents
+
+
+def test_performance_script_disables_erpp_jit_when_encoder_prefetch_is_disabled():
+  script = Path(__file__).resolve().parents[1] / "performance" / "run_switch_mmlu_validation.sh"
+  contents = script.read_text()
+
+  assert 'ENABLE_ERPP_ENCODER_JIT_REFILL_EFFECTIVE="${ENABLE_ERPP_ENCODER_JIT_REFILL}"' in contents
+  assert 'ENABLE_ERPP_ENCODER_JIT_REFILL_EFFECTIVE="False"' in contents
+  assert '--enable_erpp_encoder_jit_refill "${ENABLE_ERPP_ENCODER_JIT_REFILL_EFFECTIVE}"' in contents
 
 
 def test_performance_script_uses_current_initial_cache_cli():

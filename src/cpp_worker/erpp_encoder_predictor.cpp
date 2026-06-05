@@ -13,6 +13,7 @@
 
 #include "logging.hpp"
 #include "nvtx_utils.hpp"
+#include "profiler.hpp"
 
 namespace {
 bool log_erpp_encoder_prefetch_enabled() {
@@ -24,6 +25,10 @@ bool log_erpp_encoder_prefetch_enabled() {
   return scheduler_flag != nullptr && scheduler_flag[0] != '\0' && scheduler_flag[0] != '0';
 }
 
+bool log_erpp_encoder_diagnostics_enabled() {
+  const char* flag = std::getenv("SPARSE_CACHE_LOG_ERPP_ENCODER_DIAGNOSTICS");
+  return flag != nullptr && flag[0] != '\0' && flag[0] != '0';
+}
 
 std::string trim_copy(const std::string& value) {
   const auto start = value.find_first_not_of(" \t\n\r");
@@ -221,6 +226,8 @@ void ErppEncoderPredictor::reset_sequence_state() {
   hidden_buffer = torch::Tensor();
   attention_mask_buffer = torch::Tensor();
   input_recorded = false;
+  recorded_forward_epoch = -1;
+  recorded_generate_epoch = -1;
 }
 
 void ErppEncoderPredictor::record_encoder_layer0(
@@ -275,6 +282,8 @@ void ErppEncoderPredictor::record_encoder_layer0(
   }
   CUDA_CALL(cudaEventRecord(record_event, compute_stream));
   input_recorded = true;
+  recorded_forward_epoch = forward_epoch;
+  recorded_generate_epoch = generate_epoch;
 }
 
 ErppEncoderPrediction ErppEncoderPredictor::predict_recorded() {
@@ -284,12 +293,39 @@ ErppEncoderPrediction ErppEncoderPredictor::predict_recorded() {
     }
     return {};
   }
+  uint64_t record_wait_us = 0;
   {
     NVTX_RANGE("erpp/wait_record_event");
+    Timer timer;
     CUDA_CALL(cudaEventSynchronize(record_event));
+    record_wait_us = timer.dur_us();
   }
   input_recorded = false;
+  Timer predict_timer;
   auto predictions = predict_from_cpu_tensors(hidden_buffer, attention_mask_buffer);
+  const uint64_t predict_cpu_us = predict_timer.dur_us();
+  if (log_erpp_encoder_diagnostics_enabled()) {
+    int64_t ranking_experts_total = 0;
+    int64_t budget_experts_total = 0;
+    int enabled_layers = 0;
+    for (size_t layer = 0; layer < predictions.rankings.size(); layer++) {
+      ranking_experts_total += static_cast<int64_t>(predictions.rankings[layer].size());
+      const int budget = layer < predictions.budgets.size() ? predictions.budgets[layer] : 0;
+      budget_experts_total += budget;
+      if (budget > 0 || !predictions.rankings[layer].empty()) {
+        enabled_layers += 1;
+      }
+    }
+    LOG(INFO) << "erpp_encoder_diagnostics: predictor_timing"
+              << " forward_epoch=" << recorded_forward_epoch
+              << " generate_epoch=" << recorded_generate_epoch
+              << " record_wait_us=" << record_wait_us
+              << " predict_cpu_us=" << predict_cpu_us
+              << " layers=" << predictions.rankings.size()
+              << " enabled_layers=" << enabled_layers
+              << " ranking_experts_total=" << ranking_experts_total
+              << " budget_experts_total=" << budget_experts_total;
+  }
   return predictions;
 }
 

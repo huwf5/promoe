@@ -219,6 +219,44 @@ def test_encoder_jit_refill_dispatch_only_requires_reclaimable_or_unused_slot():
     assert "encoder_jit_protected_layers()" not in body
 
 
+def test_encoder_jit_entry_diagnostics_correlate_demand_with_ranking_and_readiness():
+    hpp = _text(PREFETCHER_HPP)
+    cpp = _text(PREFETCHER_CPP)
+
+    assert "void log_encoder_jit_layer_entry_diagnostics" in hpp
+
+    preempt_body = _function_body(cpp, "void FetchScheduleWorker::do_one_task_impl(PreemptTask *task)")
+    advance_pos = preempt_body.index("advance_actual_layer")
+    diag_pos = preempt_body.index("log_encoder_jit_layer_entry_diagnostics")
+    preempt_pos = preempt_body.index("preempt_one_layer_without_reorder_")
+    assert advance_pos < diag_pos < preempt_pos
+
+    body = _function_body(cpp, "void FetchScheduleWorker::log_encoder_jit_layer_entry_diagnostics")
+    for expected in [
+        "erpp_encoder_jit_refill: demand_summary",
+        "predicted_cover=",
+        "ready_cover=",
+        "submitted_not_ready=",
+        "predicted_not_ready=",
+        "outside_ranking=",
+        "ranking_available=",
+        "budget=",
+        "occupancy=",
+        "current=L",
+    ]:
+        assert expected in body
+    for expected in [
+        "rank=",
+        "submitted=",
+        "in_cache=",
+        "ready=",
+        "is_current_copy=",
+        "num_ready=",
+        "status=",
+    ]:
+        assert expected in body
+
+
 def test_encoder_jit_refill_cache_policy_is_reclaimable_only_without_context():
     cpp = _text(CACHE_CPP)
     hpp = _text(CACHE_HPP)

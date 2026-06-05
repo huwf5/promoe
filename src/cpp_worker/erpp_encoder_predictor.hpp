@@ -62,6 +62,8 @@ class ErppEncoderPredictor {
   torch::Tensor attention_mask_buffer;
   cudaEvent_t record_event = nullptr;
   bool input_recorded = false;
+  int64_t recorded_forward_epoch = -1;
+  int64_t recorded_generate_epoch = -1;
   int budget_from_scores(torch::Tensor layer_scores) const;
   ErppEncoderPrediction predict_from_cpu_tensors(torch::Tensor hidden_cpu,
                                                  torch::Tensor attention_mask_cpu);
