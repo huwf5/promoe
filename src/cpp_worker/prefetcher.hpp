@@ -191,8 +191,11 @@ class FetchScheduleWorker : public WorkerThread<FetchScheduleTaskBase*> {
     int floor_value = 0;
     int low_watermark = 0;
     int predicted_missing = 0;
+    int predicted_need = 0;
     int occupancy_gap = 0;
     int distance = 0;
+    double scarcity = 0.0;
+    double demand_weight = 0.0;
     double score = 0.0;
     std::vector<int> required;
   };

@@ -476,17 +476,29 @@ FetchScheduleWorker::build_encoder_jit_refill_candidate(int layer_idx) {
   candidate.distance = layer_idx - current_layer;
 
   const auto& ranking = encoder_jit_rankings[layer_idx];
-  if (candidate.budget > 0) {
-    const int limit = std::min<int>(candidate.budget, ranking.size());
-    for (int rank = 0; rank < limit; rank++) {
+  candidate.predicted_need = candidate.budget > 0
+      ? std::min<int>(candidate.budget, ranking.size())
+      : 0;
+  if (candidate.predicted_need > 0) {
+    for (int rank = 0; rank < candidate.predicted_need; rank++) {
       if (encoder_jit_is_missing(layer_idx, ranking[rank])) {
         candidate.predicted_missing += 1;
       }
     }
+    candidate.scarcity = static_cast<double>(candidate.predicted_missing) /
+        static_cast<double>(candidate.predicted_need);
   }
   candidate.required = build_encoder_jit_required_experts(
       layer_idx, candidate.occupancy, candidate.floor_value,
       candidate.low_watermark, candidate.budget);
+  candidate.demand_weight = 1.0;
+  if (candidate.predicted_need > 0 && candidate.predicted_missing > 0) {
+    const double missing = static_cast<double>(candidate.predicted_missing);
+    const double pressure = 0.0;  // Phase 1A pure scarcity; no cache-rate branch.
+    const double scarcity_power = 1.0 + pressure;
+    candidate.demand_weight = 1.0 + missing *
+        std::pow(candidate.scarcity, scarcity_power);
+  }
   candidate.score = score_encoder_jit_refill_candidate(candidate);
   return candidate;
 }
@@ -498,43 +510,16 @@ double FetchScheduleWorker::score_encoder_jit_refill_candidate(
     return 0.0;
   }
 
-  const int predicted_signal = std::max(1, candidate.predicted_missing);
-  double gap_signal = 1.0 + static_cast<double>(candidate.occupancy_gap);
   if (candidate.occupancy >= candidate.low_watermark &&
       candidate.occupancy_gap == 0) {
-    // Top-k cover can still be useful when the layer is above its floor, but it
-    // should not steal refill bandwidth from layers below watermark.
-    gap_signal = 0.25;
+    // Above-watermark top-k cover can still help, but Phase 1A makes it a
+    // secondary choice instead of rewarding raw empty capacity.
+    return 0.25;
   }
 
-  double wait_penalty = 1.0;
-  if (candidate.layer_idx >= 0 &&
-      candidate.layer_idx < static_cast<int>(encoder_jit_wait_penalty_ema_us.size())) {
-    wait_penalty = encoder_jit_wait_penalty_ema_us[candidate.layer_idx] / 1000.0;
-  }
-  wait_penalty = std::max(0.25, std::min(20.0, wait_penalty));
-
-  double deadline_weight = 1.0;
-  if (candidate.distance == 1) {
-    deadline_weight = 3.0;
-  } else if (candidate.distance == 2) {
-    deadline_weight = 2.0;
-  } else if (candidate.distance == 3) {
-    deadline_weight = 1.4;
-  }
-
-  double slack_weight = 0.7;
-  if (candidate.distance == 1) {
-    slack_weight = 0.8;
-  } else if (candidate.distance == 2) {
-    slack_weight = 1.2;
-  } else if (candidate.distance == 3) {
-    slack_weight = 1.1;
-  }
-
-  return gap_signal * static_cast<double>(predicted_signal) *
-      wait_penalty * deadline_weight * slack_weight;
+  return candidate.demand_weight;
 }
+
 
 void FetchScheduleWorker::log_encoder_jit_layer_entry_diagnostics(
     int layer_idx, const int64_t* expert_idxs, size_t num_expert) {
@@ -827,7 +812,10 @@ void FetchScheduleWorker::maybe_enqueue_encoder_jit_refill() {
                     << " floor=" << candidate.floor_value
                     << " low=" << candidate.low_watermark
                     << " budget=" << candidate.budget
+                    << " predicted_need=" << candidate.predicted_need
                     << " predicted_missing=" << candidate.predicted_missing
+                    << " scarcity=" << candidate.scarcity
+                    << " demand_weight=" << candidate.demand_weight
                     << " occupancy_gap=" << candidate.occupancy_gap
                     << " distance=" << candidate.distance
                     << " required=" << candidate.required.size()
@@ -2102,7 +2090,11 @@ void PrefetchMngr::report_one_layer(int layer_id, int64_t* experts, int64_t num_
     log_encoder_layer_done_stats(previous_layer);
   }
   log_encoder_layer_entry_stats(layer_id, experts, num_expert);
-  if (metas->is_decoder_layer(layer_id)) {
+  const bool should_wait_decoder_prefetch =
+      metas->is_decoder_layer(layer_id) &&
+      metas->num_predict_expert_per_layer > 0 &&
+      metas->predict_input_mode != kNoPredict;
+  if (should_wait_decoder_prefetch) {
     LOG(INFO) << "prefetcher: consume prefetch layer progress at layer " << layer_id;
     int progress_idx = predict_thread->consume_prefetch_layer_progress();
     LOG(INFO) << "prefetcher: consume prefetch layer progress at layer " << layer_id << " done " << progress_idx;

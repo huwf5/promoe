@@ -27,13 +27,25 @@ class SwitchAdapter(ModelAdapter):
     r"|.*(decoder)\.block\.(\d+)\.layer\.2\.mlp$"
   )
 
+  @staticmethod
+  def _resolve_num_selected_experts(cfg) -> int:
+    raw = getattr(cfg, "num_selected_experts", None)
+    if raw is None:
+      # Hugging Face SwitchTransformers routes with argmax in the router implementation,
+      # and older/local configs may omit this non-core metadata field.
+      return 1
+    return int(raw)
+
   def __init__(self, model, model_id: str):
     super().__init__(model, model_id)
     cfg = model.config
     if getattr(cfg, "model_type", None) != "switch_transformers":
       raise ValueError("SwitchAdapter requires model.config.model_type == 'switch_transformers'")
-    if int(getattr(cfg, "num_selected_experts", 0)) != 1:
+    num_selected_experts = self._resolve_num_selected_experts(cfg)
+    if num_selected_experts != 1:
       raise ValueError("SwitchAdapter currently supports Switch top-1 routing only")
+    if getattr(cfg, "num_selected_experts", None) is None:
+      cfg.num_selected_experts = num_selected_experts
 
     self.num_encoder_sparse_layers = int(cfg.num_sparse_encoder_layers)
     self.num_decoder_sparse_layers = int(cfg.num_sparse_decoder_layers)
@@ -42,7 +54,7 @@ class SwitchAdapter(ModelAdapter):
     self.num_encoder_layers = int(cfg.num_layers)
     self.num_decoder_layers = int(cfg.num_decoder_layers)
     self._num_experts = int(cfg.num_experts)
-    self._num_selected_experts = int(cfg.num_selected_experts)
+    self._num_selected_experts = num_selected_experts
 
     self.encoder_sparse_layer_ids = self._expected_sparse_layer_ids(
       self.num_encoder_layers,
