@@ -68,6 +68,42 @@ def source_run_name(model_dir: Path, config: dict[str, Any], label: str) -> str:
     return label
 
 
+def _taxonomy_blte_base(model_dir: Path) -> Path | None:
+    if model_dir.parent.name != "blte":
+        return None
+    return model_dir.parent.parent
+
+
+def _taxonomy_report_base(output_dir: Path) -> Path | None:
+    if output_dir.parent.name != "reports":
+        return None
+    return output_dir.parent.parent
+
+
+def validate_report_output_dir(output_dir: Path, model_dirs: list[Path]) -> None:
+    output_base = _taxonomy_report_base(output_dir)
+    if output_base is None:
+        return
+    for model_dir in model_dirs:
+        model_base = _taxonomy_blte_base(model_dir)
+        if model_base is not None and model_base != output_base:
+            raise ValueError(
+                f"output_dir taxonomy base {output_base} does not match model_dir taxonomy base {model_base}: {model_dir}"
+            )
+
+
+def resolve_report_output_dir(output_dir: Path | None, model_dirs: list[Path]) -> Path:
+    if not model_dirs:
+        raise ValueError("at least one model_dir is required")
+    if output_dir is not None:
+        validate_report_output_dir(output_dir, model_dirs)
+        return output_dir
+    model_base = _taxonomy_blte_base(model_dirs[0])
+    if model_base is not None:
+        return model_base / "reports" / "ble-noisyor-report"
+    return default_ble_report_dir()
+
+
 def write_ble_artifact_if_taxonomy_blte(
     *,
     model_dir: Path,
@@ -90,6 +126,9 @@ def write_ble_artifact_if_taxonomy_blte(
         trace_dir=trace_dir,
         report_dir_path=report_dir_path,
     )
+    manifest["source_objective"] = config.get("objective")
+    manifest["source_loss_type"] = config.get("loss_type", "hard_ce")
+    manifest["probability_transform"] = "sigmoid" if config.get("loss_type") == "multi_label_bce" else "softmax"
     (output_dir / "ble_manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     readme_lines = [
         "# BLE Noisy-Or View",
@@ -98,6 +137,9 @@ def write_ble_artifact_if_taxonomy_blte(
         f"- source_checkpoint: {checkpoint_path.name}",
         "- output_layout: BLE",
         "- aggregation: noisy_or",
+        f"- source_objective: {config.get('objective')}",
+        f"- source_loss_type: {config.get('loss_type', 'hard_ce')}",
+        f"- probability_transform: {manifest['probability_transform']}",
         "- budget_source: sum_ble_score",
         "- budget_rounding: ceil",
         "- selection_rule: topk_by_ble_score",
@@ -112,17 +154,26 @@ def sample_targets_from_expert_selection(
     expert_selection: torch.Tensor,
     attention_mask: torch.Tensor,
     num_experts: int,
+    expert_selection_mask: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if expert_selection.ndim != 4 or expert_selection.shape[-1] < 1:
         raise ValueError("expert_selection must have shape [B,L,T,K>=1]")
     if attention_mask.shape != (expert_selection.shape[0], expert_selection.shape[2]):
         raise ValueError("attention_mask must have shape [B,T]")
+    if expert_selection_mask is not None and expert_selection_mask.shape != expert_selection.shape:
+        raise ValueError("expert_selection_mask must match expert_selection shape [B,L,T,K]")
     batch, layers, tokens, _ = expert_selection.shape
-    selected = expert_selection[..., 0].long()
-    valid = attention_mask.to(device=expert_selection.device).eq(1)
+    selected = expert_selection.long()
+    valid = attention_mask.to(device=expert_selection.device).eq(1)[:, None, :, None]
+    if expert_selection_mask is None:
+        slot_mask = torch.zeros_like(selected, dtype=torch.bool)
+        slot_mask[..., 0] = True
+    else:
+        slot_mask = expert_selection_mask.to(device=expert_selection.device, dtype=torch.bool)
+    slot_mask = slot_mask & valid
     expert_set = torch.zeros(batch, layers, num_experts, dtype=torch.bool, device=expert_selection.device)
     for expert_id in range(num_experts):
-        expert_set[..., expert_id] = ((selected == expert_id) & valid[:, None, :]).any(dim=2)
+        expert_set[..., expert_id] = ((selected == expert_id) & slot_mask).any(dim=(2, 3))
     true_count = expert_set.sum(dim=-1).long()
     return expert_set, true_count
 
@@ -131,13 +182,20 @@ def token_scores_from_logits(
     logits: torch.Tensor,
     attention_mask: torch.Tensor,
     aggregator: str = "noisy_or",
+    score_activation: str = "softmax",
 ) -> torch.Tensor:
     if logits.ndim != 4:
         raise ValueError("logits must have shape [B,L,T,E]")
     if attention_mask.shape != (logits.shape[0], logits.shape[2]):
         raise ValueError("attention_mask must have shape [B,T]")
     valid = attention_mask.to(device=logits.device).eq(1)[:, None, :, None]
-    probs = torch.softmax(logits.float(), dim=-1).masked_fill(~valid, 0.0)
+    if score_activation == "softmax":
+        probs = torch.softmax(logits.float(), dim=-1)
+    elif score_activation == "sigmoid":
+        probs = torch.sigmoid(logits.float())
+    else:
+        raise ValueError(f"unknown score_activation: {score_activation}")
+    probs = probs.masked_fill(~valid, 0.0)
     if aggregator == "noisy_or":
         log_no_hit = torch.log1p(-probs.clamp(max=1.0 - 1e-6)).sum(dim=2)
         return 1.0 - torch.exp(log_no_hit)
@@ -425,11 +483,20 @@ def evaluate_model(
             continue
         x = batch["layer0_attn_out"][:, :valid_len].to(device).float()
         expert_selection = batch["expert_selection"][:, :, :valid_len].to(device)
+        expert_selection_mask = batch.get("expert_selection_mask")
+        if expert_selection_mask is not None:
+            expert_selection_mask = expert_selection_mask[:, :, :valid_len].to(device)
         attention_mask = torch.ones(1, valid_len, dtype=torch.long, device=device)
         logits = model(x)
-        scores = token_scores_from_logits(logits, attention_mask, aggregator=aggregator)
-        noisy_or_scores = token_scores_from_logits(logits, attention_mask, aggregator="noisy_or")
-        true_set, true_count = sample_targets_from_expert_selection(expert_selection, attention_mask, num_experts)
+        score_activation = "sigmoid" if config.get("loss_type") == "multi_label_bce" else "softmax"
+        scores = token_scores_from_logits(logits, attention_mask, aggregator=aggregator, score_activation=score_activation)
+        noisy_or_scores = token_scores_from_logits(logits, attention_mask, aggregator="noisy_or", score_activation=score_activation)
+        true_set, true_count = sample_targets_from_expert_selection(
+            expert_selection,
+            attention_mask,
+            num_experts,
+            expert_selection_mask=expert_selection_mask,
+        )
         score_parts.append(scores.cpu())
         noisy_or_score_parts.append(noisy_or_scores.cpu())
         true_parts.append(true_set.cpu())
@@ -732,7 +799,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--model-dirs", nargs="+", type=Path)
     parser.add_argument("--labels", nargs="+")
     parser.add_argument("--trace-dir", type=Path, help="Override config trace_dir and evaluate all models on the same trace.")
-    parser.add_argument("--output-dir", type=Path, default=default_ble_report_dir())
+    parser.add_argument("--output-dir", type=Path, default=None)
     parser.add_argument("--split", default="validation")
     parser.add_argument("--device", default="auto")
     parser.add_argument("--aggregator", default="noisy_or", choices=("noisy_or", "sum_prob", "max_prob"))
@@ -744,6 +811,7 @@ def main() -> None:
     args = parse_args()
     device = resolve_device(args.device)
     model_dirs = args.model_dirs or [args.model_dir]
+    args.output_dir = resolve_report_output_dir(args.output_dir, model_dirs)
     labels = args.labels or [model_dir.name for model_dir in model_dirs]
     if len(labels) != len(model_dirs):
         raise ValueError("--labels must have the same length as --model-dirs")

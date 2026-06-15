@@ -9,12 +9,22 @@ from transformers.utils import logging
 from transformers.generation.utils import TimeProfiler, recursive_attach
 import torch
 torch.cuda.set_device(0)
-from transformers import AutoModelForCausalLM, AutoTokenizer, SwitchTransformersForConditionalGeneration
+from transformers import (
+  AutoModelForCausalLM,
+  AutoModelForSeq2SeqLM,
+  AutoTokenizer,
+  SwitchTransformersForConditionalGeneration,
+)
 
 import sparse_llm_cache
 import time
 from dataclasses import dataclass, field
 
+from sparse_llm_cache.utils.model_loading import (
+  is_nllb_moe_model_id,
+  is_switch_model_id,
+  resolve_transformers_module_model_path,
+)
 from sparse_llm_cache.utils.runner_util import parse_args
 cache_configs = parse_args()
 gpu_mem_limit_gb = cache_configs.pop('gpu_mem_limit_gb', None)
@@ -58,20 +68,16 @@ load_time_start = time.time()
 logging.disable_progress_bar()
 model_id = cache_configs['model_id']
 
-def is_switch_model_id(value: str) -> bool:
-  return "switch-" in value.lower() or value.lower().endswith("switch-base-128")
-
-def resolve_switch_model_path(value: str) -> str:
-  if not value.startswith("google/"):
-    return value
-  repo_root = Path(__file__).resolve().parents[2]
-  local_path = repo_root / "deps" / "sparse-llm-cache-scripts" / "huggingface-modules" / "modules" / "transformers_modules" / "google" / value.split("/", 1)[1]
-  if local_path.exists():
-    return str(local_path)
-  return value
-
-model_cls = SwitchTransformersForConditionalGeneration if is_switch_model_id(model_id) else AutoModelForCausalLM
-model_load_id = resolve_switch_model_path(model_id) if is_switch_model_id(model_id) else model_id
+if is_switch_model_id(model_id):
+  model_cls = SwitchTransformersForConditionalGeneration
+elif is_nllb_moe_model_id(model_id):
+  model_cls = AutoModelForSeq2SeqLM
+else:
+  model_cls = AutoModelForCausalLM
+model_load_id = resolve_transformers_module_model_path(
+  model_id,
+  repo_root=Path(__file__).resolve().parents[2],
+)
 torch_dtype = 'auto'
 if 'GPTQ' in model_id:
   torch_dtype = None

@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """Export hot experts from experiment prompts.
 
-This script is intentionally independent from project-specific predictor runtimes. It
+By default this script is independent from project-specific predictor runtimes. It
 loads a standard HuggingFace MoE model, hooks router modules, counts the experts
 actually dispatched by the router mask after capacity/drop handling, and writes a
-hot expert snapshot under the experiment trace layout.
+hot expert snapshot under the experiment trace layout. For very large models,
+--load-backend sparse-cache patches Transformers through sparse_llm_cache before
+loading and collects NLLB-MoE encoder/decoder router probabilities from sparse
+MLP hooks while preserving the same hot expert payload schema.
 
 Default input:
     experiment/datasets/<dataset>/<task>/<split>/prompt_list.pt
@@ -67,8 +70,10 @@ Notes:
       --enc-pad-to used as a truncation cap instead of fixed padding.
     - The script hooks modules whose names end with .router and counts nonzero
       entries in the returned dispatch mask, so dropped tokens are not counted.
-    - It does not use project-specific predictor checkpoints, scheduler,
-      prefetch, GPU pool, or predictor runtime managers.
+    - The default HuggingFace backend does not use project-specific predictor
+      checkpoints, scheduler, prefetch, GPU pool, or predictor runtime managers.
+    - The sparse-cache backend uses sparse_llm_cache with no predictor
+      prefetching and keeps the hot expert JSON schema unchanged.
     - Real export loads the model and should be run in the intended GPU
       environment.
 """
@@ -76,6 +81,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import time
 from collections import Counter
 from pathlib import Path
@@ -535,6 +541,86 @@ def load_hf_model(
     return model, tokenizer, config
 
 
+def _default_sparse_cache_rate(config: Any) -> float:
+    if getattr(config, "model_type", None) in {"nllb-moe", "nllb_moe"}:
+        return 0.01
+    return 0.375
+
+
+def _sparse_cache_config(
+    *,
+    model_path: Path,
+    config: Any,
+    cache_rate: Optional[float],
+    cache_policy: str,
+    per_layer_cache: bool,
+) -> Dict[str, Any]:
+    resolved_cache_rate = _default_sparse_cache_rate(config) if cache_rate is None else float(cache_rate)
+    return {
+        "model_id": str(model_path),
+        "cache_rate": resolved_cache_rate,
+        "cache_policy": cache_policy,
+        "per_layer_cache": bool(per_layer_cache),
+        "num_predict_expert_per_layer": 0,
+        "reorder_experts": False,
+        "early_preempt": False,
+        "chunk_prefetch": False,
+        "predict_input_mode": "no_predict",
+    }
+
+
+def load_sparse_cache_model(
+    model_path: Path,
+    device: str,
+    dtype_name: str = "auto",
+    cache_rate: Optional[float] = None,
+    cache_policy: str = "lru",
+    per_layer_cache: bool = False,
+) -> Tuple[Any, Any, Any]:
+    import sparse_llm_cache
+    from transformers import AutoConfig, AutoModelForSeq2SeqLM, AutoTokenizer
+
+    if str(device).startswith("cuda") and torch.cuda.is_available():
+        torch.cuda.set_device(torch.device(device))
+
+    config = AutoConfig.from_pretrained(
+        str(model_path),
+        trust_remote_code=True,
+        local_files_only=True,
+    )
+    torch_dtype = resolve_torch_dtype(dtype_name, config)
+    sparse_config = _sparse_cache_config(
+        model_path=model_path,
+        config=config,
+        cache_rate=cache_rate,
+        cache_policy=cache_policy,
+        per_layer_cache=per_layer_cache,
+    )
+    sparse_llm_cache.utils.hack_transformers(
+        **sparse_config,
+        pin_memory=True,
+        enable_model_timer=False,
+    )
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        str(model_path),
+        trust_remote_code=True,
+        local_files_only=True,
+    )
+    _ensure_tokenizer_padding(tokenizer)
+    model = AutoModelForSeq2SeqLM.from_pretrained(
+        str(model_path),
+        config=config,
+        trust_remote_code=True,
+        torch_dtype=torch_dtype,
+        local_files_only=True,
+        device_map=0,
+    )
+    _ensure_generation_decoder_start(model, tokenizer)
+    model.eval()
+    return model, tokenizer, config
+
+
 def _num_experts(config: Any) -> Optional[int]:
     value = getattr(config, "num_experts", None)
     if value is None:
@@ -570,8 +656,24 @@ def _iter_tensors(value: Any) -> Iterable[torch.Tensor]:
             yield from _iter_tensors(item)
 
 
-def extract_router_mask(output: Any, num_experts: Optional[int] = None) -> Optional[torch.Tensor]:
+def extract_router_mask(
+    output: Any,
+    num_experts: Optional[int] = None,
+    model_type: Optional[str] = None,
+) -> Optional[torch.Tensor]:
     if isinstance(output, torch.Tensor):
+        return None
+
+    if model_type == "nllb-moe" and isinstance(output, (tuple, list)):
+        if len(output) < 2:
+            return None
+        router_probs = output[1]
+        if (
+            isinstance(router_probs, torch.Tensor)
+            and router_probs.dim() >= 2
+            and (num_experts is None or int(router_probs.shape[-1]) == num_experts)
+        ):
+            return router_probs
         return None
 
     for tensor in _iter_tensors(output):
@@ -589,6 +691,7 @@ def install_router_hooks(
     expected_num_experts = _num_experts(config)
     if expected_num_experts is None:
         raise ValueError("Model config must define num_experts for router mask collection")
+    model_type = getattr(config, "model_type", None)
 
     handles: List[Any] = []
 
@@ -599,7 +702,7 @@ def install_router_hooks(
         router_key = _stage_router_key(module_name)
 
         def hook(_module: Any, _inputs: Tuple[Any, ...], output: Any, key: str = router_key) -> None:
-            router_mask = extract_router_mask(output, expected_num_experts)
+            router_mask = extract_router_mask(output, expected_num_experts, model_type=model_type)
             if router_mask is not None:
                 collector.add_router_mask(key, router_mask)
 
@@ -609,6 +712,71 @@ def install_router_hooks(
         raise RuntimeError(
             "No router modules were found. Expected module names ending with '.router'."
         )
+    return handles
+
+
+_NLLB_SPARSE_MLP_PATTERN = re.compile(r"(?:^|\.)(encoder|decoder)\.layers\.(\d+)\.ffn$")
+
+
+def _nllb_sparse_mlp_router_key(module_name: str, module: Any) -> Optional[str]:
+    match = _NLLB_SPARSE_MLP_PATTERN.search(str(module_name))
+    if match is None:
+        return None
+    stage = str(getattr(module, "_stage", match.group(1)))
+    if stage not in {"encoder", "decoder"}:
+        return None
+    if stage != match.group(1):
+        return None
+    block_id = int(match.group(2))
+    return f"{stage}.layers.{block_id}.ffn.router"
+
+
+def extract_nllb_sparse_mlp_router_probs(
+    output: Any,
+    num_experts: Optional[int] = None,
+) -> Optional[torch.Tensor]:
+    if not isinstance(output, (tuple, list)) or len(output) < 2:
+        return None
+    router_tuple = output[1]
+    if not isinstance(router_tuple, (tuple, list)) or not router_tuple:
+        return None
+    router_probs = router_tuple[0]
+    if not isinstance(router_probs, torch.Tensor):
+        return None
+    if router_probs.dim() not in (2, 3):
+        return None
+    if num_experts is not None and int(router_probs.shape[-1]) != int(num_experts):
+        return None
+    return router_probs
+
+
+def install_sparse_cache_nllb_router_hooks(
+    *,
+    model: Any,
+    config: Any,
+    collector: RouterHotExpertCollector,
+) -> List[Any]:
+    if getattr(config, "model_type", None) not in {"nllb-moe", "nllb_moe"}:
+        raise ValueError("sparse-cache NLLB router hooks require model_type='nllb-moe'")
+    expected_num_experts = _num_experts(config)
+    if expected_num_experts is None:
+        raise ValueError("Model config must define num_experts for router mask collection")
+
+    handles: List[Any] = []
+    for module_name, module in model.named_modules():
+        router_key = _nllb_sparse_mlp_router_key(module_name, module)
+        if router_key is None or not hasattr(module, "register_forward_hook"):
+            continue
+
+        def hook(_module: Any, _inputs: Tuple[Any, ...], output: Any, key: str = router_key) -> None:
+            router_probs = extract_nllb_sparse_mlp_router_probs(output, expected_num_experts)
+            if router_probs is not None:
+                collector.add_router_mask(key, router_probs)
+
+        handles.append(module.register_forward_hook(hook))
+
+    if not handles:
+        raise RuntimeError("No NLLB sparse MLP modules were found for sparse-cache router collection.")
     return handles
 
 
@@ -634,9 +802,13 @@ def collect_hot_experts(
     max_new_tokens: int,
     enc_pad_to: int,
     max_samples: int,
+    hook_backend: str = "hf",
 ) -> Tuple[int, Dict[str, List[int]], Dict[str, Dict[str, Any]], Set[str], Set[str], int]:
     collector = RouterHotExpertCollector(router_topk=router_topk)
-    handles = install_router_hooks(model=model, config=config, collector=collector)
+    if hook_backend == "sparse-cache" and getattr(config, "model_type", None) in {"nllb-moe", "nllb_moe"}:
+        handles = install_sparse_cache_nllb_router_hooks(model=model, config=config, collector=collector)
+    else:
+        handles = install_router_hooks(model=model, config=config, collector=collector)
 
     actual_samples = 0
     try:
@@ -652,16 +824,20 @@ def collect_hot_experts(
             )
             encoded = {key: value.to(device) for key, value in encoded.items()}
             with torch.no_grad():
-                try:
-                    model.generate(
-                        **encoded,
-                        output_router_logits=True,
-                        **_generation_kwargs(model, tokenizer, max_new_tokens),
-                    )
-                except ValueError as exc:
-                    if "output_router_logits" not in str(exc):
-                        raise
-                    model.generate(**encoded, **_generation_kwargs(model, tokenizer, max_new_tokens))
+                generation_kwargs = _generation_kwargs(model, tokenizer, max_new_tokens)
+                if hook_backend == "sparse-cache":
+                    model.generate(**encoded, **generation_kwargs)
+                else:
+                    try:
+                        model.generate(
+                            **encoded,
+                            output_router_logits=True,
+                            **generation_kwargs,
+                        )
+                    except ValueError as exc:
+                        if "output_router_logits" not in str(exc):
+                            raise
+                        model.generate(**encoded, **generation_kwargs)
             actual_samples += 1
     finally:
         for handle in handles:
@@ -677,6 +853,15 @@ def collect_hot_experts(
     return actual_samples, frozen, usage_summary, encoder_layers, decoder_layers, num_experts_per_layer
 
 
+def bool_arg(value: str) -> bool:
+    lowered = str(value).strip().lower()
+    if lowered in {"1", "true", "yes", "y"}:
+        return True
+    if lowered in {"0", "false", "no", "n"}:
+        return False
+    raise argparse.ArgumentTypeError(f"expected boolean value, got {value!r}")
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Export hot experts from experiment prompt lists into experiment/traces."
@@ -689,6 +874,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prompt-root", type=Path, default=None, help="Override prompt directory")
     parser.add_argument("--output-path", type=Path, default=None, help="Override JSON output path")
     parser.add_argument("--device", type=str, default="cuda:0", help="Torch device for inputs")
+    parser.add_argument(
+        "--load-backend",
+        type=str,
+        default="hf",
+        choices=["hf", "sparse-cache"],
+        help="Model loading backend: hf keeps the standard HuggingFace path; sparse-cache patches Transformers first",
+    )
     parser.add_argument(
         "--device-map",
         type=str,
@@ -725,6 +917,24 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=None,
         help="Optional folder for HuggingFace disk offload when CPU RAM is insufficient",
+    )
+    parser.add_argument(
+        "--cache-rate",
+        type=float,
+        default=None,
+        help="Sparse-cache cache_rate; defaults to 0.01 for NLLB-MoE and 0.375 otherwise",
+    )
+    parser.add_argument(
+        "--cache-policy",
+        type=str,
+        default="lru",
+        help="Sparse-cache cache policy used with --load-backend sparse-cache",
+    )
+    parser.add_argument(
+        "--per-layer-cache",
+        type=bool_arg,
+        default=False,
+        help="Whether sparse-cache uses per-layer cache partitioning",
     )
     parser.add_argument("--max-new-tokens", type=int, default=32, help="Generation length per prompt")
     parser.add_argument("--enc-pad-to", type=int, default=512, help="Encoder-side truncation cap; dynamic padding follows small-demo")
@@ -775,14 +985,24 @@ def main() -> None:
         max_cpu_memory=args.max_cpu_memory,
         gpu_memory_reserve_mib=int(args.gpu_memory_reserve_mib),
     )
-    model, tokenizer, config = load_hf_model(
-        args.model_path.resolve(),
-        args.device,
-        dtype_name=args.torch_dtype,
-        device_map=device_map,
-        max_memory=max_memory,
-        offload_folder=args.offload_folder,
-    )
+    if args.load_backend == "sparse-cache":
+        model, tokenizer, config = load_sparse_cache_model(
+            args.model_path.resolve(),
+            args.device,
+            dtype_name=args.torch_dtype,
+            cache_rate=args.cache_rate,
+            cache_policy=args.cache_policy,
+            per_layer_cache=args.per_layer_cache,
+        )
+    else:
+        model, tokenizer, config = load_hf_model(
+            args.model_path.resolve(),
+            args.device,
+            dtype_name=args.torch_dtype,
+            device_map=device_map,
+            max_memory=max_memory,
+            offload_folder=args.offload_folder,
+        )
     router_topk = resolve_router_topk(args.router_topk, config)
 
     actual_samples, frozen, usage_summary, encoder_layers, decoder_layers, num_experts_per_layer = collect_hot_experts(
@@ -795,6 +1015,7 @@ def main() -> None:
         max_new_tokens=int(args.max_new_tokens),
         enc_pad_to=int(args.enc_pad_to),
         max_samples=int(args.max_samples),
+        hook_backend=args.load_backend,
     )
 
     payload = build_hot_expert_payload(

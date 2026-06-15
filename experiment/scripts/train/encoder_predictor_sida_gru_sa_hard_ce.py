@@ -43,6 +43,7 @@ from experiment.scripts.train.encoder_predictor_taxonomy import (
 
 MODEL_NAME = "sida-gru-sa"
 OBJECTIVE = "hard-ce"
+LOSS_TYPES = ("auto", "hard_ce", "multi_label_bce")
 OUTPUT_NAME = SIDA_GRU_SA_BLTE_RUN_NAME
 DEFAULT_TRACE_DIR = trace_dir_for_model_task(model_path=DEFAULT_MODEL_PATH, dataset=DEFAULT_DATASET, task_name=DEFAULT_TASK_NAME)
 DEFAULT_OUTPUT_DIR = blte_artifact_dir(OUTPUT_NAME)
@@ -157,6 +158,13 @@ class EncoderPredictorTraceDataset(Dataset[dict[str, torch.Tensor]]):
             "attention_mask": _load_tensor(self.split_dir / "attention_mask.pt"),
             "expert_selection": _load_tensor(self.split_dir / "expert_selection.pt"),
         }
+        optional_files = {
+            "expert_weights": self.split_dir / "expert_weights.pt",
+            "expert_selection_mask": self.split_dir / "expert_selection_mask.pt",
+        }
+        for name, optional_path in optional_files.items():
+            if optional_path.exists():
+                self.tensors[name] = _load_tensor(optional_path)
         self.info = parse_trace_metadata(self.metadata, self.tensors)
         self._validate_shapes()
 
@@ -174,6 +182,18 @@ class EncoderPredictorTraceDataset(Dataset[dict[str, torch.Tensor]]):
             raise ValueError("expert_selection must have K >= 1")
         if bool((expert_selection < 0).any()) or bool((expert_selection >= self.info.num_experts).any()):
             raise ValueError("expert_selection ids must be in [0, num_experts)")
+        expert_weights = self.tensors.get("expert_weights")
+        if expert_weights is not None:
+            if expert_weights.shape != expert_selection.shape:
+                raise ValueError("expert_weights must match expert_selection shape [S,L,T,K]")
+            if not torch.is_floating_point(expert_weights):
+                self.tensors["expert_weights"] = expert_weights.float()
+        expert_selection_mask = self.tensors.get("expert_selection_mask")
+        if expert_selection_mask is not None:
+            if expert_selection_mask.shape != expert_selection.shape:
+                raise ValueError("expert_selection_mask must match expert_selection shape [S,L,T,K]")
+            if expert_selection_mask.dtype != torch.bool:
+                self.tensors["expert_selection_mask"] = expert_selection_mask.bool()
 
     def __len__(self) -> int:
         return int(self.tensors["layer0_attn_out"].shape[0])
@@ -268,6 +288,94 @@ def hard_ce_loss(
     return ce, {"ce": ce, "valid_items": valid_items}
 
 
+def _validate_optional_expert_tensor(
+    name: str,
+    tensor: torch.Tensor | None,
+    expert_selection: torch.Tensor,
+) -> torch.Tensor | None:
+    if tensor is None:
+        return None
+    if tensor.shape != expert_selection.shape:
+        raise ValueError(f"{name} must match expert_selection shape [B,L,T,K]")
+    tensor = tensor.to(device=expert_selection.device)
+    if name == "expert_weights":
+        if not bool(torch.isfinite(tensor).all()):
+            raise ValueError("expert_weights must contain only finite values")
+        if bool((tensor < 0).any()) or bool((tensor > 1).any()):
+            raise ValueError("expert_weights must be in [0, 1]")
+    return tensor
+
+
+def _effective_expert_selection_mask(
+    expert_selection: torch.Tensor,
+    expert_selection_mask: torch.Tensor | None,
+) -> torch.Tensor:
+    if expert_selection_mask is None:
+        mask = torch.zeros_like(expert_selection, dtype=torch.bool)
+        mask[..., 0] = True
+        return mask
+    return expert_selection_mask.to(device=expert_selection.device, dtype=torch.bool)
+
+
+def multi_label_bce_loss(
+    pred_logits: torch.Tensor,
+    expert_selection: torch.Tensor,
+    attention_mask: torch.Tensor,
+    expert_weights: torch.Tensor | None = None,
+    expert_selection_mask: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor | int]]:
+    if expert_selection.shape[:3] != pred_logits.shape[:3] or expert_selection.shape[-1] < 1:
+        raise ValueError("expert_selection must have shape [B,L,T,K>=1] aligned with pred_logits")
+    expert_selection = expert_selection.to(device=pred_logits.device).long()
+    expert_weights = _validate_optional_expert_tensor("expert_weights", expert_weights, expert_selection)
+    expert_selection_mask = _validate_optional_expert_tensor("expert_selection_mask", expert_selection_mask, expert_selection)
+    if expert_selection_mask is None and expert_selection.shape[-1] > 1:
+        if expert_weights is None:
+            raise ValueError("multi_label_bce_loss requires expert_selection_mask or expert_weights for K > 1")
+        expert_selection_mask = expert_weights > 0
+    slot_mask = _effective_expert_selection_mask(expert_selection, expert_selection_mask)
+    valid = valid_token_layer_mask(pred_logits, attention_mask) & slot_mask.any(dim=-1)
+    valid_items = int(valid.sum().item())
+    if valid_items == 0:
+        zero = pred_logits.sum() * 0.0
+        return zero, {"bce": zero, "valid_items": 0}
+
+    target = torch.zeros_like(pred_logits, dtype=pred_logits.dtype)
+    positive_slots = slot_mask.to(dtype=pred_logits.dtype)
+    target.scatter_add_(dim=-1, index=expert_selection, src=positive_slots)
+    target = target.clamp(min=0.0, max=1.0)
+
+    element_weights = torch.ones_like(pred_logits, dtype=pred_logits.dtype)
+    if expert_weights is not None:
+        selected_weights = torch.zeros_like(pred_logits, dtype=pred_logits.dtype)
+        selected_weights.scatter_add_(
+            dim=-1,
+            index=expert_selection,
+            src=expert_weights.to(device=pred_logits.device, dtype=pred_logits.dtype) * positive_slots,
+        )
+        element_weights = torch.where(target > 0, selected_weights.clamp(min=1e-6), element_weights)
+
+    bce_per_expert = F.binary_cross_entropy_with_logits(pred_logits, target, reduction="none")
+    weighted = bce_per_expert[valid] * element_weights[valid]
+    bce = weighted.sum() / element_weights[valid].sum().clamp(min=1e-12)
+    return bce, {"bce": bce, "valid_items": valid_items}
+
+
+def loss_for_type(
+    loss_type: str,
+    pred_logits: torch.Tensor,
+    expert_selection: torch.Tensor,
+    attention_mask: torch.Tensor,
+    expert_weights: torch.Tensor | None = None,
+    expert_selection_mask: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor | int]]:
+    if loss_type == "hard_ce":
+        return hard_ce_loss(pred_logits, expert_selection, attention_mask)
+    if loss_type == "multi_label_bce":
+        return multi_label_bce_loss(pred_logits, expert_selection, attention_mask, expert_weights, expert_selection_mask)
+    raise ValueError(f"unknown loss_type: {loss_type}")
+
+
 def _empty_prefetch_metrics(budgets: tuple[int, ...]) -> dict[str, float | int]:
     metrics: dict[str, float | int] = {"num_valid_token_layer_items": 0}
     for budget in budgets:
@@ -284,49 +392,87 @@ def _empty_prefetch_metrics(budgets: tuple[int, ...]) -> dict[str, float | int]:
     return metrics
 
 
+def _expert_targets_for_metrics(
+    pred_logits: torch.Tensor,
+    expert_selection: torch.Tensor,
+    attention_mask: torch.Tensor,
+    expert_selection_mask: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if expert_selection.shape[:3] != pred_logits.shape[:3] or expert_selection.shape[-1] < 1:
+        raise ValueError("expert_selection must have shape [B,L,T,K>=1] aligned with pred_logits")
+    expert_selection = expert_selection.to(device=pred_logits.device).long()
+    expert_selection_mask = _validate_optional_expert_tensor("expert_selection_mask", expert_selection_mask, expert_selection)
+    slot_mask = _effective_expert_selection_mask(expert_selection, expert_selection_mask)
+    valid = valid_token_layer_mask(pred_logits, attention_mask) & slot_mask.any(dim=-1)
+    if not bool(valid.any()):
+        empty_logits = pred_logits.new_zeros((0, pred_logits.shape[-1]))
+        empty_set = torch.zeros((0, pred_logits.shape[-1]), dtype=torch.bool, device=pred_logits.device)
+        empty_count = torch.zeros((0,), dtype=torch.long, device=pred_logits.device)
+        return empty_logits, empty_set, empty_count
+
+    valid_logits = pred_logits[valid]
+    selected = expert_selection[valid]
+    selected_mask = slot_mask[valid]
+    true_set = torch.zeros(selected.shape[0], pred_logits.shape[-1], dtype=torch.bool, device=pred_logits.device)
+    true_set.scatter_(dim=-1, index=selected, src=selected_mask)
+    true_count = true_set.sum(dim=-1).long()
+    keep = true_count > 0
+    return valid_logits[keep], true_set[keep], true_count[keep]
+
+
 def compute_prefetch_metrics(
     pred_logits: torch.Tensor,
     expert_selection: torch.Tensor,
     attention_mask: torch.Tensor,
     budgets: Iterable[int] = DEFAULT_BUDGETS,
+    expert_selection_mask: torch.Tensor | None = None,
 ) -> dict[str, float | int]:
     budget_values = tuple(int(budget) for budget in budgets)
     if not budget_values or any(budget <= 0 for budget in budget_values):
         raise ValueError("budgets must be positive integers")
-    if expert_selection.shape[:3] != pred_logits.shape[:3] or expert_selection.shape[-1] < 1:
-        raise ValueError("expert_selection must have shape [B,L,T,K>=1] aligned with pred_logits")
 
-    valid = valid_token_layer_mask(pred_logits, attention_mask)
-    num_valid = int(valid.sum().item())
+    valid_logits, true_set, true_count = _expert_targets_for_metrics(
+        pred_logits,
+        expert_selection,
+        attention_mask,
+        expert_selection_mask,
+    )
+    num_valid = int(valid_logits.shape[0])
     if num_valid == 0:
         return _empty_prefetch_metrics(budget_values)
 
-    valid_logits = pred_logits[valid]
-    labels = expert_selection.to(device=pred_logits.device)[..., 0].long()[valid]
     ranked = torch.argsort(valid_logits, dim=-1, descending=True)
-    true_rank_positions = ranked.eq(labels[:, None]).nonzero(as_tuple=False)[:, 1]
-    true_ranks = true_rank_positions + 1
-    true_ranks_float = true_ranks.to(dtype=torch.float32)
-    top1_hits = int(ranked[:, :1].eq(labels[:, None]).any(dim=1).sum().item())
-    top1_recall = top1_hits / num_valid
+    true_by_rank = torch.gather(true_set, dim=-1, index=ranked)
+    rank_numbers = torch.arange(1, ranked.shape[-1] + 1, device=ranked.device, dtype=torch.float32)[None, :]
+    true_rank_positions = true_by_rank.nonzero(as_tuple=False)[:, 1]
+    true_ranks_float = (true_rank_positions + 1).to(dtype=torch.float32)
+    top1_overlap = int(true_by_rank[:, :1].sum().item())
+    total_true = int(true_count.sum().item())
+    top1_recall = top1_overlap / total_true if total_true else 0.0
 
     metrics: dict[str, float | int] = {"num_valid_token_layer_items": num_valid}
     experts = int(pred_logits.shape[-1])
     for budget in budget_values:
         effective_budget = min(budget, experts)
-        hits = ranked[:, :effective_budget].eq(labels[:, None]).any(dim=1)
-        overlap_count = int(hits.sum().item())
-        reciprocal = torch.where(hits, 1.0 / true_ranks_float, torch.zeros_like(true_ranks_float))
-        ndcg = torch.where(hits, 1.0 / torch.log2(true_ranks_float + 1.0), torch.zeros_like(true_ranks_float))
+        hits_ranked = true_by_rank[:, :effective_budget].to(dtype=torch.float32)
+        overlap_per_item = hits_ranked.sum(dim=-1)
+        overlap_count = int(overlap_per_item.sum().item())
+        precision_at_hits = hits_ranked * (hits_ranked.cumsum(dim=-1) / rank_numbers[:, :effective_budget])
+        ap = precision_at_hits.sum(dim=-1) / true_count.to(dtype=torch.float32).clamp(min=1.0)
+        discounts = 1.0 / torch.log2(rank_numbers[:, :effective_budget] + 1.0)
+        dcg = (hits_ranked * discounts).sum(dim=-1)
+        ideal_hits = torch.arange(effective_budget, device=ranked.device)[None, :] < true_count[:, None].clamp(max=effective_budget)
+        idcg = (ideal_hits.to(dtype=torch.float32) * discounts).sum(dim=-1).clamp(min=1e-12)
+        recall = overlap_count / total_true if total_true else 0.0
         metrics[f"overlap_count@{budget}"] = overlap_count
         metrics[f"topK_precision@{budget}"] = overlap_count / (num_valid * effective_budget)
-        metrics[f"topK_recall@{budget}"] = overlap_count / num_valid
-        metrics[f"MAP@{budget}"] = float(reciprocal.mean().item())
-        metrics[f"NDCG@{budget}"] = float(ndcg.mean().item())
+        metrics[f"topK_recall@{budget}"] = recall
+        metrics[f"MAP@{budget}"] = float(ap.mean().item())
+        metrics[f"NDCG@{budget}"] = float((dcg / idcg).mean().item())
         if budget > 1:
-            extra_overlap = overlap_count - top1_hits
+            extra_overlap = overlap_count - top1_overlap
             metrics[f"extra_overlap_gain@{budget}"] = extra_overlap
-            metrics[f"extra_recall_gain@{budget}"] = overlap_count / num_valid - top1_recall
+            metrics[f"extra_recall_gain@{budget}"] = recall - top1_recall
             extra_slots = max(effective_budget - 1, 1) * num_valid
             metrics[f"marginal_precision@{budget}"] = extra_overlap / extra_slots
 
@@ -350,13 +496,26 @@ def resolve_device(name: str) -> torch.device:
     return device
 
 
-def _empty_loss_summary(prefix: str) -> dict[str, float | int]:
-    return {f"{prefix}_loss": 0.0, f"{prefix}_ce": 0.0, f"{prefix}_valid_items": 0}
+def resolve_loss_type(requested_loss_type: str, metadata: dict[str, Any]) -> str:
+    if requested_loss_type not in LOSS_TYPES:
+        raise ValueError(f"unknown loss_type: {requested_loss_type}")
+    if requested_loss_type != "auto":
+        return requested_loss_type
+    model_type = str(_metadata_model_config(metadata).get("model_type", ""))
+    return "multi_label_bce" if model_type == "nllb-moe" else "hard_ce"
+
+
+def objective_from_loss_type(loss_type: str) -> str:
+    if loss_type == "hard_ce":
+        return "hard-ce"
+    if loss_type == "multi_label_bce":
+        return "multi-label-bce"
+    raise ValueError(f"unknown loss_type: {loss_type}")
 
 
 def _valid_sample_tensors(
     batch: dict[str, torch.Tensor], sample_index: int
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+) -> tuple[torch.Tensor, ...] | None:
     attention_mask = batch["attention_mask"][sample_index]
     valid_len = int(attention_mask.eq(1).sum().item())
     if valid_len == 0:
@@ -364,7 +523,31 @@ def _valid_sample_tensors(
     x = batch["layer0_attn_out"][sample_index : sample_index + 1, :valid_len].float()
     expert_selection = batch["expert_selection"][sample_index : sample_index + 1, :, :valid_len]
     valid_mask = torch.ones(1, valid_len, dtype=batch["attention_mask"].dtype, device=batch["attention_mask"].device)
-    return x, expert_selection, valid_mask
+    if "expert_weights" not in batch and "expert_selection_mask" not in batch:
+        return x, expert_selection, valid_mask
+    expert_weights = batch.get("expert_weights")
+    expert_selection_mask = batch.get("expert_selection_mask")
+    if expert_weights is not None:
+        expert_weights = expert_weights[sample_index : sample_index + 1, :, :valid_len]
+    if expert_selection_mask is not None:
+        expert_selection_mask = expert_selection_mask[sample_index : sample_index + 1, :, :valid_len]
+    return x, expert_selection, valid_mask, expert_weights, expert_selection_mask
+
+
+def _unpack_sample_tensors(sample: tuple[torch.Tensor, ...]) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+    if len(sample) == 3:
+        x, expert_selection, valid_mask = sample
+        return x, expert_selection, valid_mask, None, None
+    x, expert_selection, valid_mask, expert_weights, expert_selection_mask = sample
+    return x, expert_selection, valid_mask, expert_weights, expert_selection_mask
+
+
+def _loss_metric_name(loss_type: str) -> str:
+    return "ce" if loss_type == "hard_ce" else "bce"
+
+
+def _empty_loss_summary(prefix: str, loss_type: str = "hard_ce") -> dict[str, float | int]:
+    return {f"{prefix}_loss": 0.0, f"{prefix}_{_loss_metric_name(loss_type)}": 0.0, f"{prefix}_valid_items": 0}
 
 
 def train_one_epoch(
@@ -373,10 +556,12 @@ def train_one_epoch(
     optimizer: torch.optim.Optimizer,
     device: torch.device,
     max_batches: int | None = None,
+    loss_type: str = "hard_ce",
 ) -> dict[str, float | int]:
     model.train()
+    aux_key = _loss_metric_name(loss_type)
     total_loss = 0.0
-    total_ce = 0.0
+    total_aux = 0.0
     total_valid = 0
     for batch_index, batch in enumerate(loader):
         if max_batches is not None and batch_index >= max_batches:
@@ -389,22 +574,22 @@ def train_one_epoch(
             sample = _valid_sample_tensors(batch, sample_index)
             if sample is None:
                 continue
-            x, expert_selection, valid_mask = sample
+            x, expert_selection, valid_mask, expert_weights, expert_selection_mask = _unpack_sample_tensors(sample)
             pred = model(x)
-            loss, parts = hard_ce_loss(pred, expert_selection, valid_mask)
+            loss, parts = loss_for_type(loss_type, pred, expert_selection, valid_mask, expert_weights, expert_selection_mask)
             valid_items = int(parts["valid_items"])
             weighted = loss * valid_items
             weighted_batch_loss = weighted if weighted_batch_loss is None else weighted_batch_loss + weighted
             batch_valid += valid_items
             total_loss += float(loss.detach().cpu().item()) * valid_items
-            total_ce += float(parts["ce"].detach().cpu().item()) * valid_items
+            total_aux += float(parts[aux_key].detach().cpu().item()) * valid_items
             total_valid += valid_items
         if weighted_batch_loss is not None and batch_valid > 0:
             (weighted_batch_loss / batch_valid).backward()
             optimizer.step()
     if total_valid == 0:
-        return _empty_loss_summary("train")
-    return {"train_loss": total_loss / total_valid, "train_ce": total_ce / total_valid, "train_valid_items": total_valid}
+        return _empty_loss_summary("train", loss_type)
+    return {"train_loss": total_loss / total_valid, f"train_{aux_key}": total_aux / total_valid, "train_valid_items": total_valid}
 
 
 def _is_count_metric(name: str) -> bool:
@@ -415,14 +600,18 @@ def _is_rank_stat(name: str) -> bool:
     return name in {"mean_true_rank", "median_true_rank", "p90_true_rank", "p99_true_rank"}
 
 
-def _rank_histogram(pred_logits: torch.Tensor, expert_selection: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
-    valid = valid_token_layer_mask(pred_logits, attention_mask)
-    if not bool(valid.any()):
+def _rank_histogram(
+    pred_logits: torch.Tensor,
+    expert_selection: torch.Tensor,
+    attention_mask: torch.Tensor,
+    expert_selection_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    valid_logits, true_set, _ = _expert_targets_for_metrics(pred_logits, expert_selection, attention_mask, expert_selection_mask)
+    if int(valid_logits.shape[0]) == 0:
         return torch.zeros(pred_logits.shape[-1] + 1, dtype=torch.long)
-    valid_logits = pred_logits[valid]
-    labels = expert_selection.to(device=pred_logits.device)[..., 0].long()[valid]
     ranked = torch.argsort(valid_logits, dim=-1, descending=True)
-    true_rank_positions = ranked.eq(labels[:, None]).nonzero(as_tuple=False)[:, 1]
+    true_by_rank = torch.gather(true_set, dim=-1, index=ranked)
+    true_rank_positions = true_by_rank.nonzero(as_tuple=False)[:, 1]
     return torch.bincount((true_rank_positions + 1).cpu(), minlength=pred_logits.shape[-1] + 1)
 
 
@@ -446,10 +635,12 @@ def evaluate(
     device: torch.device,
     budgets: tuple[int, ...],
     max_batches: int | None = None,
+    loss_type: str = "hard_ce",
 ) -> dict[str, float | int]:
     model.eval()
+    aux_key = _loss_metric_name(loss_type)
     total_loss = 0.0
-    total_ce = 0.0
+    total_aux = 0.0
     total_valid = 0
     metric_totals: dict[str, float] = {}
     rank_hist: torch.Tensor | None = None
@@ -462,12 +653,12 @@ def evaluate(
             sample = _valid_sample_tensors(batch, sample_index)
             if sample is None:
                 continue
-            x, expert_selection, valid_mask = sample
+            x, expert_selection, valid_mask, expert_weights, expert_selection_mask = _unpack_sample_tensors(sample)
             pred = model(x)
-            loss, parts = hard_ce_loss(pred, expert_selection, valid_mask)
+            loss, parts = loss_for_type(loss_type, pred, expert_selection, valid_mask, expert_weights, expert_selection_mask)
             valid_items = int(parts["valid_items"])
             total_loss += float(loss.detach().cpu().item()) * valid_items
-            total_ce += float(parts["ce"].detach().cpu().item()) * valid_items
+            total_aux += float(parts[aux_key].detach().cpu().item()) * valid_items
             total_valid += valid_items
 
             sample_metrics = compute_prefetch_metrics(
@@ -475,6 +666,7 @@ def evaluate(
                 expert_selection.detach().cpu(),
                 valid_mask.detach().cpu(),
                 budgets=budgets,
+                expert_selection_mask=expert_selection_mask.detach().cpu() if expert_selection_mask is not None else None,
             )
             sample_valid = int(sample_metrics["num_valid_token_layer_items"])
             if sample_valid:
@@ -485,7 +677,7 @@ def evaluate(
                         metric_totals[key] = metric_totals.get(key, 0.0) + float(value)
                     else:
                         metric_totals[key] = metric_totals.get(key, 0.0) + float(value) * sample_valid
-            sample_rank_hist = _rank_histogram(pred.detach(), expert_selection, valid_mask)
+            sample_rank_hist = _rank_histogram(pred.detach(), expert_selection, valid_mask, expert_selection_mask)
             if rank_hist is None:
                 rank_hist = sample_rank_hist
             else:
@@ -493,11 +685,11 @@ def evaluate(
                     rank_hist = F.pad(rank_hist, (0, sample_rank_hist.numel() - rank_hist.numel()))
                 rank_hist[: sample_rank_hist.numel()] += sample_rank_hist
 
-    summary = _empty_loss_summary("validation")
+    summary = _empty_loss_summary("validation", loss_type)
     if total_valid:
         summary = {
             "validation_loss": total_loss / total_valid,
-            "validation_ce": total_ce / total_valid,
+            f"validation_{aux_key}": total_aux / total_valid,
             "validation_valid_items": total_valid,
         }
     metrics: dict[str, float | int] = {"num_valid_token_layer_items": total_valid}
@@ -575,6 +767,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--hidden-dim", type=int, default=256)
     parser.add_argument("--recurrent-layers", type=int, default=2)
     parser.add_argument("--budgets", type=_parse_budgets, default=DEFAULT_BUDGETS)
+    parser.add_argument("--loss-type", choices=LOSS_TYPES, default="auto")
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--seed", type=int, default=0)
@@ -620,9 +813,12 @@ def normalized_compare_metadata(info: TraceInfo, metadata: dict[str, Any]) -> di
 
 
 def make_config(args: argparse.Namespace, info: TraceInfo, metadata: dict[str, Any], device: torch.device) -> dict[str, Any]:
+    actual_loss_type = resolve_loss_type(args.loss_type, metadata)
     return {
         "model": MODEL_NAME,
-        "objective": OBJECTIVE,
+        "objective": objective_from_loss_type(actual_loss_type),
+        "loss_type": actual_loss_type,
+        "requested_loss_type": args.loss_type,
         "output_name": output_name_from_args(args),
         "trace_dir": str(args.trace_dir),
         "output_dir": str(args.output_dir),
@@ -663,7 +859,7 @@ def make_run_manifest(args: argparse.Namespace, config: dict[str, Any]) -> dict[
     return blte_manifest(
         run_name=config["output_name"],
         model_arch=MODEL_NAME,
-        objective=OBJECTIVE,
+        objective=objective_from_loss_type(config.get("loss_type", "hard_ce")),
         output_dir=args.output_dir,
         trace_dir=args.trace_dir,
         hidden_dim=args.hidden_dim,
@@ -675,7 +871,7 @@ def make_run_manifest(args: argparse.Namespace, config: dict[str, Any]) -> dict[
         workload_task=context.workload_task,
         base_model=context.base_model,
         trace_id=context.trace_id,
-        extra={"trace_info": config["trace_info"]},
+        extra={"trace_info": config["trace_info"], "loss_type": config.get("loss_type", "hard_ce"), "objective": config.get("objective", objective_from_loss_type(config.get("loss_type", "hard_ce")))},
     )
 
 
@@ -687,6 +883,7 @@ def write_readme(path: Path, config: dict[str, Any], metrics: dict[str, Any]) ->
         "",
         f"- model: {config['model']}",
         f"- objective: {config['objective']}",
+        f"- loss_type: {config.get('loss_type', 'hard_ce')}",
         f"- trace_dir: {config['trace_dir']}",
         f"- epochs_requested: {config['epochs']}",
         f"- epoch_final: {metrics.get('epoch', 0)}",
@@ -712,6 +909,7 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
     info = train_dataset.info
     if validation_dataset.info != info:
         raise ValueError("train and validation trace metadata/shapes disagree")
+    args.loss_type = resolve_loss_type(args.loss_type, train_dataset.metadata)
 
     generator = torch.Generator().manual_seed(args.seed)
     train_loader = DataLoader(
@@ -755,6 +953,7 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
                 optimizer,
                 device,
                 max_batches=args.max_train_batches,
+                loss_type=args.loss_type,
             )
             eval_metrics = evaluate(
                 model,
@@ -762,6 +961,7 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
                 device,
                 budgets=args.budgets,
                 max_batches=args.max_eval_batches,
+                loss_type=args.loss_type,
             )
             validation_loss = float(eval_metrics["validation_loss"])
             validation_losses.append(validation_loss)

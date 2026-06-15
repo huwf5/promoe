@@ -108,9 +108,10 @@ def src_simplenn_blte_run_name(
     batch_size: int = 2,
     seed: int = 0,
     data_mode: str = DATA_MODE_VALIDTRIM,
+    loss_token: str = "hardce",
 ) -> str:
     return (
-        f"src-simplenn-token-hardce-h{hidden_dim}-l{src_layers}-"
+        f"src-simplenn-token-{loss_token}-h{hidden_dim}-l{src_layers}-"
         f"{_dropout_token(dropout)}-{_lr_token(lr)}-bs{batch_size}-seed{seed}-{data_mode}"
     )
 

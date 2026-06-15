@@ -214,9 +214,15 @@ void ErppEncoderPredictor::load_model_from(const std::string& path) {
   CHECK(!path.empty()) << "ERPP encoder predictor path is empty";
   c10::Device cpu_device(c10::DeviceType::CPU);
   model = torch::jit::load(path, cpu_device);
+  const auto& forward_schema = model.get_method("forward").function().getSchema();
+  const auto forward_arg_count = forward_schema.arguments().size();
+  CHECK(forward_arg_count == 2)
+      << "ERPP encoder predictor forward schema must be forward(hidden), got "
+      << forward_schema;
   model.eval();
   loaded = true;
-  LOG(INFO) << "loaded ERPP encoder predictor from " << path;
+  LOG(INFO) << "loaded ERPP encoder hidden-only predictor from " << path
+            << " forward_arg_count=" << forward_arg_count;
 }
 
 void ErppEncoderPredictor::reset_sequence_state() {
@@ -224,7 +230,6 @@ void ErppEncoderPredictor::reset_sequence_state() {
     CUDA_CALL(cudaEventSynchronize(record_event));
   }
   hidden_buffer = torch::Tensor();
-  attention_mask_buffer = torch::Tensor();
   input_recorded = false;
   recorded_forward_epoch = -1;
   recorded_generate_epoch = -1;
@@ -238,16 +243,11 @@ void ErppEncoderPredictor::record_encoder_layer0(
     int64_t generate_epoch) {
   NVTX_RANGE("erpp/record_encoder_layer0 forward_epoch=" + std::to_string(forward_epoch) +
              " generate_epoch=" + std::to_string(generate_epoch));
+  (void)attention_mask;
   CHECK(hidden.defined()) << "ERPP hidden is undefined";
-  CHECK(attention_mask.defined()) << "ERPP attention_mask is undefined";
 
   CHECK(hidden.is_cuda()) << "ERPP hidden must be a CUDA tensor for async recording";
-  CHECK(attention_mask.is_cuda()) << "ERPP attention_mask must be a CUDA tensor for async recording";
-  CHECK(hidden.get_device() == attention_mask.get_device())
-      << "ERPP hidden and attention_mask must be on the same CUDA device";
   CHECK(hidden.is_contiguous()) << "ERPP hidden must be contiguous for async recording";
-  CHECK(attention_mask.is_contiguous())
-      << "ERPP attention_mask must be contiguous for async recording";
 
   auto torch_stream = at::cuda::getStreamFromExternal(compute_stream, hidden.get_device());
   c10::cuda::CUDAStreamGuard stream_guard(torch_stream);
@@ -255,9 +255,6 @@ void ErppEncoderPredictor::record_encoder_layer0(
   hidden_buffer = torch::empty_like(
       hidden,
       hidden.options().device(torch::kCPU).pinned_memory(true));
-  attention_mask_buffer = torch::empty_like(
-      attention_mask,
-      attention_mask.options().device(torch::kCPU).pinned_memory(true));
 
   {
     NVTX_RANGE("erpp/hidden_d2h bytes=" + std::to_string(hidden.nbytes()));
@@ -265,15 +262,6 @@ void ErppEncoderPredictor::record_encoder_layer0(
         hidden_buffer.data_ptr(),
         hidden.data_ptr(),
         hidden.nbytes(),
-        cudaMemcpyDeviceToHost,
-        compute_stream));
-  }
-  {
-    NVTX_RANGE("erpp/attention_mask_d2h bytes=" + std::to_string(attention_mask.nbytes()));
-    CUDA_CALL(cudaMemcpyAsync(
-        attention_mask_buffer.data_ptr(),
-        attention_mask.data_ptr(),
-        attention_mask.nbytes(),
         cudaMemcpyDeviceToHost,
         compute_stream));
   }
@@ -302,7 +290,7 @@ ErppEncoderPrediction ErppEncoderPredictor::predict_recorded() {
   }
   input_recorded = false;
   Timer predict_timer;
-  auto predictions = predict_from_cpu_tensors(hidden_buffer, attention_mask_buffer);
+  auto predictions = predict_from_cpu_tensors(hidden_buffer);
   const uint64_t predict_cpu_us = predict_timer.dur_us();
   if (log_erpp_encoder_diagnostics_enabled()) {
     int64_t ranking_experts_total = 0;
@@ -329,62 +317,26 @@ ErppEncoderPrediction ErppEncoderPredictor::predict_recorded() {
   return predictions;
 }
 
-torch::Tensor ErppEncoderPredictor::normalize_attention_mask(
-    torch::Tensor attention_mask,
-    int64_t batch_size,
-    int64_t seq_len) const {
-  CHECK(attention_mask.defined()) << "ERPP attention_mask is undefined";
-  bool extended_float_mask = attention_mask.dim() > 2 && attention_mask.is_floating_point();
-  auto mask = attention_mask.detach().to(torch::kCPU);
-  while (mask.dim() > 2) {
-    bool squeezed = false;
-    for (int dim = 1; dim < mask.dim() - 1; dim++) {
-      if (mask.size(dim) == 1) {
-        mask = mask.squeeze(dim);
-        squeezed = true;
-        break;
-      }
-    }
-    CHECK(squeezed) << "attention_mask cannot normalize to [B,T]";
-  }
-  CHECK(mask.dim() == 2) << "attention_mask must normalize to [B,T]";
-  CHECK(mask.size(0) == batch_size && mask.size(1) == seq_len)
-      << "attention_mask shape mismatch, got [" << mask.size(0) << "," << mask.size(1)
-      << "] expected [" << batch_size << "," << seq_len << "]";
-
-  if (extended_float_mask) {
-    mask = mask >= 0;
-  } else if (mask.is_floating_point()) {
-    mask = mask != 0;
-  } else {
-    mask = mask.to(torch::kBool);
-  }
-  return mask.to(torch::kLong).contiguous();
-}
-
 ErppEncoderPrediction ErppEncoderPredictor::predict(
     torch::Tensor hidden,
     torch::Tensor attention_mask) {
+  (void)attention_mask;
   CHECK(hidden.defined()) << "ERPP hidden is undefined";
-  CHECK(attention_mask.defined()) << "ERPP attention_mask is undefined";
   auto hidden_cpu = hidden.detach().to(torch::kCPU).contiguous();
-  auto attention_mask_cpu = attention_mask.detach().to(torch::kCPU).contiguous();
-  return predict_from_cpu_tensors(hidden_cpu, attention_mask_cpu);
+  return predict_from_cpu_tensors(hidden_cpu);
 }
 
 ErppEncoderPrediction ErppEncoderPredictor::predict_from_cpu_tensors(
-    torch::Tensor hidden_cpu,
-    torch::Tensor attention_mask_cpu) {
+    torch::Tensor hidden_cpu) {
   CHECK(loaded) << "ERPP encoder predictor model is not loaded";
   CHECK(hidden_cpu.defined()) << "ERPP hidden is undefined";
   CHECK(hidden_cpu.dim() == 3) << "ERPP hidden must be [B,T,H]";
   CHECK(hidden_cpu.size(0) == 1) << "ERPP encoder prefetch supports batch size 1";
 
-  auto mask = normalize_attention_mask(attention_mask_cpu, hidden_cpu.size(0), hidden_cpu.size(1));
   auto hidden_float_cpu = hidden_cpu.detach().to(torch::kCPU).to(torch::kFloat32).contiguous();
 
   torch::NoGradGuard guard;
-  std::vector<torch::jit::IValue> inputs{hidden_float_cpu, mask};
+  std::vector<torch::jit::IValue> inputs{hidden_float_cpu};
   torch::Tensor logits;
   {
     NVTX_RANGE("erpp/predict_forward");

@@ -6,7 +6,8 @@ from pathlib import Path
 from typing import Any, Iterable, NamedTuple
 
 
-_ROUTER_PATTERN = re.compile(r".*(encoder|decoder)\.block\.(\d+)\.")
+_SWITCH_ROUTER_PATTERN = re.compile(r".*(encoder|decoder)\.block\.(\d+)\.")
+_LAYERS_ROUTER_PATTERN = re.compile(r".*(encoder|decoder)\.layers\.(\d+)\.")
 
 
 class EncoderCoverageInitialPlan(NamedTuple):
@@ -16,10 +17,12 @@ class EncoderCoverageInitialPlan(NamedTuple):
 
 
 def _router_stage_block(router_key: str) -> tuple[str, int] | None:
-  match = _ROUTER_PATTERN.match(str(router_key))
-  if not match:
-    return None
-  return match.group(1), int(match.group(2))
+  text = str(router_key)
+  for pattern in (_SWITCH_ROUTER_PATTERN, _LAYERS_ROUTER_PATTERN):
+    match = pattern.match(text)
+    if match:
+      return match.group(1), int(match.group(2))
+  return None
 
 
 def _global_layer_id_or_none(adapter, stage: str, block_id: int) -> int | None:

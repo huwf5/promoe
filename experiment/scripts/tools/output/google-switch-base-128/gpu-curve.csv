@@ -1,0 +1,13 @@
+cache_rate,cache_slots,effective_cache_rate,cache_gib,lower_bound_total_gib,safety_margin_gib,estimated_total_gib,fit_4g,fit_8g,fit_12g,fit_24g,fit_48g,fit_80g
+0.0,0,0.0,0.0,0.685546875,0.0,0.685546875,True,True,True,True,True,True
+0.001,2,0.0013020833333333333,0.03515625,0.720703125,0.0,0.720703125,True,True,True,True,True,True
+0.01,15,0.009765625,0.263671875,0.94921875,0.0,0.94921875,True,True,True,True,True,True
+0.25,384,0.25,6.75,7.435546875,0.0,7.435546875,False,True,True,True,True,True
+0.05,77,0.050130208333333336,1.353515625,2.0390625,0.0,2.0390625,True,True,True,True,True,True
+0.1,154,0.10026041666666667,2.70703125,3.392578125,0.0,3.392578125,True,True,True,True,True,True
+0.125,192,0.125,3.375,4.060546875,0.0,4.060546875,False,True,True,True,True,True
+0.25,384,0.25,6.75,7.435546875,0.0,7.435546875,False,True,True,True,True,True
+0.375,576,0.375,10.125,10.810546875,0.0,10.810546875,False,False,True,True,True,True
+0.5,768,0.5,13.5,14.185546875,0.0,14.185546875,False,False,False,True,True,True
+0.75,1152,0.75,20.25,20.935546875,0.0,20.935546875,False,False,False,True,True,True
+1.0,1536,1.0,27.0,27.685546875,0.0,27.685546875,False,False,False,False,True,True

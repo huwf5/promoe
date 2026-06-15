@@ -341,6 +341,15 @@
 #   --device cuda:0 \
 #   --print-status
 
+  /mnt/huwf5/conda-envs/promoe-moe-cache/bin/python \
+    experiment/scripts/trace/encoder_predictor/export_sparse_cache_encoder_trace.py \
+    --model-path /mnt/huwf5/promoe/experiment/models/facebook/nllb-moe-54b \
+    --dataset mmlu \
+    --task-name professional_law \
+    --device cuda:1 \
+    --cache-rate 0.01 \
+    --print-status
+
 # # 3. train encoder_predictor: switch-base-256, src-simplenn-token-hard-ce-h384-l1
 # CUDA_VISIBLE_DEVICES=0 \
 # /mnt/huwf5/conda-envs/promoe-moe-cache/bin/python \
@@ -358,6 +367,39 @@
 #   --early-stop \
 #   --early-stop-window 8 \
 #   --early-stop-threshold 0.003
+
+cd /mnt/huwf5/promoe
+
+CUDA_VISIBLE_DEVICES=0 \
+PYTHONPATH=/mnt/huwf5/promoe/src:/mnt/huwf5/promoe/deps/transformers/src \
+/mnt/huwf5/conda-envs/promoe-moe-cache/bin/python \
+  experiment/scripts/train/encoder_predictor_src_simplenn_token_hard_ce.py \
+  --trace-dir experiment/traces/nllb-moe-54b-mmlu-professional_law/encoder_predictor_sparse_cache_trace \
+  --loss-type multi_label_bce \
+  --device cuda:0 \
+  --epochs 80 \
+  --batch-size 2 \
+  --lr 1e-4 \
+  --hidden-dim 384 \
+  --src-layers 1 \
+  --dropout 0.5 \
+  --early-stop \
+  --early-stop-window 8 \
+  --early-stop-threshold 0.003
+
+  # PYTHONPATH=/mnt/huwf5/promoe/src:/mnt/huwf5/promoe/deps/transformers/src \
+  # /mnt/huwf5/conda-envs/promoe-moe-cache/bin/python \
+  #   experiment/scripts/train/encoder_predictor_src_simplenn_token_hard_ce.py \
+  #   --trace-dir /mnt/huwf5/promoe/experiment/traces/nllb-moe-54b-mmlu-
+  #   professional_law/encoder_predictor_sparse_cache_trace \
+  #   --loss-type multi_label_bce \
+  #   --no-use-expert-weights-in-loss \
+  #   --device cuda:0
+
+/mnt/huwf5/conda-envs/promoe-moe-cache/bin/python \
+  experiment/scripts/train/evaluate_encoder_predictor_prefetch.py \
+  --model-dir experiment/models/predictors/encoder_expert_prefetch/mmlu-professional_law/nllb-moe-54b/sparse-cache-b1-longest-v1/blte/src-simplenn-token-hardce-h384-l1-drop0p5-lr1e4-bs2-seed0-validtrim \
+  --device cuda:0
 
 # # 3b. export encoder_predictor TorchScript: hidden-only BLTE + BLE
 # # 默认输出:

@@ -72,6 +72,25 @@ printf 'What is the answer?\n' > /tmp/encoder_predictor_trace_validation_prompts
 
 The exporter calls `model.generate(...)` directly. Trace tensors are collected by hooks on encoder modules; the script does not call `_prefetch_mngr.reset_and_load_initial_cache()` or `_sparse_cache_old_generate()`. The sparse cache runtime still performs on-demand expert staging through hooks installed by `sparse_llm_cache.utils.hack_transformers(...)`.
 
+
+## NLLB-MoE 54B Export
+
+NLLB-MoE uses top2 routing. The exporter records post-capacity sparse router probabilities, `expert_selection.pt` with `K=2`, `expert_weights.pt`, and `expert_selection_mask.pt`. Use the sparse cache path and keep `cache_rate=0.01` for this model.
+
+```bash
+PYTHONPATH=/mnt/huwf5/promoe/src:/mnt/huwf5/promoe/deps/transformers/src /mnt/huwf5/conda-envs/promoe-moe-cache/bin/python   experiment/scripts/trace/encoder_predictor/export_sparse_cache_encoder_trace.py   --model-path /mnt/huwf5/promoe/experiment/models/facebook/nllb-moe-54b   --dataset mmlu   --task-name professional_law   --device cuda:0   --batch-size 1   --max-input-tokens 512   --max-new-tokens 1   --cache-rate 0.01   --cache-policy lru   --per-layer-cache False   --print-status
+```
+
+For a one-sample smoke run, pass `--train-prompt-file`, `--validation-prompt-file`, and `--output-dir` exactly as in the Switch smoke test, but keep the NLLB `--model-path` and `--cache-rate 0.01`.
+
+Train SRC-SimpleNN on the NLLB trace with the top2 objective:
+
+```bash
+PYTHONPATH=/mnt/huwf5/promoe/src:/mnt/huwf5/promoe/deps/transformers/src /mnt/huwf5/conda-envs/promoe-moe-cache/bin/python   experiment/scripts/train/encoder_predictor_src_simplenn_token_hard_ce.py   --trace-dir experiment/traces/nllb-moe-54b-mmlu-professional_law/encoder_predictor_sparse_cache_trace   --loss-type multi_label_bce   --device cuda:0
+```
+
+`--loss-type auto` also selects `multi_label_bce` when the trace metadata has `model_type=nllb-moe`; passing the flag explicitly makes the training intent clear. By default, positive BCE terms use `expert_weights`; add `--no-use-expert-weights-in-loss` when you want both routed experts to be equal hard positives.
+
 ## Compare
 
 ```bash

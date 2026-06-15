@@ -59,14 +59,11 @@ class ErppEncoderPredictor {
   std::vector<uint8_t> enabled_layers;
 
   torch::Tensor hidden_buffer;
-  torch::Tensor attention_mask_buffer;
   cudaEvent_t record_event = nullptr;
   bool input_recorded = false;
   int64_t recorded_forward_epoch = -1;
   int64_t recorded_generate_epoch = -1;
   int budget_from_scores(torch::Tensor layer_scores) const;
-  ErppEncoderPrediction predict_from_cpu_tensors(torch::Tensor hidden_cpu,
-                                                 torch::Tensor attention_mask_cpu);
+  ErppEncoderPrediction predict_from_cpu_tensors(torch::Tensor hidden_cpu);
   std::vector<uint8_t> parse_enabled_layers(const std::string& spec) const;
-  torch::Tensor normalize_attention_mask(torch::Tensor attention_mask, int64_t batch_size, int64_t seq_len) const;
 };
