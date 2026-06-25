@@ -165,6 +165,12 @@ std::vector<uint8_t> ErppEncoderPredictor::parse_enabled_layers(const std::strin
     std::fill(enabled.begin(), enabled.end(), 1);
     return enabled;
   }
+  if (normalized == "non_first") {
+    if (enabled.size() > 1) {
+      std::fill(enabled.begin() + 1, enabled.end(), 1);
+    }
+    return enabled;
+  }
 
   CHECK(normalized.find("all") == std::string::npos)
       << "ERPP encoder layers 'all' cannot be mixed with explicit ids: " << spec;

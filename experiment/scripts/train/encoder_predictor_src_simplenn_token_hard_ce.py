@@ -330,6 +330,76 @@ def _effective_expert_selection_mask(
     return expert_selection_mask.to(device=expert_selection.device, dtype=torch.bool)
 
 
+def _float_weight_token(value: float) -> str:
+    text = f"{value:g}"
+    if "e" in text:
+        mantissa, exponent = text.split("e")
+        mantissa = mantissa.replace(".", "p").replace("-", "m")
+        exponent = exponent.replace("+", "").replace("-", "m")
+        return f"{mantissa}e{exponent}"
+    return text.replace(".", "p").replace("-", "m")
+
+
+def _smooth_l1_or_zero(pred_logits: torch.Tensor, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    if pred.numel() == 0:
+        return pred_logits.sum() * 0.0
+    return F.smooth_l1_loss(pred, target.to(device=pred.device, dtype=pred.dtype))
+
+
+def token_cardinality_loss_from_target(
+    pred_logits: torch.Tensor,
+    target: torch.Tensor,
+    valid: torch.Tensor,
+) -> torch.Tensor:
+    probs = torch.sigmoid(pred_logits.float())
+    pred_cardinality = probs.sum(dim=-1)
+    true_cardinality = target.sum(dim=-1)
+    return _smooth_l1_or_zero(pred_logits, pred_cardinality[valid], true_cardinality[valid])
+
+
+def layer_noisy_or_count_loss_from_target(
+    pred_logits: torch.Tensor,
+    target: torch.Tensor,
+    valid: torch.Tensor,
+) -> torch.Tensor:
+    probs = torch.sigmoid(pred_logits.float()).masked_fill(~valid[..., None], 0.0)
+    log_no_hit = torch.log1p(-probs.clamp(max=1.0 - 1e-6)).sum(dim=2)
+    pred_count = (1.0 - torch.exp(log_no_hit)).sum(dim=-1)
+    true_count = (target.to(dtype=torch.bool) & valid[..., None]).any(dim=2).sum(dim=-1)
+    layer_valid = valid.any(dim=-1)
+    return _smooth_l1_or_zero(pred_logits, pred_count[layer_valid], true_count[layer_valid])
+
+
+def soft_gate_auxiliary_loss(
+    pred_logits: torch.Tensor,
+    expert_selection: torch.Tensor,
+    expert_weights: torch.Tensor | None,
+    slot_mask: torch.Tensor,
+    valid: torch.Tensor,
+    aux_type: str = "kl",
+) -> torch.Tensor:
+    if aux_type not in {"kl", "ce"}:
+        raise ValueError(f"unknown soft_gate_aux_type: {aux_type}")
+    if expert_weights is None:
+        raise ValueError("soft gate auxiliary loss requires expert_weights")
+    if expert_selection.shape[-1] < 2:
+        return pred_logits.sum() * 0.0
+    selected_logits = torch.gather(pred_logits, dim=-1, index=expert_selection)
+    selected_logits = selected_logits.masked_fill(~slot_mask, -1.0e9)
+    weights = expert_weights.to(device=pred_logits.device, dtype=pred_logits.dtype) * slot_mask.to(dtype=pred_logits.dtype)
+    weight_sum = weights.sum(dim=-1, keepdim=True)
+    valid_gate = valid & (weight_sum.squeeze(-1) > 0.0)
+    if not bool(valid_gate.any()):
+        return pred_logits.sum() * 0.0
+    true_gate = weights / weight_sum.clamp(min=1e-12)
+    log_pred_gate = F.log_softmax(selected_logits.float(), dim=-1).to(dtype=pred_logits.dtype)
+    token_ce = -(true_gate * log_pred_gate).sum(dim=-1)
+    if aux_type == "ce":
+        return token_ce[valid_gate].mean()
+    token_kl = token_ce + (true_gate * true_gate.clamp(min=1e-12).log()).sum(dim=-1)
+    return token_kl[valid_gate].mean()
+
+
 def multi_label_bce_loss(
     pred_logits: torch.Tensor,
     expert_selection: torch.Tensor,
@@ -337,6 +407,10 @@ def multi_label_bce_loss(
     expert_weights: torch.Tensor | None = None,
     expert_selection_mask: torch.Tensor | None = None,
     use_expert_weights: bool = True,
+    token_cardinality_loss_weight: float = 0.0,
+    layer_count_loss_weight: float = 0.0,
+    soft_gate_aux_weight: float = 0.0,
+    soft_gate_aux_type: str = "kl",
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor | int]]:
     if expert_selection.shape[:3] != pred_logits.shape[:3] or expert_selection.shape[-1] < 1:
         raise ValueError("expert_selection must have shape [B,L,T,K>=1] aligned with pred_logits")
@@ -372,7 +446,28 @@ def multi_label_bce_loss(
     bce_per_expert = F.binary_cross_entropy_with_logits(pred_logits, target, reduction="none")
     weighted = bce_per_expert[valid] * element_weights[valid]
     bce = weighted.sum() / element_weights[valid].sum().clamp(min=1e-12)
-    return bce, {"bce": bce, "valid_items": valid_items}
+    loss = bce
+    parts: dict[str, torch.Tensor | int] = {"bce": bce, "valid_items": valid_items}
+    if token_cardinality_loss_weight > 0.0:
+        token_cardinality = token_cardinality_loss_from_target(pred_logits, target, valid)
+        loss = loss + float(token_cardinality_loss_weight) * token_cardinality
+        parts["token_cardinality"] = token_cardinality
+    if layer_count_loss_weight > 0.0:
+        layer_count = layer_noisy_or_count_loss_from_target(pred_logits, target, valid)
+        loss = loss + float(layer_count_loss_weight) * layer_count
+        parts["layer_count"] = layer_count
+    if soft_gate_aux_weight > 0.0:
+        soft_gate_aux = soft_gate_auxiliary_loss(
+            pred_logits,
+            expert_selection,
+            expert_weights,
+            slot_mask,
+            valid,
+            aux_type=soft_gate_aux_type,
+        )
+        loss = loss + float(soft_gate_aux_weight) * soft_gate_aux
+        parts["soft_gate_aux"] = soft_gate_aux
+    return loss, parts
 
 
 def loss_for_type(
@@ -383,8 +478,16 @@ def loss_for_type(
     expert_weights: torch.Tensor | None = None,
     expert_selection_mask: torch.Tensor | None = None,
     use_expert_weights_in_loss: bool = True,
+    token_cardinality_loss_weight: float = 0.0,
+    layer_count_loss_weight: float = 0.0,
+    soft_gate_aux_weight: float = 0.0,
+    soft_gate_aux_type: str = "kl",
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor | int]]:
+    if token_cardinality_loss_weight < 0.0 or layer_count_loss_weight < 0.0 or soft_gate_aux_weight < 0.0:
+        raise ValueError("auxiliary loss weights must be non-negative")
     if loss_type == "hard_ce":
+        if token_cardinality_loss_weight > 0.0 or layer_count_loss_weight > 0.0 or soft_gate_aux_weight > 0.0:
+            raise ValueError("auxiliary losses require multi_label_bce")
         return hard_ce_loss(pred_logits, expert_selection, attention_mask)
     if loss_type == "multi_label_bce":
         return multi_label_bce_loss(
@@ -394,6 +497,10 @@ def loss_for_type(
             expert_weights,
             expert_selection_mask,
             use_expert_weights=use_expert_weights_in_loss,
+            token_cardinality_loss_weight=token_cardinality_loss_weight,
+            layer_count_loss_weight=layer_count_loss_weight,
+            soft_gate_aux_weight=soft_gate_aux_weight,
+            soft_gate_aux_type=soft_gate_aux_type,
         )
     raise ValueError(f"unknown loss_type: {loss_type}")
 
@@ -580,12 +687,17 @@ def train_one_epoch(
     max_batches: int | None = None,
     loss_type: str = "hard_ce",
     use_expert_weights_in_loss: bool = True,
+    token_cardinality_loss_weight: float = 0.0,
+    layer_count_loss_weight: float = 0.0,
+    soft_gate_aux_weight: float = 0.0,
+    soft_gate_aux_type: str = "kl",
 ) -> dict[str, float | int]:
     model.train()
     aux_key = _loss_metric_name(loss_type)
     total_loss = 0.0
     total_aux = 0.0
     total_valid = 0
+    extra_part_totals: dict[str, float] = {}
     for batch_index, batch in enumerate(loader):
         if max_batches is not None and batch_index >= max_batches:
             break
@@ -607,6 +719,10 @@ def train_one_epoch(
                 expert_weights,
                 expert_selection_mask,
                 use_expert_weights_in_loss=use_expert_weights_in_loss,
+                token_cardinality_loss_weight=token_cardinality_loss_weight,
+                layer_count_loss_weight=layer_count_loss_weight,
+                soft_gate_aux_weight=soft_gate_aux_weight,
+                soft_gate_aux_type=soft_gate_aux_type,
             )
             valid_items = int(parts["valid_items"])
             weighted = loss * valid_items
@@ -614,13 +730,21 @@ def train_one_epoch(
             batch_valid += valid_items
             total_loss += float(loss.detach().cpu().item()) * valid_items
             total_aux += float(parts[aux_key].detach().cpu().item()) * valid_items
+            for part_name, part_value in parts.items():
+                if part_name in {"valid_items", aux_key}:
+                    continue
+                if isinstance(part_value, torch.Tensor):
+                    extra_part_totals[part_name] = extra_part_totals.get(part_name, 0.0) + float(part_value.detach().cpu().item()) * valid_items
             total_valid += valid_items
         if weighted_batch_loss is not None and batch_valid > 0:
             (weighted_batch_loss / batch_valid).backward()
             optimizer.step()
     if total_valid == 0:
         return _empty_loss_summary("train", loss_type)
-    return {"train_loss": total_loss / total_valid, f"train_{aux_key}": total_aux / total_valid, "train_valid_items": total_valid}
+    summary = {"train_loss": total_loss / total_valid, f"train_{aux_key}": total_aux / total_valid, "train_valid_items": total_valid}
+    for part_name, value in extra_part_totals.items():
+        summary[f"train_{part_name}"] = value / total_valid
+    return summary
 
 
 def _is_count_metric(name: str) -> bool:
@@ -668,12 +792,17 @@ def evaluate(
     max_batches: int | None = None,
     loss_type: str = "hard_ce",
     use_expert_weights_in_loss: bool = True,
+    token_cardinality_loss_weight: float = 0.0,
+    layer_count_loss_weight: float = 0.0,
+    soft_gate_aux_weight: float = 0.0,
+    soft_gate_aux_type: str = "kl",
 ) -> dict[str, float | int]:
     model.eval()
     aux_key = _loss_metric_name(loss_type)
     total_loss = 0.0
     total_aux = 0.0
     total_valid = 0
+    extra_part_totals: dict[str, float] = {}
     metric_totals: dict[str, float] = {}
     rank_hist: torch.Tensor | None = None
 
@@ -695,10 +824,19 @@ def evaluate(
                 expert_weights,
                 expert_selection_mask,
                 use_expert_weights_in_loss=use_expert_weights_in_loss,
+                token_cardinality_loss_weight=token_cardinality_loss_weight,
+                layer_count_loss_weight=layer_count_loss_weight,
+                soft_gate_aux_weight=soft_gate_aux_weight,
+                soft_gate_aux_type=soft_gate_aux_type,
             )
             valid_items = int(parts["valid_items"])
             total_loss += float(loss.detach().cpu().item()) * valid_items
             total_aux += float(parts[aux_key].detach().cpu().item()) * valid_items
+            for part_name, part_value in parts.items():
+                if part_name in {"valid_items", aux_key}:
+                    continue
+                if isinstance(part_value, torch.Tensor):
+                    extra_part_totals[part_name] = extra_part_totals.get(part_name, 0.0) + float(part_value.detach().cpu().item()) * valid_items
             total_valid += valid_items
 
             sample_metrics = compute_prefetch_metrics(
@@ -732,6 +870,8 @@ def evaluate(
             f"validation_{aux_key}": total_aux / total_valid,
             "validation_valid_items": total_valid,
         }
+        for part_name, value in extra_part_totals.items():
+            summary[f"validation_{part_name}"] = value / total_valid
     metrics: dict[str, float | int] = {"num_valid_token_layer_items": total_valid}
     for key, value in metric_totals.items():
         metrics[key] = int(value) if _is_count_metric(key) else value / total_valid if total_valid else 0.0
@@ -750,7 +890,17 @@ def _parse_budgets(raw: str) -> tuple[int, ...]:
 def loss_token_from_args(args: argparse.Namespace) -> str:
     loss_type = getattr(args, "loss_type", "hard_ce")
     if loss_type == "multi_label_bce":
-        return "bce-weighted" if args.use_expert_weights_in_loss else "bce-equal-top2"
+        token = "bce-weighted" if args.use_expert_weights_in_loss else "bce-equal-top2"
+        token_cardinality_weight = float(getattr(args, "token_cardinality_loss_weight", 0.0))
+        layer_count_weight = float(getattr(args, "layer_count_loss_weight", 0.0))
+        soft_gate_weight = float(getattr(args, "soft_gate_aux_weight", 0.0))
+        if soft_gate_weight > 0.0:
+            token += f"-softgate{_float_weight_token(soft_gate_weight)}"
+        if token_cardinality_weight > 0.0:
+            token += f"-tokcnt{_float_weight_token(token_cardinality_weight)}"
+        if layer_count_weight > 0.0:
+            token += f"-layercnt{_float_weight_token(layer_count_weight)}"
+        return token
     return "hardce"
 
 
@@ -820,6 +970,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--loss-type", choices=LOSS_TYPES, default="auto")
     parser.add_argument("--use-expert-weights-in-loss", dest="use_expert_weights_in_loss", action="store_true", default=True)
     parser.add_argument("--no-use-expert-weights-in-loss", dest="use_expert_weights_in_loss", action="store_false")
+    parser.add_argument("--token-cardinality-loss-weight", type=float, default=0.0)
+    parser.add_argument("--layer-count-loss-weight", type=float, default=0.0)
+    parser.add_argument("--soft-gate-aux-weight", type=float, default=0.0)
+    parser.add_argument("--soft-gate-aux-type", choices=("kl", "ce"), default="kl")
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--seed", type=int, default=0)
@@ -871,6 +1025,10 @@ def make_config(args: argparse.Namespace, info: TraceInfo, metadata: dict[str, A
         "loss_type": actual_loss_type,
         "requested_loss_type": args.loss_type,
         "use_expert_weights_in_loss": bool(args.use_expert_weights_in_loss),
+        "token_cardinality_loss_weight": float(args.token_cardinality_loss_weight),
+        "layer_count_loss_weight": float(args.layer_count_loss_weight),
+        "soft_gate_aux_weight": float(args.soft_gate_aux_weight),
+        "soft_gate_aux_type": args.soft_gate_aux_type,
         "output_name": output_name_from_args(args),
         "trace_dir": str(args.trace_dir),
         "output_dir": str(args.output_dir),
@@ -929,6 +1087,10 @@ def make_run_manifest(args: argparse.Namespace, config: dict[str, Any]) -> dict[
             "loss_type": config.get("loss_type", "hard_ce"),
             "objective": config.get("objective", objective_from_loss_type(config.get("loss_type", "hard_ce"))),
             "use_expert_weights_in_loss": config.get("use_expert_weights_in_loss", True),
+            "token_cardinality_loss_weight": config.get("token_cardinality_loss_weight", 0.0),
+            "layer_count_loss_weight": config.get("layer_count_loss_weight", 0.0),
+            "soft_gate_aux_weight": config.get("soft_gate_aux_weight", 0.0),
+            "soft_gate_aux_type": config.get("soft_gate_aux_type", "kl"),
         },
     )
 
@@ -943,6 +1105,10 @@ def write_readme(path: Path, config: dict[str, Any], metrics: dict[str, Any]) ->
         f"- objective: {config['objective']}",
         f"- loss_type: {config.get('loss_type', 'hard_ce')}",
         f"- use_expert_weights_in_loss: {config.get('use_expert_weights_in_loss', True)}",
+        f"- token_cardinality_loss_weight: {config.get('token_cardinality_loss_weight', 0.0)}",
+        f"- layer_count_loss_weight: {config.get('layer_count_loss_weight', 0.0)}",
+        f"- soft_gate_aux_weight: {config.get('soft_gate_aux_weight', 0.0)}",
+        f"- soft_gate_aux_type: {config.get('soft_gate_aux_type', 'kl')}",
         f"- trace_dir: {config['trace_dir']}",
         f"- epochs_requested: {config['epochs']}",
         f"- epoch_final: {metrics.get('epoch', 0)}",
@@ -1015,6 +1181,10 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
                 max_batches=args.max_train_batches,
                 loss_type=args.loss_type,
                 use_expert_weights_in_loss=args.use_expert_weights_in_loss,
+                token_cardinality_loss_weight=args.token_cardinality_loss_weight,
+                layer_count_loss_weight=args.layer_count_loss_weight,
+                soft_gate_aux_weight=args.soft_gate_aux_weight,
+                soft_gate_aux_type=args.soft_gate_aux_type,
             )
             eval_metrics = evaluate(
                 model,
@@ -1024,6 +1194,10 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
                 max_batches=args.max_eval_batches,
                 loss_type=args.loss_type,
                 use_expert_weights_in_loss=args.use_expert_weights_in_loss,
+                token_cardinality_loss_weight=args.token_cardinality_loss_weight,
+                layer_count_loss_weight=args.layer_count_loss_weight,
+                soft_gate_aux_weight=args.soft_gate_aux_weight,
+                soft_gate_aux_type=args.soft_gate_aux_type,
             )
             validation_loss = float(eval_metrics["validation_loss"])
             validation_losses.append(validation_loss)

@@ -402,11 +402,11 @@ def build_encoder_balanced_hot_initial_plan(
     total_slots: int,
     allow_sequential_fallback: bool = False,
 ) -> list[tuple[int, int]]:
-  """Build an encoder-only plan with layer-balanced quotas and per-layer hot order.
+  """Build an encoder-first plan with balanced encoder quotas and decoder spillover.
 
   This policy spreads the initial cache budget across encoder layers first, then
-  uses the hot ranking inside each layer. Any slots left after equal quotas are
-  assigned by the next marginal token count across layers.
+  uses the hot ranking inside each layer. If the requested budget exceeds encoder
+  capacity, the remaining slots are split evenly across decoder layers.
   """
   total_slots = max(0, int(total_slots))
   if total_slots <= 0:
@@ -425,12 +425,10 @@ def build_encoder_balanced_hot_initial_plan(
   if num_encoder_layers <= 0:
     raise ValueError("adapter has no encoder sparse layers")
   encoder_capacity = num_encoder_layers * int(adapter.num_expert_per_layer)
-  if total_slots > encoder_capacity:
-    raise ValueError(
-      f"encoder capacity {encoder_capacity} is smaller than initial slots {total_slots}"
-    )
+  encoder_slots = min(total_slots, encoder_capacity)
+  decoder_slots = total_slots - encoder_slots
 
-  base_quota, extra_slots = divmod(total_slots, num_encoder_layers)
+  base_quota, extra_slots = divmod(encoder_slots, num_encoder_layers)
   plan: list[tuple[int, int]] = []
   seen = set()
   selected_per_layer: dict[int, int] = {}
@@ -489,10 +487,25 @@ def build_encoder_balanced_hot_initial_plan(
       if extra_slots <= 0:
         break
 
+  if len(plan) != encoder_slots:
+    raise ValueError(
+      f"balanced hot initial plan has {len(plan)} encoder entries, expected {encoder_slots}; "
+      "reduce cache_rate or pass allow_sequential_fallback=True"
+    )
+
+  if decoder_slots > 0:
+    decoder_by_layer, _decoder_token_totals = _hot_pairs_by_layer(payload, adapter, "decoder")
+    plan.extend(
+      _decoder_even_plan(
+        decoder_by_layer,
+        adapter,
+        total_slots=decoder_slots,
+      )
+    )
+
   if len(plan) != total_slots:
     raise ValueError(
-      f"balanced hot initial plan has {len(plan)} entries, expected {total_slots}; "
-      "reduce cache_rate or pass allow_sequential_fallback=True"
+      f"balanced hot initial plan has {len(plan)} entries, expected {total_slots}"
     )
   return _order_initial_plan_for_encoder_lru(plan, adapter)
 

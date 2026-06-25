@@ -244,6 +244,15 @@ def _resolve_initial_cache_inputs(
     "per_layer_cache": False,
   }
 
+def _resolve_cache_device_index(cache_device):
+  device = torch.device(cache_device)
+  if device.type != "cuda":
+    raise ValueError(f"sparse cache runtime requires a CUDA cache_device, got {cache_device!r}")
+  if device.index is None:
+    return torch.cuda.current_device()
+  return int(device.index)
+
+
 def inject_model(
     model : torch.nn.Module,
     model_id = None,
@@ -524,10 +533,11 @@ def inject_model(
     predictor_model_path, num_predict_expert_per_layer, predictor_type
   )
 
-  model_loader  = cpp_worker.ModelLoader(meta)
+  cache_device_id = _resolve_cache_device_index(cache_device)
+  model_loader  = cpp_worker.ModelLoader(meta, cache_device_id)
   predictor     = cpp_worker.PredictorBase.create(meta)
   prefetch_mngr = cpp_worker.PrefetchMngr(meta, model_loader, predictor)
-  torch.cuda.set_stream(torch.cuda.ExternalStream(prefetch_mngr.compute_stream, 0))
+  torch.cuda.set_stream(torch.cuda.ExternalStream(prefetch_mngr.compute_stream, cache_device_id))
   print("initializing cache lib...done")
 
   add_metadata_to_submodules(model, adapter.add_metadata_to_module)

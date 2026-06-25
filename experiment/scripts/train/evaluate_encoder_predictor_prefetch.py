@@ -92,6 +92,18 @@ def validate_report_output_dir(output_dir: Path, model_dirs: list[Path]) -> None
             )
 
 
+def resolve_checkpoint_path(model_dir: Path, checkpoint_name: str | None) -> Path:
+    if checkpoint_name is not None:
+        checkpoint = Path(checkpoint_name)
+        if checkpoint.name != checkpoint_name or checkpoint.parent != Path("."):
+            raise ValueError("checkpoint_name must be a file name, not a path")
+        return model_dir / checkpoint_name
+    best = model_dir / "best_model.pt"
+    if best.exists():
+        return best
+    return model_dir / "model.pt"
+
+
 def resolve_report_output_dir(output_dir: Path | None, model_dirs: list[Path]) -> Path:
     if not model_dirs:
         raise ValueError("at least one model_dir is required")
@@ -442,6 +454,7 @@ def evaluate_model(
     max_batches: int | None,
     label: str,
     report_dir_path: Path,
+    checkpoint_name: str | None = None,
 ) -> tuple[
     list[dict[str, float | int]],
     list[dict[str, float | int]],
@@ -457,7 +470,7 @@ def evaluate_model(
     dataset = EncoderPredictorTraceDataset(trace_dir, split)
     loader = DataLoader(dataset, batch_size=1, shuffle=False, collate_fn=collate_trace_batch)
     model = build_model_from_config(config, device)
-    checkpoint_path = model_dir / ("best_model.pt" if (model_dir / "best_model.pt").exists() else "model.pt")
+    checkpoint_path = resolve_checkpoint_path(model_dir, checkpoint_name)
     checkpoint = load_checkpoint(checkpoint_path, device)
     model.load_state_dict(checkpoint["model_state_dict"], strict=True)
     model.eval()
@@ -804,6 +817,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--device", default="auto")
     parser.add_argument("--aggregator", default="noisy_or", choices=("noisy_or", "sum_prob", "max_prob"))
     parser.add_argument("--max-batches", type=int, default=None)
+    parser.add_argument("--checkpoint-name", choices=("best_model.pt", "model.pt"), default=None)
     return parser.parse_args(argv)
 
 
@@ -843,6 +857,7 @@ def main() -> None:
             max_batches=args.max_batches,
             label=label,
             report_dir_path=args.output_dir,
+            checkpoint_name=args.checkpoint_name,
         )
         curves_by_model[label] = curves
         layer_curves_by_model[label] = layer_curves
@@ -872,6 +887,7 @@ def main() -> None:
                     "split": args.split,
                     "aggregator": args.aggregator,
                     "max_batches": args.max_batches,
+                    "checkpoint_name": args.checkpoint_name,
                 },
             },
             indent=2,

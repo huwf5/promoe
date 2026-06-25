@@ -29,7 +29,7 @@ class MemMngrCtx {
   size_t granularity = 0;
   CUmemAccessDesc accessDesc = {};
   int device_id = 0;
-  MemMngrCtx();
+  explicit MemMngrCtx(int device_id = 0);
 
   uint8_t * global_unified_mem = nullptr;
   size_t global_unified_mem_size = 0;
@@ -286,7 +286,7 @@ class ModelLoader {
   std::shared_ptr<ModuleMeta> metas;
  public:
   std::shared_ptr<MemMngrCtx> mem_mngr_ctx;
-  ModelLoader(std::shared_ptr<ModuleMeta> metas);
+  ModelLoader(std::shared_ptr<ModuleMeta> metas, int device_id = 0);
   void add_one_expert_param(torch::Tensor param, int layer_id, int expert_id, std::string param_name) {
     return add_one_expert_param(param, layer_id, expert_id, param_name, /*alloc_nbytes*/ 0);
   }

@@ -1,4 +1,5 @@
 import contextlib
+import csv
 import os
 from pathlib import Path
 
@@ -127,6 +128,7 @@ class _ExplicitGenTimingAgg:
   warmup_samples: int = int(os.environ.get("PROMOE_BENCHMARK_WARMUP", "4"))
   samples: list[tuple[float, float, int, int, float | None]] = field(default_factory=list)
   cache_init_samples: list[float] = field(default_factory=list)
+  rows: list[dict[str, object]] = field(default_factory=list)
 
   def add(
       self,
@@ -134,6 +136,11 @@ class _ExplicitGenTimingAgg:
       tpot_excl_first_s: float | None,
       output_token_count: int,
       cache_init_s: float | None = None,
+      input_s: float | None = None,
+      input_token_count: int | None = None,
+      gen_forward_steps: int | None = None,
+      batch_idx: int | None = None,
+      sample_indices: list[int] | None = None,
   ):
     if ttft_s is None:
       return
@@ -144,6 +151,42 @@ class _ExplicitGenTimingAgg:
     self.samples.append((ttft_s, decode_s, output_token_count, decode_token_count, tpot_excl_first_s))
     if cache_init_s is not None:
       self.cache_init_samples.append(cache_init_s)
+    row_idx = len(self.rows)
+    warmup = row_idx < max(self.warmup_samples, 0)
+    e2e_s = ttft_s + decode_s
+    decode_tps = None
+    if tpot_excl_first_s is not None and decode_s > 0.0:
+      decode_tps = decode_token_count / decode_s
+    e2e_tps = None
+    if e2e_s > 0.0:
+      e2e_tps = output_token_count / e2e_s
+    self.rows.append({
+      "run_id": os.environ.get("PROMOE_BENCHMARK_RUN_ID", ""),
+      "baseline": os.environ.get("PROMOE_BENCHMARK_BASELINE", "promoe"),
+      "backend_mode": os.environ.get("PROMOE_BENCHMARK_BACKEND_MODE", os.environ.get("MODE", "default")),
+      "model_id": cache_configs.get("model_id", ""),
+      "gpu_profile": os.environ.get("PROMOE_BENCHMARK_GPU_PROFILE", ""),
+      "gpu_id": os.environ.get("PROMOE_BENCHMARK_GPU_ID", ""),
+      "gpu_mem_gb": os.environ.get("PROMOE_BENCHMARK_GPU_MEM_GB", ""),
+      "cache_rate": cache_configs.get("cache_rate", ""),
+      "dataset": "mmlu",
+      "task": os.environ.get("PROMOE_BENCHMARK_TASK", "professional_law"),
+      "split": cache_configs.get("dataset", ""),
+      "sample_idx": ",".join(str(idx) for idx in (sample_indices or [])),
+      "batch_idx": batch_idx if batch_idx is not None else row_idx,
+      "prompt_tokens": input_token_count if input_token_count is not None else "",
+      "new_tokens": output_token_count,
+      "input_ms": 1000.0 * input_s if input_s is not None else "",
+      "cache_init_ms": 1000.0 * cache_init_s if cache_init_s is not None else "",
+      "ttft_ms": 1000.0 * ttft_s,
+      "tpot_ms": 1000.0 * tpot_excl_first_s if tpot_excl_first_s is not None else "",
+      "e2e_ms": 1000.0 * e2e_s,
+      "decode_tokens_per_second_excl_first": decode_tps if decode_tps is not None else "",
+      "e2e_tokens_per_second": e2e_tps if e2e_tps is not None else "",
+      "gen_forward_steps": gen_forward_steps if gen_forward_steps is not None else "",
+      "warmup": 1 if warmup else 0,
+      "is_valid": 0 if warmup else 1,
+    })
 
   def _benchmark_samples(self):
     skip = min(max(self.warmup_samples, 0), len(self.samples))
@@ -184,6 +227,47 @@ class _ExplicitGenTimingAgg:
       print("benchmark_e2e_tokens_per_second: n/a (zero elapsed time)", flush=True)
     else:
       print(f"benchmark_e2e_tokens_per_second:{sum_generate_tokens / total_generate_s:.6f}", flush=True)
+
+  def write_samples_csv(self):
+    output_dir = os.environ.get("PROMOE_BENCHMARK_OUTPUT_DIR", "").strip()
+    if not output_dir:
+      return
+    path = Path(output_dir)
+    path.mkdir(parents=True, exist_ok=True)
+    samples_path = path / "samples.csv"
+    fieldnames = [
+      "run_id",
+      "baseline",
+      "backend_mode",
+      "model_id",
+      "gpu_profile",
+      "gpu_id",
+      "gpu_mem_gb",
+      "cache_rate",
+      "dataset",
+      "task",
+      "split",
+      "sample_idx",
+      "batch_idx",
+      "prompt_tokens",
+      "new_tokens",
+      "input_ms",
+      "cache_init_ms",
+      "ttft_ms",
+      "tpot_ms",
+      "e2e_ms",
+      "decode_tokens_per_second_excl_first",
+      "e2e_tokens_per_second",
+      "gen_forward_steps",
+      "warmup",
+      "is_valid",
+    ]
+    with samples_path.open("w", newline="") as f:
+      writer = csv.DictWriter(f, fieldnames=fieldnames)
+      writer.writeheader()
+      for row in self.rows:
+        writer.writerow(row)
+    print(f"benchmark_samples_csv:{samples_path}", flush=True)
 
 
 class _ForwardEndCollector:
@@ -263,7 +347,7 @@ _explicit_timing.attach()
 _explicit_agg = _ExplicitGenTimingAgg()
 
 
-def gen_batch(text_list, do_print=False, max_new_tokens=100):
+def gen_batch(text_list, do_print=False, max_new_tokens=100, batch_idx=None, sample_indices=None):
   if torch.cuda.is_available():
     torch.cuda.synchronize()
   input_start = time.perf_counter()
@@ -297,7 +381,17 @@ def gen_batch(text_list, do_print=False, max_new_tokens=100):
     generated_tokens = outputs[:, input_len:]
   output_len = generated_tokens.shape[1]
   ttft_s, tpot_excl_s = _explicit_timing.compute(output_len)
-  _explicit_agg.add(ttft_s, tpot_excl_s, output_len, cache_init_s)
+  _explicit_agg.add(
+    ttft_s,
+    tpot_excl_s,
+    output_len,
+    cache_init_s,
+    input_s=input_s,
+    input_token_count=input_len,
+    gen_forward_steps=len(_explicit_timing._ends),
+    batch_idx=batch_idx,
+    sample_indices=sample_indices,
+  )
   if do_print:
     n_steps = len(_explicit_timing._ends)
     cache_init_ms = 1000.0 * cache_init_s if cache_init_s is not None else float("nan")
@@ -379,11 +473,18 @@ with _nvtx_range("promoe/eval_all_batches"):
     original_seq_ids = original_prompt_indices[batch_start:batch_stop]
     print(f'Seq {seq_id}/{cache_configs["max_num_batch"]}, original_seq_ids={original_seq_ids}, decoding...', flush=True)
     with _nvtx_benchmark_batch(seq_id, _explicit_agg.warmup_samples):
-      input_len, output_len = gen_batch(text_list, max_new_tokens=cache_configs['max_new_tokens'], do_print=True)
+      input_len, output_len = gen_batch(
+        text_list,
+        max_new_tokens=cache_configs['max_new_tokens'],
+        do_print=True,
+        batch_idx=seq_id,
+        sample_indices=original_seq_ids,
+      )
 eval_time = time.time() - eval_time_start
 
 maybe_log_time_profiler(time_profiler)
 _explicit_agg.report()
+_explicit_agg.write_samples_csv()
 sparse_llm_cache.cpp_worker.log_gpu_mem_info()
 print("load_model_time:", load_model_time)
 print("eval_time:", eval_time)

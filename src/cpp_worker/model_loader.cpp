@@ -18,9 +18,9 @@ void ExpertParamWrapperBase::release_tensor_references() {
   model_parameter_reference.clear();
 }
 
-ModelLoader::ModelLoader(std::shared_ptr<ModuleMeta> metas) : metas(metas) {
+ModelLoader::ModelLoader(std::shared_ptr<ModuleMeta> metas, int device_id) : metas(metas) {
   source_list.resize(metas->num_layer * metas->num_expert, nullptr);
-  mem_mngr_ctx = std::make_shared<MemMngrCtx>();
+  mem_mngr_ctx = std::make_shared<MemMngrCtx>(device_id);
   for (int layer_id = 0; layer_id < metas->num_layer; layer_id++) {
     for (int expert_id = 0; expert_id < metas->num_expert; expert_id++) {
       auto &expert_handler = source_list[metas->squeeze_expert_idx(layer_id, expert_id)];
@@ -93,11 +93,12 @@ void ModelLoader::release_logical_expert_param_refs() {
   }
 }
 
-MemMngrCtx::MemMngrCtx() {
-  CUDA_CALL(cudaSetDevice(0));
+MemMngrCtx::MemMngrCtx(int device_id) {
+  this->device_id = device_id;
+  CUDA_CALL(cudaSetDevice(device_id));
   prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
   prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
-  prop.location.id = 0;
+  prop.location.id = device_id;
   prop.requestedHandleTypes = CU_MEM_HANDLE_TYPE_NONE;
 
   CU_CALL(cuMemGetAllocationGranularity(&granularity, &prop, CU_MEM_ALLOC_GRANULARITY_MINIMUM));
@@ -107,7 +108,7 @@ MemMngrCtx::MemMngrCtx() {
   LOG(ERROR) << "Recommended granularity: " << granularity;
 
   accessDesc.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
-  accessDesc.location.id = 0;
+  accessDesc.location.id = device_id;
   accessDesc.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
 }
 

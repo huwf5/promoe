@@ -12,6 +12,7 @@ import torch
 import torch.nn as nn
 import os
 import glob
+import json
 from pathlib import Path
 
 
@@ -45,7 +46,8 @@ class Trace:
     
     After unpack_from_dir() + prepare_tensors(), accessible fields:
     - expert_selection: [N_entry, N_layer, K] int64, expert indices per token/layer
-    - decode_stage_moe_layer_logits_per_token: [N_decode_token, N_layer, N_expert] float32
+    - decode_stage_moe_layer_logits_per_token: [N_decode_token, N_layer+1, H] float32
+      hidden features used as predictor input (aligned with cpp kMoeLayerLogits)
     - decode_stage_moe_layer_gate_logits_per_token: [N_decode_token, N_layer, N_expert] float32
     - decode_stage_expert_freq_per_token: [N_decode_token, N_layer, N_expert] float32
     - decode_stage_token_ids_per_token: [N_decode_token] int64
@@ -80,6 +82,16 @@ class Trace:
         self.num_expert = None
         self.num_moe_layer = None
         self.per_token_expert = None
+        self.trace_metas = {}
+        self.schema_version = 1
+        self.id_space = "local"
+        self.num_layer = None
+        self.num_encoder_moe_layer = 0
+        self.num_decoder_moe_layer = None
+        self.predict_stage = "decoder"
+        self.predictor_target_start = 0
+        self.predictor_target_stop = None
+        self.predictor_source_ids = None
     
     def unpack_from_dir(self, trace_dir: str):
         """
@@ -97,6 +109,10 @@ class Trace:
         - prefill_expert_len.pt (per-layer expert count in prefill for each sequence)
         """
         trace_dir = Path(trace_dir)
+
+        trace_metas_path = trace_dir / "trace_metas.json"
+        if trace_metas_path.exists():
+            self.trace_metas = json.loads(trace_metas_path.read_text())
         
         # Load decode stage tensors
         self.expert_selection = self._load_pt(trace_dir / "expert_selection.pt")
@@ -142,10 +158,17 @@ class Trace:
         if self.expert_selection is None:
             raise RuntimeError("expert_selection not loaded; call unpack_from_dir first")
         
-        # Infer metadata from shape
-        self.num_expert = int(torch.max(self.expert_selection)) + 1
+        # Infer metadata from dense tensors when available. expert_selection may not
+        # cover every expert in small or biased traces, but gate/freq last dim is V.
+        if self.decode_stage_moe_layer_gate_logits_per_token is not None:
+            self.num_expert = self.decode_stage_moe_layer_gate_logits_per_token.shape[-1]
+        elif self.decode_stage_expert_freq_per_token is not None:
+            self.num_expert = self.decode_stage_expert_freq_per_token.shape[-1]
+        else:
+            self.num_expert = int(torch.max(self.expert_selection)) + 1
         self.num_moe_layer = self.expert_selection.shape[1]
         self.per_token_expert = self.expert_selection.shape[2]
+        self._prepare_trace_metadata()
         
         # Compute token_idx_in_seq_flip: inverse position in sequence during decode
         # This is used for --token_distance filtering (favor tokens later in sequence)
@@ -162,6 +185,50 @@ class Trace:
             
             # Compute flip: max_idx - current_idx
             self.decode_stage_token_idx_in_seq_flip = max_idx_per_seq[inverse_indices] - token_idx
+
+    def _prepare_trace_metadata(self):
+        self.schema_version = int(self.trace_metas.get("schema_version", 1))
+        self.id_space = self.trace_metas.get("id_space", "local")
+        self.predict_stage = self.trace_metas.get("predict_stage", "decoder")
+
+        if self.id_space == "global" and self.predict_stage == "decoder":
+            self.num_layer = int(self.trace_metas["num_layer"])
+            self.num_encoder_moe_layer = int(self.trace_metas["num_encoder_moe_layer"])
+            self.num_decoder_moe_layer = int(self.trace_metas["num_decoder_moe_layer"])
+            decoder_start = int(self.trace_metas["decoder_global_layer_start"])
+            decoder_stop = int(self.trace_metas["decoder_global_layer_stop"])
+
+            if self.schema_version != 2:
+                raise ValueError(f"global decoder trace requires schema_version=2, got {self.schema_version}")
+            if self.num_layer != self.num_moe_layer:
+                raise ValueError(
+                    f"global dense trace num_layer={self.num_layer} does not match "
+                    f"expert_selection layer count={self.num_moe_layer}"
+                )
+            if self.num_encoder_moe_layer + self.num_decoder_moe_layer != self.num_layer:
+                raise ValueError(
+                    "global decoder trace metadata mismatch: "
+                    f"E={self.num_encoder_moe_layer}, D={self.num_decoder_moe_layer}, L={self.num_layer}"
+                )
+            if decoder_start != self.num_encoder_moe_layer or decoder_stop != self.num_layer:
+                raise ValueError(
+                    "decoder global range must match encoder boundary and total layer count: "
+                    f"start={decoder_start}, stop={decoder_stop}, E={self.num_encoder_moe_layer}, L={self.num_layer}"
+                )
+
+            self.predictor_target_start = self.num_encoder_moe_layer
+            self.predictor_target_stop = self.num_layer
+            self.predictor_source_ids = list(range(self.num_encoder_moe_layer, self.num_layer + 1))
+            return
+
+        self.num_layer = self.num_moe_layer
+        self.num_encoder_moe_layer = int(self.trace_metas.get("num_encoder_moe_layer", 0))
+        self.num_decoder_moe_layer = self.trace_metas.get("num_decoder_moe_layer", self.num_moe_layer)
+        if self.num_decoder_moe_layer is not None:
+            self.num_decoder_moe_layer = int(self.num_decoder_moe_layer)
+        self.predictor_target_start = 0
+        self.predictor_target_stop = self.num_moe_layer
+        self.predictor_source_ids = list(range(self.num_moe_layer + 1))
     
     @staticmethod
     def _load_pt(path, required=True):

@@ -1093,8 +1093,12 @@ void FetchScheduleWorker::preempt_one_expert(int layer_idx, int64_t expert_idx) 
       cache_hit(e, true);
     } else if (launch_status == kLaunching) {
       LOG(TRACE) << "scheduler: skip redundant launch for " << e->toString();
+    } else if (launch_status == kUsing) {
+      LOG(TRACE) << "scheduler: wait active expert before demand launch " << e->toString();
+      e->expert_status.wait(kReady, kLaunching);
+      cache_hit(e, true);
     } else {
-      CHECK(launch_status == kReady || launch_status == kLaunching)
+      CHECK(launch_status == kReady || launch_status == kLaunching || launch_status == kUsing)
           << "launch ready expert " << e->toString()
           << " but current status is " << launch_status;
     }
@@ -1156,8 +1160,12 @@ void FetchScheduleWorker::preempt_one_layer_without_reorder_(int layer_idx, int6
         cache_hit(e, true);
       } else if (launch_status == kLaunching) {
         LOG(TRACE) << "scheduler: skip redundant launch for " << e->toString();
+      } else if (launch_status == kUsing) {
+        LOG(TRACE) << "scheduler: wait active expert before demand launch " << e->toString();
+        e->expert_status.wait(kReady, kLaunching);
+        cache_hit(e, true);
       } else {
-        CHECK(launch_status == kReady || launch_status == kLaunching)
+        CHECK(launch_status == kReady || launch_status == kLaunching || launch_status == kUsing)
             << "launch ready expert " << e->toString()
             << " but current status is " << launch_status;
       }
