@@ -28,14 +28,20 @@ BLE_MANIFEST_NAME = "ble_manifest.json"
 class HiddenOnlyNoisyOrWrapper(nn.Module):
     """Convert token-level BLTE logits to hidden-only BLE noisy-or scores."""
 
-    def __init__(self, token_model: nn.Module, eps: float = 1e-6) -> None:
+    def __init__(self, token_model: nn.Module, score_activation: str = "softmax", eps: float = 1e-6) -> None:
         super().__init__()
+        if score_activation not in {"softmax", "sigmoid"}:
+            raise ValueError(f"unknown score_activation: {score_activation}")
         self.token_model = token_model
+        self.score_activation = score_activation
         self.eps = float(eps)
 
     def forward(self, hidden: torch.Tensor) -> torch.Tensor:
         token_logits = self.token_model(hidden)
-        probs = torch.softmax(token_logits.float(), dim=-1)
+        if self.score_activation == "sigmoid":
+            probs = torch.sigmoid(token_logits.float())
+        else:
+            probs = torch.softmax(token_logits.float(), dim=-1)
         log_no_hit = torch.log1p(-probs.clamp(max=1.0 - self.eps)).sum(dim=2)
         return 1.0 - torch.exp(log_no_hit)
 
@@ -153,6 +159,10 @@ def load_trained_model(blte_dir: Path, checkpoint_name: str, config: dict[str, A
     return model, checkpoint_path
 
 
+def score_activation_from_config(config: dict[str, Any]) -> str:
+    return "sigmoid" if config.get("loss_type") == "multi_label_bce" else "softmax"
+
+
 def _shape_values(config: dict[str, Any]) -> tuple[int, int, int, int]:
     metadata = _metadata(config)
     hidden_size = int(metadata["hidden_size"])
@@ -211,8 +221,9 @@ def export_ble_torchscript(
     check_hidden: torch.Tensor,
     num_layers: int,
     num_experts: int,
+    score_activation: str,
 ) -> None:
-    wrapper = HiddenOnlyNoisyOrWrapper(model)
+    wrapper = HiddenOnlyNoisyOrWrapper(model, score_activation=score_activation)
     wrapper.eval()
     with torch.no_grad():
         eager_check = wrapper(check_hidden)
@@ -248,7 +259,7 @@ def _base_manifest(
     src_compatible: bool,
 ) -> dict[str, Any]:
     hidden_size, num_layers, num_experts, max_input_tokens = _shape_values(config)
-    return {
+    manifest = {
         "aggregation": aggregation,
         "artifact_level": artifact_level,
         "base_model": config.get("base_model"),
@@ -269,6 +280,9 @@ def _base_manifest(
         "trace_id": config.get("trace_id"),
         "workload_task": config.get("workload_task"),
     }
+    if artifact_level == "ble":
+        manifest["probability_transform"] = score_activation_from_config(config)
+    return manifest
 
 
 def _minimal_ble_manifest(ble_dir: Path, blte_dir: Path, checkpoint_path: Path, config: dict[str, Any]) -> dict[str, Any]:
@@ -284,7 +298,7 @@ def _minimal_ble_manifest(ble_dir: Path, blte_dir: Path, checkpoint_path: Path, 
         "budget_source": "sum_ble_score",
         "output_layout": "BLE",
         "predictor_task": "encoder_expert_prefetch",
-        "probability_transform": "softmax",
+        "probability_transform": score_activation_from_config(config),
         "selection_rule": "topk_by_ble_score",
         "source_blte_artifact": str(blte_dir),
         "source_blte_run_name": blte_dir.name,
@@ -298,7 +312,13 @@ def _minimal_ble_manifest(ble_dir: Path, blte_dir: Path, checkpoint_path: Path, 
 
 def ensure_ble_manifest(ble_dir: Path, blte_dir: Path, checkpoint_path: Path, config: dict[str, Any]) -> None:
     manifest_path = ble_dir / BLE_MANIFEST_NAME
+    expected_transform = score_activation_from_config(config)
     if manifest_path.exists():
+        manifest = read_json(manifest_path)
+        if manifest.get("probability_transform") == expected_transform:
+            return
+        manifest["probability_transform"] = expected_transform
+        write_json(manifest_path, manifest)
         return
     write_json(manifest_path, _minimal_ble_manifest(ble_dir, blte_dir, checkpoint_path, config))
 
@@ -384,7 +404,15 @@ def export_torchscript_artifacts(
     if export_ble:
         ble_dir.mkdir(parents=True, exist_ok=True)
         ensure_ble_manifest(ble_dir, blte_dir, checkpoint_path, config)
-        export_ble_torchscript(model, ble_ts, example_hidden, check_hidden, num_layers, num_experts)
+        export_ble_torchscript(
+            model,
+            ble_ts,
+            example_hidden,
+            check_hidden,
+            num_layers,
+            num_experts,
+            score_activation_from_config(config),
+        )
         manifest = _base_manifest(
             artifact_level="ble",
             torchscript_path=ble_ts,

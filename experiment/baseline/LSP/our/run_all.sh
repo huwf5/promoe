@@ -4,8 +4,8 @@
 #
 # Example:
 #   GPU_ID=0 \
-#   GPU_CONFIGS="gpu4gb gpu8gb gpu12gb gpu24gb" \
-#   MODELS="switch-base-128 switch-base-256 switch-large-128" \
+#   GPU_CONFIGS="gpu4gb gpu8gb gpu12gb gpu16gb gpu24gb gpu40gb gpu48gb" \
+#   MODELS="switch-base-128 switch-base-256 switch-large-128 nllb" \
 #   experiment/baseline/LSP/our/run_all.sh
 #
 # Smoke test:
@@ -46,18 +46,25 @@ MODEL_REVISION="${MODEL_REVISION:-main}"
 
 ERPP_ENCODER_BUDGETS="${ERPP_ENCODER_BUDGETS:-dynamic_noisy_or_sum}"
 #TODO: not first layer
-ERPP_ENCODER_LAYERS="${ERPP_ENCODER_LAYERS:-2,3,4,5}"
+ERPP_ENCODER_LAYERS="${ERPP_ENCODER_LAYERS:-non_first}"
 ENABLE_ERPP_ENCODER_JIT_REFILL="${ENABLE_ERPP_ENCODER_JIT_REFILL:-True}"
+# TODO
 ERPP_ENCODER_JIT_REFILL_WINDOW="${ERPP_ENCODER_JIT_REFILL_WINDOW:-5}"
 ERPP_ENCODER_JIT_REFILL_FLOOR_MODE="${ERPP_ENCODER_JIT_REFILL_FLOOR_MODE:-budget}"
 ERPP_ENCODER_JIT_REFILL_FLOOR_VALUE="${ERPP_ENCODER_JIT_REFILL_FLOOR_VALUE:--1}"
 ERPP_ENCODER_JIT_REFILL_LOW_WATERMARK_RATIO="${ERPP_ENCODER_JIT_REFILL_LOW_WATERMARK_RATIO:-0.90}"
 ERPP_ENCODER_JIT_REFILL_LAYERS="${ERPP_ENCODER_JIT_REFILL_LAYERS:-auto}"
 ERPP_ENCODER_JIT_REFILL_PER_IDLE="${ERPP_ENCODER_JIT_REFILL_PER_IDLE:-2}"
-ENABLE_ERPP_ENCODER_JIT_TOPK_COVER="${ENABLE_ERPP_ENCODER_JIT_TOPK_COVER:-True}"
+ENABLE_ERPP_ENCODER_JIT_TOPK_COVER="${ENABLE_ERPP_ENCODER_JIT_TOPK_COVER:-False}"
+# ENABLE_ERPP_ENCODER_JIT_TOPK_COVER="${ENABLE_ERPP_ENCODER_JIT_TOPK_COVER:-True}"
 
-GPU_CONFIGS="${GPU_CONFIGS:-default}"
-MODELS="${MODELS:-switch-base-128}"
+GPU_CONFIGS="${GPU_CONFIGS:-gpu4gb }"
+# GPU_CONFIGS="${GPU_CONFIGS:-gpu4gb gpu8gb gpu12gb gpu16gb gpu24gb }"
+# GPU_CONFIGS="${GPU_CONFIGS:-gpu4gb gpu8gb gpu12gb gpu16gb gpu24gb gpu40gb gpu48gb}"
+# MODELS="${MODELS:-switch-base-128 switch-base-256 switch-large-128 nllb}"
+MODELS="${MODELS:-switch-base-128 }"
+# MODELS="${MODELS:-switch-base-128 switch-base-256 }"
+# MODELS="${MODELS:-switch-base-256 switch-large-128 nllb}"
 RUN_ROOT="${RUN_ROOT:-${OUR_ROOT}/runs}"
 
 sanitize_id() {
@@ -115,7 +122,9 @@ gpu_config() {
     gpu4gb) GPU_ID="${GPU4GB_GPU_ID:-${GPU_ID}}"; GPU_MEM_PROFILE_GB="4" ;;
     gpu8gb) GPU_ID="${GPU8GB_GPU_ID:-${GPU_ID}}"; GPU_MEM_PROFILE_GB="8" ;;
     gpu12gb) GPU_ID="${GPU12GB_GPU_ID:-${GPU_ID}}"; GPU_MEM_PROFILE_GB="12" ;;
+    gpu16gb) GPU_ID="${GPU16GB_GPU_ID:-${GPU_ID}}"; GPU_MEM_PROFILE_GB="16" ;;
     gpu24gb) GPU_ID="${GPU24GB_GPU_ID:-${GPU_ID}}"; GPU_MEM_PROFILE_GB="24" ;;
+    gpu40gb) GPU_ID="${GPU40GB_GPU_ID:-${GPU_ID}}"; GPU_MEM_PROFILE_GB="40" ;;
     gpu48gb) GPU_ID="${GPU48GB_GPU_ID:-${GPU_ID}}"; GPU_MEM_PROFILE_GB="48" ;;
     *) echo "error: unknown GPU profile: ${profile}" >&2; exit 1 ;;
   esac
@@ -137,7 +146,7 @@ model_config() {
       MODEL_ID="google/switch-base-128"
       INITIAL_HOT_EXPERT_FILE="$(model_hot_expert_file switch-base-128)"
       PREDICTOR_ROOT="${ROOT}/deps/sparse-llm-cache-scripts/moe-predict-models/switch-base-128-mmlu-professional_law-test-train-validation-val/sep/decoder_sparse-cache-b1-longest-v1"
-      ERPP_ENCODER_MODEL_PATH="${ROOT}/performance_predictor/encoder/ERPP/implement/model/sida-gru-sa-hard-ce/erpp_encoder_predictor_v2.ts"
+      ERPP_ENCODER_MODEL_PATH="${ROOT}/experiment/models/predictors/encoder_expert_prefetch/mmlu-professional_law/switch-base-128/sparse-cache-b1-longest-v1/ble/noisyor-from-src-simplenn-token-hardce-h384-l1-drop0p5-lr1e4-bs2-seed0-validtrim/encoder_predictor_ble.ts"
       ;;
     switch-base-256)
       MODEL_ID="google/switch-base-256"
@@ -151,6 +160,12 @@ model_config() {
       PREDICTOR_ROOT="${ROOT}/deps/sparse-llm-cache-scripts/moe-predict-models/switch-large-128-mmlu-professional_law-test-train-validation-val/sep/decoder_sparse-cache-b1-longest-v1"
       ERPP_ENCODER_MODEL_PATH="${ROOT}/experiment/models/predictors/encoder_expert_prefetch/mmlu-professional_law/switch-large-128/sparse-cache-b1-longest-v1/ble/noisyor-from-src-simplenn-token-hardce-h384-l1-drop0p5-lr1e4-bs512-seed0-validtrim/encoder_predictor_ble.ts"
       ;;
+    nllb|nllb-moe-54b)
+      MODEL_ID="facebook/nllb-moe-54b"
+      INITIAL_HOT_EXPERT_FILE="${ROOT}/experiment/traces/nllb-moe-54b-mmlu-${MMLU_TASK}-test/hot_experts/nllb-moe-54b.test.json"
+      PREDICTOR_ROOT="${ROOT}/deps/sparse-llm-cache-scripts/moe-predict-models/nllb-moe-54b-mmlu-professional_law-test-train-validation-val/sep/decoder_sparse-cache-b1-longest-v1"
+      ERPP_ENCODER_MODEL_PATH="${ROOT}/experiment/models/predictors/encoder_expert_prefetch/mmlu-professional_law/nllb-moe-54b/sparse-cache-b1-longest-v1/ble/noisyor-from-src-simplenn-token-bce-equal-top2-tokcnt0p004-h384-l1-drop0p5-lr1e4-bs512-seed0-validtrim/encoder_predictor_ble.ts"
+      ;;
     *) echo "error: unknown model alias: ${alias}" >&2; exit 1 ;;
   esac
 
@@ -162,7 +177,7 @@ model_config() {
 resolve_gpu_model_settings() {
   case "${GPU_PROFILE}" in
     default) GPU_MEM_GB="4" ;;
-    gpu4gb|gpu8gb|gpu12gb|gpu24gb|gpu48gb) GPU_MEM_GB="${GPU_MEM_PROFILE_GB}" ;;
+    gpu4gb|gpu8gb|gpu12gb|gpu16gb|gpu24gb|gpu40gb|gpu48gb) GPU_MEM_GB="${GPU_MEM_PROFILE_GB}" ;;
     *) echo "error: no GPU memory mapping for GPU profile: ${GPU_PROFILE}" >&2; exit 1 ;;
   esac
 
@@ -170,18 +185,30 @@ resolve_gpu_model_settings() {
     default:switch-base-128|gpu4gb:switch-base-128) CACHE_RATE="0.125" ;;
     gpu8gb:switch-base-128) CACHE_RATE="0.25" ;;
     gpu12gb:switch-base-128) CACHE_RATE="0.375" ;;
+    gpu16gb:switch-base-128) CACHE_RATE="0.5" ;;
     gpu24gb:switch-base-128) CACHE_RATE="0.8" ;;
+    gpu40gb:switch-base-128) CACHE_RATE="1.0" ;;
     gpu48gb:switch-base-128) CACHE_RATE="1.0" ;;
     default:switch-base-256|gpu4gb:switch-base-256) CACHE_RATE="0.05" ;;
     gpu8gb:switch-base-256) CACHE_RATE="0.13" ;;
     gpu12gb:switch-base-256) CACHE_RATE="0.2" ;;
+    gpu16gb:switch-base-256) CACHE_RATE="0.25" ;;
     gpu24gb:switch-base-256) CACHE_RATE="0.405" ;;
+    gpu40gb:switch-base-256) CACHE_RATE="0.7" ;;
     gpu48gb:switch-base-256) CACHE_RATE="0.85" ;;
     default:switch-large-128|gpu4gb:switch-large-128) CACHE_RATE="0.07" ;;
     gpu8gb:switch-large-128) CACHE_RATE="0.15" ;;
     gpu12gb:switch-large-128) CACHE_RATE="0.225" ;;
+    gpu16gb:switch-large-128) CACHE_RATE="0.30" ;;
     gpu24gb:switch-large-128) CACHE_RATE="0.45" ;;
+    gpu40gb:switch-large-128) CACHE_RATE="0.8" ;;
     gpu48gb:switch-large-128) CACHE_RATE="0.95" ;;
+    default:nllb|default:nllb-moe-54b|gpu4gb:nllb|gpu4gb:nllb-moe-54b|gpu8gb:nllb|gpu8gb:nllb-moe-54b) CACHE_RATE="skip" ;;
+    gpu12gb:nllb|gpu12gb:nllb-moe-54b) CACHE_RATE="0.01" ;;
+    gpu16gb:nllb|gpu16gb:nllb-moe-54b) CACHE_RATE="0.02" ;;
+    gpu24gb:nllb|gpu24gb:nllb-moe-54b) CACHE_RATE="0.0625" ;;
+    gpu40gb:nllb|gpu40gb:nllb-moe-54b) CACHE_RATE="0.145" ;;
+    gpu48gb:nllb|gpu48gb:nllb-moe-54b) CACHE_RATE="0.2" ;;
     *) echo "error: no CACHE_RATE mapping for GPU/model pair: ${GPU_PROFILE}/${MODEL_ALIAS}" >&2; exit 1 ;;
   esac
 
@@ -205,7 +232,6 @@ mode_config() {
       ENABLE_DECODER_WARMUP_OVERLAP="${ENABLE_DECODER_WARMUP_OVERLAP:-False}"
       ;;
     overlap)
-    # TODO：
       NUM_PRED="${NUM_PRED:-6}"
       REORDER="${REORDER:-True}"
       PREEMPT="${PREEMPT:-True}"
@@ -344,8 +370,6 @@ build_args() {
       --erpp_encoder_jit_refill_low_watermark_ratio "${ERPP_ENCODER_JIT_REFILL_LOW_WATERMARK_RATIO}"
       --erpp_encoder_jit_refill_layers "${ERPP_ENCODER_JIT_REFILL_LAYERS}"
       --erpp_encoder_jit_refill_per_idle "${ERPP_ENCODER_JIT_REFILL_PER_IDLE}"
-      --erpp_encoder_expert_copy_us "${ERPP_ENCODER_EXPERT_COPY_US}"
-      --erpp_encoder_expert_compute_us "${ERPP_ENCODER_EXPERT_COMPUTE_US}"
       --enable_erpp_encoder_jit_topk_cover "${ENABLE_ERPP_ENCODER_JIT_TOPK_COVER}"
     )
   else
@@ -386,6 +410,10 @@ run_one_model() {
   local alias="$2"
   gpu_config "${profile}"
   model_config "${alias}"
+  if [[ "${CACHE_RATE}" == "skip" ]]; then
+    echo "skip: GPU profile ${GPU_PROFILE} is not configured to run ${MODEL_ALIAS}"
+    return
+  fi
   mode_config
 
   if [[ -n "${SAMPLE_INDICES}" ]]; then

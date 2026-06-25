@@ -1,5 +1,17 @@
 #!/usr/bin/env bash
 # Run Promoe LSP baseline experiments directly from the experiment tree.
+# cd /mnt/huwf5/promoe
+
+# GPU_ID=0 \
+# GPU_CONFIGS="gpu4gb gpu8gb gpu12gb gpu16gb gpu24gb gpu40gb gpu48gb" \
+# MODELS="switch-base-128 switch-base-256 switch-large-128 nllb" \
+# PER_LAYER_CACHE=False \
+# RUN_ID=switch_gpu_sweep_$(date +%Y%m%d_%H%M%S) \
+# experiment/baseline/LSP/promoe/scripts/run_all.sh
+
+
+
+
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../../.." && pwd)"
@@ -9,10 +21,9 @@ COLLECT_SUMMARY="${PROMOE_ROOT}/scripts/collect_summary.py"
 
 # Common runtime parameters.
 PYTHON_BIN="${PYTHON_BIN:-/mnt/huwf5/conda-envs/promoe-moe-cache/bin/python}"
-GPU_ID_OVERRIDE="${GPU_ID:-}"
+GPU_ID="${GPU_ID:-0}"
 BATCH_SIZE="${BATCH_SIZE:-1}"
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-32}"
-GPU_MEM_GB_OVERRIDE="${GPU_MEM_GB:-}"
 PROMOE_BENCHMARK_WARMUP="${PROMOE_BENCHMARK_WARMUP:-4}"
 SAMPLE_INDICES="${SAMPLE_INDICES:-}"
 PROMOE_DRY_RUN="${PROMOE_DRY_RUN:-0}"
@@ -24,7 +35,6 @@ SPLIT="${SPLIT:-validation}"
 
 # Promoe method parameters. These match the existing performance script defaults.
 BACKEND_MODE="${BACKEND_MODE:-${MODE:-ours}}"
-CACHE_RATE_OVERRIDE="${CACHE_RATE:-}"
 PER_LAYER_CACHE="${PER_LAYER_CACHE:-False}"
 DETERMINISTIC_INIT="${DETERMINISTIC_INIT:-1}"
 INITIAL_CACHE_POLICY="${INITIAL_CACHE_POLICY:-hot_encoder_balanced_coverage}"
@@ -33,16 +43,41 @@ SPARSE_CACHE_LOG_PREFETCH_DECISION="${SPARSE_CACHE_LOG_PREFETCH_DECISION:-0}"
 ERPP_ENCODER_DIAGNOSTICS="${ERPP_ENCODER_DIAGNOSTICS:-0}"
 ENABLE_DECODER_PHASE_WARMUP_OVERLAP="${ENABLE_DECODER_PHASE_WARMUP_OVERLAP:-False}"
 ENABLE_ERPP_ENCODER_PREFETCH="${ENABLE_ERPP_ENCODER_PREFETCH:-False}"
-INITIAL_HOT_EXPERT_FILE_OVERRIDE="${INITIAL_HOT_EXPERT_FILE:-}"
-PREDICTOR_ROOT_OVERRIDE="${PREDICTOR_ROOT:-}"
-ERPP_ENCODER_MODEL_PATH_OVERRIDE="${ERPP_ENCODER_MODEL_PATH:-}"
-MODEL_REVISION_OVERRIDE="${MODEL_REVISION:-main}"
+MODEL_REVISION="${MODEL_REVISION:-main}"
 
 # GPU/model sweep parameters.
-GPU_CONFIGS="${GPU_CONFIGS:-default}"
-MODELS="${MODELS:-switch-base-128}"
-RUN_ID="${RUN_ID:-$(date +%Y%m%d_%H%M%S)}"
-RUN_ROOT="${RUN_ROOT:-${PROMOE_ROOT}/runs}"
+# GPU_CONFIGS="${GPU_CONFIGS:-gpu4gb gpu8gb gpu12gb gpu16gb gpu24gb gpu40gb gpu48gb}"
+GPU_CONFIGS="${GPU_CONFIGS:-gpu4gb gpu8gb gpu12gb gpu16gb gpu24gb}"
+MODELS="${MODELS:-switch-base-128 switch-base-256 switch-large-128 nllb}"
+# MODELS="${MODELS:-switch-base-128 switch-base-256}"
+RUN_ROOT="${RUN_ROOT:-${PROMOE_ROOT}/runs}"   
+
+sanitize_id() {
+  local value="$1"
+  value="${value,,}"
+  value="${value// /_}"
+  value="${value//\//_}"
+  value="${value//[^a-z0-9._-]/_}"
+  value="$(printf '%s' "${value}" | sed -E 's/_+/_/g; s/^_+//; s/_+$//')"
+  printf '%s' "${value:-unknown}"
+}
+
+detect_gpu_name() {
+  local query_gpu="${GPU_ID%%,*}"
+  local name=""
+  if command -v nvidia-smi >/dev/null 2>&1; then
+    name="$(nvidia-smi --id="${query_gpu}" --query-gpu=name --format=csv,noheader 2>/dev/null | head -n 1 || true)"
+    if [[ -z "${name}" ]]; then
+      name="$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | sed -n "$((query_gpu + 1))p" || true)"
+    fi
+  fi
+  printf '%s' "${name:-unknown_gpu}"
+}
+
+HOST_ID="$(sanitize_id "$(hostname -s 2>/dev/null || hostname 2>/dev/null || echo unknown_host)")"
+GPU_NAME_RAW="$(detect_gpu_name)"
+GPU_NAME_ID="$(sanitize_id "${GPU_NAME_RAW}")"
+RUN_ID="${RUN_ID:-promoe_${HOST_ID}_${GPU_NAME_ID}_$(date +%Y%m%d_%H%M%S)}"
 
 if [[ "${BATCH_SIZE}" != "1" ]]; then
   echo "error: BATCH_SIZE must be 1 so samples.csv remains one row per request, got: ${BATCH_SIZE}" >&2
@@ -66,30 +101,37 @@ gpu_config() {
   local profile="$1"
   GPU_PROFILE="${profile}"
   GPU_PROFILE_KEY="${profile//\//_}"
-  GPU_ID="${GPU_ID_OVERRIDE:-0}"
   GPU_MEM_PROFILE_GB=""
 
   case "${profile}" in
     default)
       ;;
     gpu4gb)
-      GPU_ID="${GPU4GB_GPU_ID:-${GPU_ID_OVERRIDE:-0}}"
+      GPU_ID="${GPU4GB_GPU_ID:-${GPU_ID}}"
       GPU_MEM_PROFILE_GB="4"
       ;;
     gpu8gb)
-      GPU_ID="${GPU8GB_GPU_ID:-${GPU_ID_OVERRIDE:-0}}"
+      GPU_ID="${GPU8GB_GPU_ID:-${GPU_ID}}"
       GPU_MEM_PROFILE_GB="8"
       ;;
     gpu12gb)
-      GPU_ID="${GPU12GB_GPU_ID:-${GPU_ID_OVERRIDE:-0}}"
+      GPU_ID="${GPU12GB_GPU_ID:-${GPU_ID}}"
       GPU_MEM_PROFILE_GB="12"
       ;;
+    gpu16gb)
+      GPU_ID="${GPU16GB_GPU_ID:-${GPU_ID}}"
+      GPU_MEM_PROFILE_GB="16"
+      ;;
     gpu24gb)
-      GPU_ID="${GPU24GB_GPU_ID:-${GPU_ID_OVERRIDE:-0}}"
+      GPU_ID="${GPU24GB_GPU_ID:-${GPU_ID}}"
       GPU_MEM_PROFILE_GB="24"
       ;;
+    gpu40gb)
+      GPU_ID="${GPU40GB_GPU_ID:-${GPU_ID}}"
+      GPU_MEM_PROFILE_GB="40"
+      ;;
     gpu48gb)
-      GPU_ID="${GPU48GB_GPU_ID:-${GPU_ID_OVERRIDE:-0}}"
+      GPU_ID="${GPU48GB_GPU_ID:-${GPU_ID}}"
       GPU_MEM_PROFILE_GB="48"
       ;;
     *)
@@ -99,35 +141,41 @@ gpu_config() {
   esac
 }
 
+model_hot_expert_file() {
+  local alias="$1"
+  echo "${ROOT}/experiment/traces/${alias}-mmlu-${MMLU_TASK}-test/hot_experts/${alias}.test.json"
+}
+
 model_config() {
   local alias="$1"
   MODEL_ALIAS="${alias}"
-  MODEL_REVISION="${MODEL_REVISION_OVERRIDE}"
-  GPU_MEM_GB=""
   PREDICTOR_ROOT=""
   ERPP_ENCODER_MODEL_PATH=""
 
   case "${alias}" in
     switch-base-128)
       MODEL_ID="google/switch-base-128"
-# /mnt/huwf5/promoe/experiment/traces/switch-base-128-mmlu-professional_law-test/hot_experts/switch-base-128.test.json
-      INITIAL_HOT_EXPERT_FILE="${ROOT}/experiment/traces/switch-base-128-mmlu-professional_law-test/hot_experts/switch-base-128.test.json"
-      PREDICTOR_ROOT="${ROOT}/deps/sparse-llm-cache-scripts/moe-predict-models/switch-base-128-mmlu-professional_law-test-train-validation-val/sep/decoder"
+      INITIAL_HOT_EXPERT_FILE="$(model_hot_expert_file switch-base-128)"
+      PREDICTOR_ROOT="${ROOT}/deps/sparse-llm-cache-scripts/moe-predict-models/switch-base-128-mmlu-professional_law-test-train-validation-val/sep/decoder_sparse-cache-b1-longest-v1"
       ERPP_ENCODER_MODEL_PATH="${ROOT}/experiment/models/predictors/encoder_expert_prefetch/mmlu-professional_law/switch-base-128/sparse-cache-b1-longest-v1/ble/noisyor-from-src-simplenn-token-hardce-h384-l1-drop0p5-lr1e4-bs2-seed0-validtrim/encoder_predictor_ble.ts"
       ;;
     switch-base-256)
       MODEL_ID="google/switch-base-256"
-# /mnt/huwf5/promoe/experiment/traces/switch-base-256-mmlu-professional_law-test/hot_experts/switch-base-256.test.json
-      INITIAL_HOT_EXPERT_FILE="${ROOT}/experiment/traces/switch-base-256-mmlu-professional_law-test/hot_experts/switch-base-256.test.json"
-      PREDICTOR_ROOT="${ROOT}/deps/sparse-llm-cache-scripts/moe-predict-models/switch-base-256-mmlu-professional_law-test-train-validation-val/sep/decoder"
+      INITIAL_HOT_EXPERT_FILE="$(model_hot_expert_file switch-base-256)"
+      PREDICTOR_ROOT="${ROOT}/deps/sparse-llm-cache-scripts/moe-predict-models/switch-base-256-mmlu-professional_law-test-train-validation-val/sep/decoder_sparse-cache-b1-longest-v1"
       ERPP_ENCODER_MODEL_PATH="${ROOT}/experiment/models/predictors/encoder_expert_prefetch/mmlu-professional_law/switch-base-256/sparse-cache-b1-longest-v1/ble/noisyor-from-src-simplenn-token-hardce-h384-l1-drop0p5-lr1e4-bs512-seed0-validtrim/encoder_predictor_ble.ts"
       ;;
     switch-large-128)
       MODEL_ID="google/switch-large-128"
-# /mnt/huwf5/promoe/experiment/traces/switch-large-128-mmlu-professional_law-test/hot_experts/switch-large-128.test.json
-      INITIAL_HOT_EXPERT_FILE="${ROOT}/experiment/traces/switch-large-128-mmlu-professional_law-test/hot_experts/switch-large-128.test.json"
-      PREDICTOR_ROOT="${ROOT}/deps/sparse-llm-cache-scripts/moe-predict-models/switch-large-128-mmlu-professional_law-test-train-validation-val/sep/decoder"
+      INITIAL_HOT_EXPERT_FILE="$(model_hot_expert_file switch-large-128)"
+      PREDICTOR_ROOT="${ROOT}/deps/sparse-llm-cache-scripts/moe-predict-models/switch-large-128-mmlu-professional_law-test-train-validation-val/sep/decoder_sparse-cache-b1-longest-v1"
       ERPP_ENCODER_MODEL_PATH="${ROOT}/experiment/models/predictors/encoder_expert_prefetch/mmlu-professional_law/switch-large-128/sparse-cache-b1-longest-v1/ble/noisyor-from-src-simplenn-token-hardce-h384-l1-drop0p5-lr1e4-bs512-seed0-validtrim/encoder_predictor_ble.ts"
+      ;;
+    nllb|nllb-moe-54b)
+      MODEL_ID="facebook/nllb-moe-54b"
+      INITIAL_HOT_EXPERT_FILE="${ROOT}/experiment/traces/nllb-moe-54b-mmlu-${MMLU_TASK}-test/hot_experts/nllb-moe-54b.test.json"
+      PREDICTOR_ROOT="${ROOT}/deps/sparse-llm-cache-scripts/moe-predict-models/nllb-moe-54b-mmlu-professional_law-test-train-validation-val/sep/decoder_sparse-cache-b1-longest-v1"
+      ERPP_ENCODER_MODEL_PATH="${ROOT}/experiment/models/predictors/encoder_expert_prefetch/mmlu-professional_law/nllb-moe-54b/sparse-cache-b1-longest-v1/ble/noisyor-from-src-simplenn-token-bce-equal-top2-tokcnt0p004-h384-l1-drop0p5-lr1e4-bs512-seed0-validtrim/encoder_predictor_ble.ts"
       ;;
     *)
       echo "error: unknown model alias: ${alias}" >&2
@@ -135,26 +183,17 @@ model_config() {
       ;;
   esac
 
-  apply_gpu_model_overrides
-  if [[ -n "${INITIAL_HOT_EXPERT_FILE_OVERRIDE}" ]]; then
-    INITIAL_HOT_EXPERT_FILE="${INITIAL_HOT_EXPERT_FILE_OVERRIDE}"
-  fi
-  if [[ -n "${PREDICTOR_ROOT_OVERRIDE}" ]]; then
-    PREDICTOR_ROOT="${PREDICTOR_ROOT_OVERRIDE}"
-  fi
-  if [[ -n "${ERPP_ENCODER_MODEL_PATH_OVERRIDE}" ]]; then
-    ERPP_ENCODER_MODEL_PATH="${ERPP_ENCODER_MODEL_PATH_OVERRIDE}"
-  fi
+  resolve_gpu_model_settings
   MODEL_KEY="${MODEL_ID//\//_}"
 }
 
 
-apply_gpu_model_overrides() {
+resolve_gpu_model_settings() {
   case "${GPU_PROFILE}" in
     default)
       GPU_MEM_GB="4"
       ;;
-    gpu4gb|gpu8gb|gpu12gb|gpu24gb|gpu48gb)
+    gpu4gb|gpu8gb|gpu12gb|gpu16gb|gpu24gb|gpu40gb|gpu48gb)
       GPU_MEM_GB="${GPU_MEM_PROFILE_GB}"
       ;;
     *)
@@ -164,32 +203,93 @@ apply_gpu_model_overrides() {
   esac
 
   # Known mapping. Add new model/GPU pairs here only after measuring or deciding the cache ratio.
-  # switch-base-128: 4GB(0.125), 8GB(0.25), 12GB+(0.375)
   case "${GPU_PROFILE}:${MODEL_ALIAS}" in
-    default:switch-base-128)
-      CACHE_RATE="0.125"
-      ;;
-    gpu4gb:switch-base-128)
+    default:switch-base-128|gpu4gb:switch-base-128)
       CACHE_RATE="0.125"
       ;;
     gpu8gb:switch-base-128)
       CACHE_RATE="0.25"
       ;;
-    gpu12gb:switch-base-128|gpu24gb:switch-base-128|gpu48gb:switch-base-128)
+    gpu12gb:switch-base-128)
       CACHE_RATE="0.375"
+      ;;
+    gpu16gb:switch-base-128)
+      CACHE_RATE="0.5"
+      ;;
+    gpu24gb:switch-base-128)
+      CACHE_RATE="0.8"
+      ;;
+    gpu40gb:switch-base-128)
+      CACHE_RATE="1.0"
+      ;;
+    gpu48gb:switch-base-128)
+      CACHE_RATE="1.0"
+      ;;
+    default:switch-base-256|gpu4gb:switch-base-256)
+      CACHE_RATE="0.05"
+      ;;
+    gpu8gb:switch-base-256)
+      CACHE_RATE="0.13"
+      ;;
+    gpu12gb:switch-base-256)
+      CACHE_RATE="0.2"
+      ;;
+    gpu16gb:switch-base-256)
+      CACHE_RATE="0.25"
+      ;;
+    gpu24gb:switch-base-256)
+      CACHE_RATE="0.405"
+      ;;
+    gpu40gb:switch-base-256)
+      CACHE_RATE="0.7"
+      ;;
+    gpu48gb:switch-base-256)
+      CACHE_RATE="0.85"
+      ;;
+    default:switch-large-128|gpu4gb:switch-large-128)
+      CACHE_RATE="0.07"
+      ;;
+    gpu8gb:switch-large-128)
+      CACHE_RATE="0.15"
+      ;;
+    gpu12gb:switch-large-128)
+      CACHE_RATE="0.225"
+      ;;
+    gpu16gb:switch-large-128)
+      CACHE_RATE="0.30"
+      ;;
+    gpu24gb:switch-large-128)
+      CACHE_RATE="0.45"
+      ;;
+    gpu40gb:switch-large-128)
+      CACHE_RATE="0.8"
+      ;;
+    gpu48gb:switch-large-128)
+      CACHE_RATE="0.95"
+      ;;
+    default:nllb|default:nllb-moe-54b|gpu4gb:nllb|gpu4gb:nllb-moe-54b|gpu8gb:nllb|gpu8gb:nllb-moe-54b)
+      CACHE_RATE="skip"
+      ;;
+    gpu12gb:nllb|gpu12gb:nllb-moe-54b)
+      CACHE_RATE="0.01"
+      ;;
+    gpu16gb:nllb|gpu16gb:nllb-moe-54b)
+      CACHE_RATE="0.02"
+      ;;
+    gpu24gb:nllb|gpu24gb:nllb-moe-54b)
+      CACHE_RATE="0.0625"
+      ;;
+    gpu40gb:nllb|gpu40gb:nllb-moe-54b)
+      CACHE_RATE="0.145"
+      ;;
+    gpu48gb:nllb|gpu48gb:nllb-moe-54b)
+      CACHE_RATE="0.2"
       ;;
     *)
       echo "error: no CACHE_RATE mapping for GPU/model pair: ${GPU_PROFILE}/${MODEL_ALIAS}" >&2
       exit 1
       ;;
   esac
-
-  if [[ -n "${GPU_MEM_GB_OVERRIDE}" ]]; then
-    GPU_MEM_GB="${GPU_MEM_GB_OVERRIDE}"
-  fi
-  if [[ -n "${CACHE_RATE_OVERRIDE}" ]]; then
-    CACHE_RATE="${CACHE_RATE_OVERRIDE}"
-  fi
 }
 
 mode_config() {
@@ -368,6 +468,10 @@ run_one_model() {
   local alias="$2"
   gpu_config "${profile}"
   model_config "${alias}"
+  if [[ "${CACHE_RATE}" == "skip" ]]; then
+    echo "skip: GPU profile ${GPU_PROFILE} is not configured to run ${MODEL_ALIAS}"
+    return
+  fi
   mode_config
 
   if [[ -n "${SAMPLE_INDICES}" ]]; then

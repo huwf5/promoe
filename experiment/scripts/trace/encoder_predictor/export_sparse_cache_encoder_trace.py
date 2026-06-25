@@ -85,6 +85,13 @@ def resolve_model_torch_dtype(name: str, config) -> torch.dtype:
     return storage_dtype(dtype_name(inferred))
 
 
+def resolve_model_device_map(device: str | torch.device) -> dict:
+    resolved = torch.device(device)
+    if resolved.type == "cuda" and resolved.index is None:
+        return {"": "cuda"}
+    return {"": str(resolved)}
+
+
 def resolve_storage_dtype(name: str, config) -> torch.dtype:
     if name != "auto":
         return storage_dtype(name)
@@ -413,6 +420,7 @@ def build_sparse_cache_config(args: argparse.Namespace, model_type: str | None =
         "early_preempt": False,
         "chunk_prefetch": False,
         "predict_input_mode": "no_predict",
+        "cache_device": str(args.device),
     }
 
 
@@ -582,7 +590,7 @@ class SparseCacheTraceRunner:
             self.args.model_path,
             torch_dtype=self.resolved_model_torch_dtype,
             local_files_only=True,
-            device_map=0,
+            device_map=resolve_model_device_map(self.input_device),
             trust_remote_code=True,
         )
         if getattr(self.model.config, "is_encoder_decoder", False) and self.model.config.decoder_start_token_id is None:

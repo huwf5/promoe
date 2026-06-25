@@ -398,7 +398,7 @@ PYTHONPATH=/mnt/huwf5/promoe/src:/mnt/huwf5/promoe/deps/transformers/src \
 
 /mnt/huwf5/conda-envs/promoe-moe-cache/bin/python \
   experiment/scripts/train/evaluate_encoder_predictor_prefetch.py \
-  --model-dir experiment/models/predictors/encoder_expert_prefetch/mmlu-professional_law/nllb-moe-54b/sparse-cache-b1-longest-v1/blte/src-simplenn-token-hardce-h384-l1-drop0p5-lr1e4-bs2-seed0-validtrim \
+  --model-dir /mnt/huwf5/promoe/experiment/models/predictors/encoder_expert_prefetch/mmlu-professional_law/nllb-moe-54b/sparse-cache-b1-longest-v1/blte/src-simplenn-token-bce-equal-top2-tokcnt0p1-layercnt0p05-h384-l1-drop0p5-lr1e4-bs512-seed0-validtrim \
   --device cuda:0
 
 # # 3b. export encoder_predictor TorchScript: hidden-only BLTE + BLE

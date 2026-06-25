@@ -22,6 +22,85 @@ class CompletedRun:
     stderr: str
 
 
+class GpuMemoryMonitor:
+    def __init__(self, *, device: str, sampler: Callable[[str], Optional[int]]):
+        self.device = device
+        self.sampler = sampler
+        self.peak_mb: Optional[int] = None
+        self.current_mb: Optional[int] = None
+        self.sample_count = 0
+        self.error: Optional[str] = None
+        self._disabled = False
+
+    def sample(self) -> None:
+        if self._disabled:
+            return
+        try:
+            used_mb = self.sampler(self.device)
+        except Exception as exc:  # nvidia-smi may be unavailable on non-GPU hosts.
+            self.error = str(exc)
+            self._disabled = True
+            return
+        if used_mb is None:
+            return
+        used_mb = int(used_mb)
+        self.current_mb = used_mb
+        self.sample_count += 1
+        if self.peak_mb is None or used_mb > self.peak_mb:
+            self.peak_mb = used_mb
+
+    @property
+    def peak_gb(self) -> Optional[float]:
+        if self.peak_mb is None:
+            return None
+        return self.peak_mb / 1024.0
+
+    @property
+    def current_gb(self) -> Optional[float]:
+        if self.current_mb is None:
+            return None
+        return self.current_mb / 1024.0
+
+    def exceeds_limit(self, gpu_mem_gb: float) -> Optional[bool]:
+        peak_gb = self.peak_gb
+        if peak_gb is None:
+            return None
+        return peak_gb > gpu_mem_gb
+
+
+def _parse_cuda_device_index(device: str) -> Optional[int]:
+    if device == "cuda":
+        return 0
+    if device.startswith("cuda:"):
+        suffix = device.split(":", 1)[1]
+        if suffix.isdigit():
+            return int(suffix)
+    return None
+
+
+def query_gpu_memory_used_mb(device: str) -> Optional[int]:
+    gpu_index = _parse_cuda_device_index(device)
+    if gpu_index is None:
+        return None
+    completed = subprocess.run(
+        [
+            "nvidia-smi",
+            "--query-gpu=memory.used",
+            "--format=csv,noheader,nounits",
+            "-i",
+            str(gpu_index),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    if completed.returncode != 0:
+        raise RuntimeError(completed.stderr.strip() or completed.stdout.strip() or "nvidia-smi failed")
+    first_line = completed.stdout.strip().splitlines()[0]
+    return int(first_line.strip())
+
+
 @dataclass
 class CheckResult:
     can_run: bool
@@ -33,6 +112,11 @@ class CheckResult:
     elapsed_seconds: float
     stdout_tail: str
     stderr_tail: str
+    peak_gpu_memory_mb: Optional[int] = None
+    peak_gpu_memory_gb: Optional[float] = None
+    gpu_memory_sample_count: int = 0
+    peak_exceeds_limit: Optional[bool] = None
+    gpu_memory_error: Optional[str] = None
     temp_dir: Optional[Path] = None
     output_dir: Optional[Path] = None
 
@@ -117,6 +201,11 @@ def save_result_record(
         "elapsed_seconds": float(result.elapsed_seconds),
         "stdout_tail": result.stdout_tail,
         "stderr_tail": result.stderr_tail,
+        "peak_gpu_memory_mb": result.peak_gpu_memory_mb,
+        "peak_gpu_memory_gb": result.peak_gpu_memory_gb,
+        "gpu_memory_sample_count": int(result.gpu_memory_sample_count),
+        "peak_exceeds_limit": result.peak_exceeds_limit,
+        "gpu_memory_error": result.gpu_memory_error,
     }
     if result.temp_dir is not None:
         record["temp_dir"] = str(result.temp_dir)
@@ -150,21 +239,76 @@ def classify_failure(returncode: int, stdout: str, stderr: str) -> Optional[str]
     return "runtime_error"
 
 
-def run_subprocess(command: Sequence[str], *, timeout_seconds: Optional[float] = None) -> CompletedRun:
-    try:
-        completed = subprocess.run(
-            list(command),
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=timeout_seconds,
-        )
-        return CompletedRun(completed.returncode, completed.stdout, completed.stderr)
-    except subprocess.TimeoutExpired as exc:
-        stdout = exc.stdout if isinstance(exc.stdout, str) else ""
-        stderr = exc.stderr if isinstance(exc.stderr, str) else ""
+def run_subprocess(
+    command: Sequence[str],
+    *,
+    timeout_seconds: Optional[float] = None,
+    gpu_memory_monitor: Optional[GpuMemoryMonitor] = None,
+    gpu_memory_poll_interval_seconds: float = 0.1,
+    heartbeat_seconds: Optional[float] = 30.0,
+) -> CompletedRun:
+    if gpu_memory_monitor is None:
+        try:
+            completed = subprocess.run(
+                list(command),
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=timeout_seconds,
+            )
+            return CompletedRun(completed.returncode, completed.stdout, completed.stderr)
+        except subprocess.TimeoutExpired as exc:
+            stdout = exc.stdout if isinstance(exc.stdout, str) else ""
+            stderr = exc.stderr if isinstance(exc.stderr, str) else ""
+            stderr = f"{stderr}\nCommand timed out after {timeout_seconds} seconds".strip()
+            return CompletedRun(124, stdout, stderr)
+
+    start = time.time()
+    process = subprocess.Popen(
+        list(command),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    timed_out = False
+    poll_interval = max(float(gpu_memory_poll_interval_seconds), 0.01)
+    heartbeat_interval = None
+    if heartbeat_seconds is not None and heartbeat_seconds > 0:
+        heartbeat_interval = float(heartbeat_seconds)
+    next_heartbeat = start + heartbeat_interval if heartbeat_interval is not None else None
+    print(
+        f"[cache_ratio] started child pid={process.pid} command={' '.join(command)}",
+        file=sys.stderr,
+        flush=True,
+    )
+    while process.poll() is None:
+        gpu_memory_monitor.sample()
+        now = time.time()
+        if next_heartbeat is not None and now >= next_heartbeat:
+            elapsed = now - start
+            current_gb = gpu_memory_monitor.current_gb
+            peak_gb = gpu_memory_monitor.peak_gb
+            current_text = "n/a" if current_gb is None else f"{current_gb:.2f}GB"
+            peak_text = "n/a" if peak_gb is None else f"{peak_gb:.2f}GB"
+            print(
+                f"[cache_ratio] still running pid={process.pid} elapsed={elapsed:.0f}s "
+                f"gpu_current={current_text} gpu_peak={peak_text} "
+                f"samples={gpu_memory_monitor.sample_count}",
+                file=sys.stderr,
+                flush=True,
+            )
+            next_heartbeat = now + heartbeat_interval
+        if timeout_seconds is not None and time.time() - start >= timeout_seconds:
+            timed_out = True
+            process.kill()
+            break
+        time.sleep(poll_interval)
+    gpu_memory_monitor.sample()
+    stdout, stderr = process.communicate()
+    if timed_out:
         stderr = f"{stderr}\nCommand timed out after {timeout_seconds} seconds".strip()
         return CompletedRun(124, stdout, stderr)
+    return CompletedRun(process.returncode, stdout, stderr)
 
 
 def _write_prompt_files(temp_dir: Path, prompt: str) -> tuple[Path, Path]:
@@ -262,6 +406,10 @@ def check_cache_ratio(
     print_status: bool = False,
     timeout_seconds: Optional[float] = None,
     run_command: Callable[..., CompletedRun] = run_subprocess,
+    monitor_gpu_memory: bool = True,
+    gpu_memory_sampler: Callable[[str], Optional[int]] = query_gpu_memory_used_mb,
+    gpu_memory_poll_interval_seconds: float = 0.1,
+    heartbeat_seconds: Optional[float] = 30.0,
 ) -> CheckResult:
     if gpu_mem_gb <= 0:
         raise ValueError(f"gpu_mem_gb must be > 0, got {gpu_mem_gb}")
@@ -278,6 +426,9 @@ def check_cache_ratio(
         temp_dir = Path(temp_dir_obj.name)
 
     output_dir = temp_dir / "trace_output"
+    gpu_memory_monitor = (
+        GpuMemoryMonitor(device=device, sampler=gpu_memory_sampler) if monitor_gpu_memory else None
+    )
     start = time.time()
     try:
         train_prompt_file, validation_prompt_file = _write_prompt_files(temp_dir, prompt)
@@ -302,8 +453,21 @@ def check_cache_ratio(
             per_layer_cache=per_layer_cache,
             print_status=print_status,
         )
-        completed = run_command(command, timeout_seconds=timeout_seconds)
+        completed = run_command(
+            command,
+            timeout_seconds=timeout_seconds,
+            gpu_memory_monitor=gpu_memory_monitor,
+            gpu_memory_poll_interval_seconds=gpu_memory_poll_interval_seconds,
+            heartbeat_seconds=heartbeat_seconds,
+        )
         failure_kind = classify_failure(completed.returncode, completed.stdout, completed.stderr)
+        peak_gpu_memory_mb = gpu_memory_monitor.peak_mb if gpu_memory_monitor is not None else None
+        peak_gpu_memory_gb = gpu_memory_monitor.peak_gb if gpu_memory_monitor is not None else None
+        gpu_memory_sample_count = gpu_memory_monitor.sample_count if gpu_memory_monitor is not None else 0
+        peak_exceeds_limit = (
+            gpu_memory_monitor.exceeds_limit(gpu_mem_gb) if gpu_memory_monitor is not None else None
+        )
+        gpu_memory_error = gpu_memory_monitor.error if gpu_memory_monitor is not None else None
         return CheckResult(
             can_run=completed.returncode == 0,
             failure_kind=failure_kind,
@@ -314,6 +478,11 @@ def check_cache_ratio(
             elapsed_seconds=time.time() - start,
             stdout_tail=_tail(completed.stdout),
             stderr_tail=_tail(completed.stderr),
+            peak_gpu_memory_mb=peak_gpu_memory_mb,
+            peak_gpu_memory_gb=peak_gpu_memory_gb,
+            gpu_memory_sample_count=gpu_memory_sample_count,
+            peak_exceeds_limit=peak_exceeds_limit,
+            gpu_memory_error=gpu_memory_error,
             temp_dir=temp_dir if keep_temp else None,
             output_dir=output_dir if keep_temp else None,
         )
@@ -344,6 +513,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--work-root", type=Path, default=None, help="Temporary parent directory; outputs are still cleaned by default")
     parser.add_argument("--keep-temp", action="store_true", help="Keep temporary prompt and trace output directory for debugging")
     parser.add_argument("--timeout-seconds", type=float, default=None)
+    parser.add_argument("--no-gpu-memory-monitor", dest="monitor_gpu_memory", action="store_false", help="Disable nvidia-smi GPU memory peak sampling during the inference subprocess")
+    parser.add_argument("--gpu-memory-poll-interval-seconds", type=float, default=0.1)
+    parser.add_argument("--heartbeat-seconds", type=float, default=30.0, help="Print parent-process progress while the exporter subprocess is still running; set <=0 to disable")
+    parser.set_defaults(monitor_gpu_memory=True)
     parser.add_argument("--result-dir", type=Path, default=default_result_dir(repo_root))
     parser.add_argument("--no-save-result", dest="save_result", action="store_false", help="Do not append the lightweight result record")
     parser.set_defaults(save_result=True)
@@ -374,6 +547,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         per_layer_cache=args.per_layer_cache,
         print_status=args.print_status,
         timeout_seconds=args.timeout_seconds,
+        monitor_gpu_memory=args.monitor_gpu_memory,
+        gpu_memory_poll_interval_seconds=args.gpu_memory_poll_interval_seconds,
+        heartbeat_seconds=args.heartbeat_seconds,
     )
     payload = result.to_json_dict()
     if args.save_result:
