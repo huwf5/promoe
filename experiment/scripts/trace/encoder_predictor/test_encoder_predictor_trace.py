@@ -23,6 +23,7 @@ from export_sparse_cache_encoder_trace import (
     routed_topk_from_router_probs,
     resolve_cache_rate,
     resolve_default_output_dir,
+    resolve_model_device_map,
     resolve_model_torch_dtype,
     resolve_storage_dtype,
     selected_experts_for_config,
@@ -244,6 +245,7 @@ def test_sparse_cache_config_is_minimal_for_on_demand_trace():
         "early_preempt": False,
         "chunk_prefetch": False,
         "predict_input_mode": "no_predict",
+        "cache_device": "cuda:0",
     }
 
 
@@ -874,3 +876,29 @@ def test_transformers_timing_zero_division_detector_rejects_unrelated_error():
     else:
         raise AssertionError("expected ZeroDivisionError")
 
+
+
+def test_resolve_model_device_map_follows_requested_cuda_device():
+    assert resolve_model_device_map("cuda:1") == {"": "cuda:1"}
+    assert resolve_model_device_map("cuda:0") == {"": "cuda:0"}
+
+
+def test_resolve_model_device_map_supports_cpu_device():
+    assert resolve_model_device_map("cpu") == {"": "cpu"}
+
+
+def test_sparse_cache_config_passes_requested_cache_device_to_runtime():
+    args = build_parser().parse_args(
+        [
+            "--model-path",
+            "experiment/models/google/switch-base-128",
+            "--dataset",
+            "mmlu",
+            "--task-name",
+            "professional_law",
+            "--device",
+            "cuda:1",
+        ]
+    )
+
+    assert build_sparse_cache_config(args)["cache_device"] == "cuda:1"
