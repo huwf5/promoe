@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -74,7 +75,13 @@ def test_infer_router_topk_uses_second_expert_policy():
     assert module.resolve_router_topk("auto", SimpleNamespace(second_expert_policy="all")) == 2
 
 
-def test_infer_router_topk_auto_requires_explicit_config():
+def test_infer_router_topk_defaults_missing_num_selected_experts_for_switch_transformers():
+    module = _load_module()
+
+    assert module.resolve_router_topk("auto", SimpleNamespace(model_type="switch_transformers")) == 1
+
+
+def test_infer_router_topk_auto_requires_explicit_config_for_unknown_model_type():
     module = _load_module()
 
     with pytest.raises(ValueError, match="Cannot infer router_topk"):
@@ -109,6 +116,26 @@ def test_router_counter_counts_actual_dispatch_mask_experts():
     assert info["top_token_eids"] == [0, 1, 2]
 
 
+def test_router_counter_counts_nllb_top2_router_probs():
+    module = _load_module()
+    collector = module.RouterHotExpertCollector(router_topk=2)
+    router_probs = torch.tensor(
+        [
+            [0.7, 0.0, 0.3, 0.0],
+            [0.0, 0.6, 0.0, 0.4],
+            [0.0, 0.0, 1.0, 0.0],
+        ],
+        dtype=torch.float32,
+    )
+
+    collector.add_router_mask("encoder.layers.3.ffn.router", router_probs)
+
+    info = collector.usage_summary()["encoder.layers.3.ffn.router"]
+    assert info["token_total_hits"] == 5
+    assert info["token_hit_freq"] == {"2": 2, "0": 1, "1": 1, "3": 1}
+    assert info["top_token_eids"] == [2, 0, 1, 3]
+
+
 def test_resolve_torch_dtype_accepts_supported_aliases():
     module = _load_module()
 
@@ -128,6 +155,279 @@ def test_resolve_torch_dtype_auto_requires_config_field():
 
     with pytest.raises(ValueError, match="Cannot infer torch dtype"):
         module.resolve_torch_dtype("auto", SimpleNamespace())
+
+
+def test_parse_max_gpu_memory_applies_single_value_to_all_gpus():
+    module = _load_module()
+
+    parsed = module.parse_max_gpu_memory("70GiB", gpu_count=2)
+
+    assert parsed == {0: "70GiB", 1: "70GiB"}
+
+
+def test_parse_max_gpu_memory_accepts_indexed_values():
+    module = _load_module()
+
+    parsed = module.parse_max_gpu_memory("0:70GiB,1:68GiB", gpu_count=4)
+
+    assert parsed == {0: "70GiB", 1: "68GiB"}
+
+
+def test_build_max_memory_auto_uses_selected_gpu_with_reserve(monkeypatch):
+    module = _load_module()
+
+    class FakeCuda:
+        @staticmethod
+        def is_available():
+            return True
+
+        @staticmethod
+        def device_count():
+            return 2
+
+        @staticmethod
+        def mem_get_info(index):
+            free = [80 * 1024**3, 40 * 1024**3][index]
+            total = free
+            return free, total
+
+    monkeypatch.setattr(module.torch, "cuda", FakeCuda)
+
+    max_memory = module.build_max_memory(
+        device_map="auto",
+        device="cuda:1",
+        device_map_gpus="device",
+        max_gpu_memory=None,
+        max_cpu_memory="256GiB",
+        gpu_memory_reserve_mib=1024,
+    )
+
+    assert max_memory == {
+        1: "39936MiB",
+        "cpu": "256GiB",
+    }
+
+
+def test_build_max_memory_single_cap_uses_selected_gpu(monkeypatch):
+    module = _load_module()
+
+    class FakeCuda:
+        @staticmethod
+        def is_available():
+            return True
+
+        @staticmethod
+        def device_count():
+            return 2
+
+        @staticmethod
+        def mem_get_info(index):
+            raise AssertionError("explicit max_gpu_memory should not probe GPU memory")
+
+    monkeypatch.setattr(module.torch, "cuda", FakeCuda)
+
+    max_memory = module.build_max_memory(
+        device_map="auto",
+        device="cuda:1",
+        device_map_gpus="device",
+        max_gpu_memory="70GiB",
+        max_cpu_memory="256GiB",
+        gpu_memory_reserve_mib=1024,
+    )
+
+    assert max_memory == {1: "70GiB", "cpu": "256GiB"}
+
+
+def test_build_max_memory_can_still_use_all_visible_gpus(monkeypatch):
+    module = _load_module()
+
+    class FakeCuda:
+        @staticmethod
+        def is_available():
+            return True
+
+        @staticmethod
+        def device_count():
+            return 2
+
+        @staticmethod
+        def mem_get_info(index):
+            free = [80 * 1024**3, 40 * 1024**3][index]
+            total = free
+            return free, total
+
+    monkeypatch.setattr(module.torch, "cuda", FakeCuda)
+
+    max_memory = module.build_max_memory(
+        device_map="auto",
+        device="cuda:1",
+        device_map_gpus="all",
+        max_gpu_memory=None,
+        max_cpu_memory="256GiB",
+        gpu_memory_reserve_mib=1024,
+    )
+
+    assert max_memory == {
+        0: "80896MiB",
+        1: "39936MiB",
+        "cpu": "256GiB",
+    }
+
+
+def test_load_hf_model_uses_device_map_without_model_to(monkeypatch, tmp_path: Path):
+    module = _load_module()
+    calls = {}
+
+    class FakeConfig:
+        torch_dtype = "float16"
+        decoder_start_token_id = 0
+
+    class FakeTokenizer:
+        pad_token_id = 0
+
+    class FakeModel:
+        config = FakeConfig()
+        generation_config = SimpleNamespace(decoder_start_token_id=0, bos_token_id=None)
+
+        def to(self, _device):
+            calls["to_called"] = True
+            return self
+
+        def eval(self):
+            calls["eval_called"] = True
+            return self
+
+    class FakeAutoConfig:
+        @staticmethod
+        def from_pretrained(path, trust_remote_code):
+            calls["config"] = (path, trust_remote_code)
+            return FakeConfig()
+
+    class FakeAutoTokenizer:
+        @staticmethod
+        def from_pretrained(path, trust_remote_code):
+            calls["tokenizer"] = (path, trust_remote_code)
+            return FakeTokenizer()
+
+    class FakeAutoModel:
+        @staticmethod
+        def from_pretrained(path, **kwargs):
+            calls["model_path"] = path
+            calls["model_kwargs"] = kwargs
+            return FakeModel()
+
+    fake_transformers = SimpleNamespace(
+        AutoConfig=FakeAutoConfig,
+        AutoModelForSeq2SeqLM=FakeAutoModel,
+        AutoTokenizer=FakeAutoTokenizer,
+    )
+    monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
+
+    model, tokenizer, config = module.load_hf_model(
+        tmp_path,
+        device="cuda:0",
+        dtype_name="auto",
+        device_map="auto",
+        max_memory={0: "70GiB", "cpu": "256GiB"},
+        offload_folder=tmp_path / "offload",
+    )
+
+    assert isinstance(model, FakeModel)
+    assert isinstance(tokenizer, FakeTokenizer)
+    assert isinstance(config, FakeConfig)
+    assert "to_called" not in calls
+    assert calls["eval_called"]
+    assert calls["model_kwargs"]["device_map"] == "auto"
+    assert calls["model_kwargs"]["max_memory"] == {0: "70GiB", "cpu": "256GiB"}
+    assert calls["model_kwargs"]["offload_folder"] == str(tmp_path / "offload")
+    assert calls["model_kwargs"]["offload_state_dict"] is True
+    assert calls["model_kwargs"]["low_cpu_mem_usage"] is True
+
+
+def test_load_sparse_cache_model_patches_transformers_and_uses_device_map_zero(monkeypatch, tmp_path: Path):
+    module = _load_module()
+    calls = {}
+
+    class FakeConfig:
+        torch_dtype = "float32"
+        decoder_start_token_id = 2
+        bos_token_id = None
+        model_type = "nllb-moe"
+
+    class FakeTokenizer:
+        pad_token_id = 1
+        eos_token = "</s>"
+
+    class FakeModel:
+        config = FakeConfig()
+        generation_config = SimpleNamespace(decoder_start_token_id=None, bos_token_id=None)
+
+        def eval(self):
+            calls["eval_called"] = True
+            return self
+
+    class FakeAutoConfig:
+        @staticmethod
+        def from_pretrained(path, trust_remote_code, local_files_only):
+            calls["config"] = (path, trust_remote_code, local_files_only)
+            return FakeConfig()
+
+    class FakeAutoTokenizer:
+        @staticmethod
+        def from_pretrained(path, trust_remote_code, local_files_only):
+            calls["tokenizer"] = (path, trust_remote_code, local_files_only)
+            return FakeTokenizer()
+
+    class FakeAutoModel:
+        @staticmethod
+        def from_pretrained(path, **kwargs):
+            calls["model_path"] = path
+            calls["model_kwargs"] = kwargs
+            return FakeModel()
+
+    def fake_hack_transformers(**kwargs):
+        calls["hack_transformers"] = kwargs
+
+    fake_sparse_llm_cache = SimpleNamespace(
+        utils=SimpleNamespace(hack_transformers=fake_hack_transformers)
+    )
+    fake_transformers = SimpleNamespace(
+        AutoConfig=FakeAutoConfig,
+        AutoModelForSeq2SeqLM=FakeAutoModel,
+        AutoTokenizer=FakeAutoTokenizer,
+    )
+    monkeypatch.setitem(sys.modules, "sparse_llm_cache", fake_sparse_llm_cache)
+    monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
+
+    model, tokenizer, config = module.load_sparse_cache_model(
+        tmp_path,
+        device="cuda:0",
+        dtype_name="auto",
+        cache_rate=0.01,
+        cache_policy="lru",
+        per_layer_cache=False,
+    )
+
+    assert isinstance(model, FakeModel)
+    assert isinstance(tokenizer, FakeTokenizer)
+    assert isinstance(config, FakeConfig)
+    assert calls["hack_transformers"] == {
+        "model_id": str(tmp_path),
+        "cache_rate": 0.01,
+        "cache_policy": "lru",
+        "per_layer_cache": False,
+        "num_predict_expert_per_layer": 0,
+        "reorder_experts": False,
+        "early_preempt": False,
+        "chunk_prefetch": False,
+        "predict_input_mode": "no_predict",
+        "pin_memory": True,
+        "enable_model_timer": False,
+    }
+    assert calls["model_kwargs"]["device_map"] == 0
+    assert calls["model_kwargs"]["torch_dtype"] is torch.float32
+    assert calls["model_kwargs"]["local_files_only"] is True
+    assert calls["eval_called"]
 
 
 def test_decoder_start_token_id_falls_back_to_tokenizer_pad_id():
@@ -167,6 +467,61 @@ def test_extract_router_mask_accepts_router_tuple_output():
     assert extracted is mask
 
 
+def test_extract_router_mask_prefers_nllb_router_probs_for_top2_dispatch():
+    module = _load_module()
+    top_1_mask = torch.tensor(
+        [
+            [1, 0, 0, 0],
+            [0, 1, 0, 0],
+            [0, 0, 1, 0],
+        ],
+        dtype=torch.int64,
+    )
+    router_probs = torch.tensor(
+        [
+            [0.7, 0.0, 0.3, 0.0],
+            [0.0, 0.6, 0.0, 0.4],
+            [0.0, 0.0, 1.0, 0.0],
+        ],
+        dtype=torch.float32,
+    )
+
+    extracted = module.extract_router_mask(
+        (top_1_mask, router_probs),
+        num_experts=4,
+        model_type="nllb-moe",
+    )
+
+    assert extracted is router_probs
+
+
+def test_extract_router_mask_rejects_invalid_nllb_router_probs_without_top1_fallback():
+    module = _load_module()
+    top_1_mask = torch.tensor(
+        [
+            [1, 0, 0, 0],
+            [0, 1, 0, 0],
+            [0, 0, 1, 0],
+        ],
+        dtype=torch.int64,
+    )
+    wrong_expert_count = torch.ones(3, 3, dtype=torch.float32)
+
+    not_a_tensor = module.extract_router_mask(
+        (top_1_mask, None),
+        num_experts=4,
+        model_type="nllb-moe",
+    )
+    wrong_shape = module.extract_router_mask(
+        (top_1_mask, wrong_expert_count),
+        num_experts=4,
+        model_type="nllb-moe",
+    )
+
+    assert not_a_tensor is None
+    assert wrong_shape is None
+
+
 def test_extract_router_mask_rejects_plain_classifier_logits():
     module = _load_module()
     logits = torch.randn(2, 4, 8)
@@ -182,6 +537,73 @@ def test_router_hook_selection_is_limited_to_router_modules():
     assert module._looks_like_router_module("encoder.block.1.layer.1.mlp.router")
     assert not module._looks_like_router_module("encoder.block.1.layer.1.mlp")
     assert not module._looks_like_router_module("encoder.block.1.layer.1.mlp.router.classifier")
+
+
+def test_sparse_cache_nllb_hooks_collect_encoder_and_decoder_router_probs():
+    module = _load_module()
+
+    class FakeHandle:
+        def __init__(self):
+            self.removed = False
+
+        def remove(self):
+            self.removed = True
+
+    class FakeSparseMlp:
+        def __init__(self, stage: str, stage_layer_id: int, block_id: int):
+            self._stage = stage
+            self._stage_layer_id = stage_layer_id
+            self._nllb_block_id = block_id
+            self.handles = []
+
+        def register_forward_hook(self, hook):
+            self.hook = hook
+            handle = FakeHandle()
+            self.handles.append(handle)
+            return handle
+
+    class FakeModel:
+        def __init__(self):
+            self.encoder_mlp = FakeSparseMlp("encoder", 0, 3)
+            self.decoder_mlp = FakeSparseMlp("decoder", 0, 3)
+
+        def named_modules(self):
+            return [
+                ("model.encoder.layers.3.ffn", self.encoder_mlp),
+                ("model.decoder.layers.3.ffn", self.decoder_mlp),
+            ]
+
+    model = FakeModel()
+    collector = module.RouterHotExpertCollector(router_topk=2)
+
+    handles = module.install_sparse_cache_nllb_router_hooks(
+        model=model,
+        config=SimpleNamespace(model_type="nllb-moe", num_experts=4),
+        collector=collector,
+    )
+
+    encoder_probs = torch.tensor(
+        [
+            [0.7, 0.0, 0.3, 0.0],
+            [0.0, 0.6, 0.0, 0.4],
+        ],
+        dtype=torch.float32,
+    )
+    decoder_probs = torch.tensor(
+        [
+            [[0.0, 0.5, 0.5, 0.0]],
+        ],
+        dtype=torch.float32,
+    )
+    model.encoder_mlp.hook(model.encoder_mlp, (torch.zeros(1, 2, 8),), (torch.zeros(1, 2, 8), (encoder_probs,)))
+    model.decoder_mlp.hook(model.decoder_mlp, (torch.zeros(1, 1, 8),), (torch.zeros(1, 1, 8), (decoder_probs,)))
+
+    summary = collector.usage_summary()
+    assert summary["encoder.layers.3.ffn.router"]["token_hit_freq"] == {"0": 1, "1": 1, "2": 1, "3": 1}
+    assert summary["decoder.layers.3.ffn.router"]["token_hit_freq"] == {"1": 1, "2": 1}
+    assert collector.encoder_layers() == {"encoder.layers.3.ffn.router"}
+    assert collector.decoder_layers() == {"decoder.layers.3.ffn.router"}
+    assert len(handles) == 2
 
 
 def test_build_payload_matches_expected_hot_expert_shape():
@@ -238,6 +660,61 @@ def test_build_payload_matches_expected_hot_expert_shape():
         {"eid": 3, "count": 4},
         {"eid": 1, "count": 1},
     ]
+
+
+def test_collect_hot_experts_sparse_cache_backend_does_not_request_router_logits(monkeypatch):
+    module = _load_module()
+
+    class FakeHandle:
+        def remove(self):
+            pass
+
+    class FakeTokenizer:
+        pad_token_id = 0
+
+        def __call__(self, _texts, **_kwargs):
+            return {
+                "input_ids": torch.tensor([[1, 2]]),
+                "attention_mask": torch.tensor([[1, 1]]),
+            }
+
+    class FakeModel:
+        def __init__(self):
+            self.collector = None
+            self.generate_kwargs = None
+
+        def generate(self, **kwargs):
+            self.generate_kwargs = kwargs
+            self.collector.add_router_mask(
+                "encoder.layers.3.ffn.router",
+                torch.tensor([[[1.0, 0.0], [0.0, 1.0]]]),
+            )
+
+    def fake_install_sparse_cache_nllb_router_hooks(*, model, config, collector):
+        model.collector = collector
+        return [FakeHandle()]
+
+    monkeypatch.setattr(
+        module,
+        "install_sparse_cache_nllb_router_hooks",
+        fake_install_sparse_cache_nllb_router_hooks,
+    )
+    model = FakeModel()
+
+    module.collect_hot_experts(
+        model=model,
+        tokenizer=FakeTokenizer(),
+        config=SimpleNamespace(model_type="nllb-moe", num_experts=2),
+        prompts=["hello"],
+        device="cpu",
+        router_topk=2,
+        max_new_tokens=1,
+        enc_pad_to=512,
+        max_samples=1,
+        hook_backend="sparse-cache",
+    )
+
+    assert "output_router_logits" not in model.generate_kwargs
 
 
 def test_collect_hot_experts_uses_small_demo_dynamic_padding(monkeypatch):

@@ -337,6 +337,57 @@ def test_build_encoder_balanced_hot_initial_plan_can_fill_missing_slots_sequenti
 
   assert plan == [(1, 3), (1, 0), (1, 1), (0, 2), (0, 0), (0, 1)]
 
+def test_build_encoder_balanced_hot_initial_plan_spills_extra_slots_evenly_to_decoder(tmp_path):
+  payload = {
+    "expert_usage_summary": {
+      "encoder.block.1.layer.1.mlp.router.classifier": {
+        "top_token_counts": [
+          {"eid": 0, "count": 100},
+          {"eid": 1, "count": 90},
+          {"eid": 2, "count": 80},
+          {"eid": 3, "count": 70},
+        ],
+      },
+      "encoder.block.3.layer.1.mlp.router.classifier": {
+        "top_token_counts": [
+          {"eid": 0, "count": 100},
+          {"eid": 1, "count": 90},
+          {"eid": 2, "count": 80},
+          {"eid": 3, "count": 70},
+        ],
+      },
+      "decoder.block.1.layer.2.mlp.router.classifier": {
+        "top_token_counts": [
+          {"eid": 2, "count": 100},
+          {"eid": 3, "count": 90},
+        ],
+      },
+      "decoder.block.3.layer.2.mlp.router.classifier": {
+        "top_token_counts": [
+          {"eid": 1, "count": 100},
+          {"eid": 0, "count": 90},
+        ],
+      },
+    },
+  }
+  path = tmp_path / "hot.json"
+  path.write_text(json.dumps(payload))
+  adapter = SwitchAdapter(SimpleNamespace(config=_switch_config(num_experts=4)), "google/switch-base-128")
+
+  plan = build_encoder_balanced_hot_initial_plan(
+    path,
+    adapter,
+    total_slots=12,
+    allow_sequential_fallback=True,
+  )
+
+  assert plan == [
+    (2, 2), (2, 3),
+    (3, 1), (3, 0),
+    (1, 0), (1, 1), (1, 2), (1, 3),
+    (0, 0), (0, 1), (0, 2), (0, 3),
+  ]
+
 def test_build_encoder_l0_priority_hot_initial_plan_prefers_l0_then_splits_remaining(tmp_path):
   payload = {
     "expert_usage_summary": {

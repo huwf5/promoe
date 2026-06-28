@@ -94,6 +94,12 @@ class ModelAdapter:
   def extract_moe_layer_output_for_predictor(self, output):
     return output[0]
 
+  def erpp_encoder_prefetch_module(self):
+    encoder_blocks = getattr(getattr(self.model, "encoder", None), "block", None)
+    if encoder_blocks is None or len(encoder_blocks) == 0:
+      raise ValueError("ERPP encoder prefetch requires model.encoder.block[0].layer[0]")
+    return encoder_blocks[0].layer[0]
+
   def should_patch_report_experts(self, module) -> bool:
     return True
 

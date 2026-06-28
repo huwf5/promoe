@@ -31,6 +31,11 @@ bool log_erpp_encoder_diagnostics_enabled() {
   const char* flag = std::getenv("SPARSE_CACHE_LOG_ERPP_ENCODER_DIAGNOSTICS");
   return flag != nullptr && flag[0] != '\0' && flag[0] != '0';
 }
+
+bool log_demand_fetch_enabled() {
+  const char* flag = std::getenv("SPARSE_CACHE_LOG_DEMAND_FETCH");
+  return flag != nullptr && flag[0] != '\0' && flag[0] != '0';
+}
 }  // namespace
 
 void ErppEncoderPredictWorker::do_one_task_impl(ErppEncoderPredictJob job) {
@@ -249,6 +254,17 @@ void ExpertUnlockWorker::do_one_task_impl(ExpertHandler *task) {
 void FetchWorker::do_one_task_impl(CopyTask *task) {
   TRACE_EVENT_GURAD(kFetcher, "fetch:" + task->toString());
   const char* request_label = cache_request_label(task->request_type);
+  const bool log_demand_fetch = log_demand_fetch_enabled() && task->request_type == kCacheRequestDemand;
+  if (log_demand_fetch) {
+    LOG(INFO) << "demand_fetch: start L"
+              << task->expert->layer_idx << " E" << task->expert->expert_idx
+              << " P" << task->start_mem_buf_idx << "-" << task->stop_mem_buf_idx
+              << " status=" << task->expert->expert_status.get()
+              << " num_ready=" << task->expert->num_ready
+              << " precise=" << task->is_precise
+              << " forward_epoch=" << task->forward_epoch
+              << " generate_epoch=" << task->generate_epoch;
+  }
   if (log_erpp_encoder_prefetch_enabled() &&
       task->request_type == kCacheRequestEncoderPredictorPrefetch) {
     LOG(INFO) << "fetcher: start encoder_predictor_prefetch L"
@@ -273,7 +289,15 @@ void FetchWorker::do_one_task_impl(CopyTask *task) {
   {
     NVTX_RANGE("fetch/wait_evict L" + std::to_string(task->expert->layer_idx) +
                " E" + std::to_string(task->expert->expert_idx));
+    if (log_demand_fetch) {
+      LOG(INFO) << "demand_fetch: wait_evict begin L"
+                << task->expert->layer_idx << " E" << task->expert->expert_idx;
+    }
     task->lambda_wait();
+    if (log_demand_fetch) {
+      LOG(INFO) << "demand_fetch: wait_evict done L"
+                << task->expert->layer_idx << " E" << task->expert->expert_idx;
+    }
   }
   {
     size_t total_nbytes = 0;
@@ -287,6 +311,13 @@ void FetchWorker::do_one_task_impl(CopyTask *task) {
                "-" + std::to_string(task->stop_mem_buf_idx) +
                " chunks=" + std::to_string(task->stop_mem_buf_idx - task->start_mem_buf_idx) +
                " bytes=" + std::to_string(total_nbytes));
+    if (log_demand_fetch) {
+      LOG(INFO) << "demand_fetch: h2d enqueue begin L"
+                << task->expert->layer_idx << " E" << task->expert->expert_idx
+                << " P" << task->start_mem_buf_idx << "-" << task->stop_mem_buf_idx
+                << " chunks=" << (task->stop_mem_buf_idx - task->start_mem_buf_idx)
+                << " bytes=" << total_nbytes;
+    }
     for (int mem_buf_idx = task->start_mem_buf_idx; mem_buf_idx < task->stop_mem_buf_idx; mem_buf_idx++) {
       // LOG(ERROR) << "fetcher: copy from " << task->expert->host_data.ptr(mem_buf_idx) << " to " << task->expert->gpu_data->ptr(mem_buf_idx);
       CUDA_CALL(cudaMemcpyAsync(
@@ -294,6 +325,10 @@ void FetchWorker::do_one_task_impl(CopyTask *task) {
         task->expert->host_data->ptr(mem_buf_idx),
         task->expert->host_data->nbytes(mem_buf_idx),
         cudaMemcpyHostToDevice, this->stream));
+    }
+    if (log_demand_fetch) {
+      LOG(INFO) << "demand_fetch: h2d enqueue done L"
+                << task->expert->layer_idx << " E" << task->expert->expert_idx;
     }
   }
   if (task->start_mem_buf_idx == 0) {
@@ -306,7 +341,17 @@ void FetchWorker::do_one_task_impl(CopyTask *task) {
   {
     NVTX_RANGE("fetch/sync L" + std::to_string(task->expert->layer_idx) +
                " E" + std::to_string(task->expert->expert_idx));
+    if (log_demand_fetch) {
+      LOG(INFO) << "demand_fetch: stream_sync begin L"
+                << task->expert->layer_idx << " E" << task->expert->expert_idx;
+    }
     CUDA_CALL(cudaStreamSynchronize(this->stream));
+    if (log_demand_fetch) {
+      LOG(INFO) << "demand_fetch: stream_sync done L"
+                << task->expert->layer_idx << " E" << task->expert->expert_idx
+                << " status=" << task->expert->expert_status.get()
+                << " num_ready=" << task->expert->num_ready;
+    }
   }
   if (log_erpp_encoder_prefetch_enabled() &&
       task->request_type == kCacheRequestEncoderPredictorPrefetch) {
@@ -324,6 +369,11 @@ void FetchWorker::do_one_task_impl(CopyTask *task) {
               << " request=" << request_label
               << " forward_epoch=" << task->forward_epoch
               << " generate_epoch=" << task->generate_epoch;
+  }
+  if (log_demand_fetch) {
+    LOG(INFO) << "demand_fetch: notify_copy_done L"
+              << task->expert->layer_idx << " E" << task->expert->expert_idx
+              << " P" << task->start_mem_buf_idx << "-" << task->stop_mem_buf_idx;
   }
   fetch_schedule_thread->add_one_task(&fetch_schedule_thread->copy_done_task);
 }

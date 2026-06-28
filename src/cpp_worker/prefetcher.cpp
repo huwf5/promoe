@@ -1,5 +1,6 @@
 #include <omp.h>
 #include <algorithm>
+#include <atomic>
 #include <climits>
 #include <cmath>
 #include <cstdlib>
@@ -31,6 +32,18 @@ class AtomicQueueLockGuard {
 bool log_prefetch_decision_enabled() {
   const char* flag = std::getenv("SPARSE_CACHE_LOG_PREFETCH_DECISION");
   return flag != nullptr && flag[0] != '\0' && flag[0] != '0';
+}
+
+bool log_demand_fetch_enabled() {
+  const char* flag = std::getenv("SPARSE_CACHE_LOG_DEMAND_FETCH");
+  return flag != nullptr && flag[0] != '\0' && flag[0] != '0';
+}
+
+bool should_log_prefetch_scan_decision() {
+  constexpr int64_t kScanLogEveryCalls = 10000;
+  static std::atomic<int64_t> scan_log_counter{0};
+  const int64_t count = scan_log_counter.fetch_add(1, std::memory_order_relaxed) + 1;
+  return count == 1 || count % kScanLogEveryCalls == 0;
 }
 
 bool log_encoder_layer_stats_enabled() {
@@ -184,27 +197,27 @@ int64_t FetchScheduleWorker::flatten_expert(int layer_idx, int expert_idx) const
   return int64_t(layer_idx) * int64_t(metas->num_expert) + int64_t(expert_idx);
 }
 
-void FetchScheduleWorker::ensure_reclaimable_pending_initialized() {
-  if (pending_reclaimable_updates.size() != static_cast<size_t>(metas->num_layer)) {
-    pending_reclaimable_updates.resize(metas->num_layer);
+void FetchScheduleWorker::ensure_cache_policy_pending_initialized() {
+  if (pending_cache_policy_updates.size() != static_cast<size_t>(metas->num_layer)) {
+    pending_cache_policy_updates.resize(metas->num_layer);
   }
-  if (pending_reclaimable_layer_mask.size() != static_cast<size_t>(metas->num_layer)) {
-    pending_reclaimable_layer_mask.assign(metas->num_layer, 0);
+  if (pending_cache_policy_layer_mask.size() != static_cast<size_t>(metas->num_layer)) {
+    pending_cache_policy_layer_mask.assign(metas->num_layer, 0);
   }
 }
 
-void FetchScheduleWorker::reset_pending_reclaimable_updates() {
-  AtomicQueueLockGuard guard(reclaimable_update_lock);
-  pending_reclaimable_updates.assign(metas->num_layer, PendingReclaimableUpdate());
-  pending_reclaimable_layers.clear();
-  pending_reclaimable_layer_mask.assign(metas->num_layer, 0);
-  has_pending_reclaimable_updates.store(false, std::memory_order_release);
+void FetchScheduleWorker::reset_pending_cache_policy_updates() {
+  AtomicQueueLockGuard guard(cache_policy_update_lock);
+  pending_cache_policy_updates.assign(metas->num_layer, PendingCachePolicyUpdate());
+  pending_cache_policy_layers.clear();
+  pending_cache_policy_layer_mask.assign(metas->num_layer, 0);
+  has_pending_cache_policy_updates.store(false, std::memory_order_release);
 }
 
-void FetchScheduleWorker::note_pending_reclaimable_layer_locked(int layer_idx) {
-  if (!pending_reclaimable_layer_mask[layer_idx]) {
-    pending_reclaimable_layer_mask[layer_idx] = 1;
-    pending_reclaimable_layers.push_back(layer_idx);
+void FetchScheduleWorker::note_pending_cache_policy_layer_locked(int layer_idx) {
+  if (!pending_cache_policy_layer_mask[layer_idx]) {
+    pending_cache_policy_layer_mask[layer_idx] = 1;
+    pending_cache_policy_layers.push_back(layer_idx);
   }
 }
 
@@ -214,10 +227,10 @@ void FetchScheduleWorker::enqueue_layer_reclaimable_except(
   if (!metas->is_encoder_layer(layer_idx)) {
     return;
   }
-  AtomicQueueLockGuard guard(reclaimable_update_lock);
-  ensure_reclaimable_pending_initialized();
-  auto& pending = pending_reclaimable_updates[layer_idx];
-  if (pending.mode == PendingReclaimableUpdate::kLayerAll) {
+  AtomicQueueLockGuard guard(cache_policy_update_lock);
+  ensure_cache_policy_pending_initialized();
+  auto& pending = pending_cache_policy_updates[layer_idx];
+  if (pending.mode == PendingCachePolicyUpdate::kLayerAll) {
     return;
   }
 
@@ -225,7 +238,7 @@ void FetchScheduleWorker::enqueue_layer_reclaimable_except(
   if (merged.size() != static_cast<size_t>(metas->num_expert)) {
     merged.resize(metas->num_expert, 0);
   }
-  if (pending.mode == PendingReclaimableUpdate::kSomeExperts) {
+  if (pending.mode == PendingCachePolicyUpdate::kSomeExperts) {
     if (pending.expert_mask.size() != static_cast<size_t>(metas->num_expert)) {
       pending.expert_mask.resize(metas->num_expert, 0);
     }
@@ -234,7 +247,7 @@ void FetchScheduleWorker::enqueue_layer_reclaimable_except(
         merged[expert_idx] = 0;
       }
     }
-  } else if (pending.mode == PendingReclaimableUpdate::kLayerExcept) {
+  } else if (pending.mode == PendingCachePolicyUpdate::kLayerExcept) {
     if (pending.needed_mask.size() != static_cast<size_t>(metas->num_expert)) {
       pending.needed_mask.resize(metas->num_expert, 0);
     }
@@ -243,26 +256,56 @@ void FetchScheduleWorker::enqueue_layer_reclaimable_except(
     }
   }
 
-  pending.mode = PendingReclaimableUpdate::kLayerExcept;
+  pending.mode = PendingCachePolicyUpdate::kLayerExcept;
   pending.needed_mask = std::move(merged);
   pending.expert_mask.clear();
-  note_pending_reclaimable_layer_locked(layer_idx);
-  has_pending_reclaimable_updates.store(true, std::memory_order_release);
+  note_pending_cache_policy_layer_locked(layer_idx);
+  has_pending_cache_policy_updates.store(true, std::memory_order_release);
 }
 
-void FetchScheduleWorker::enqueue_expert_reclaimable(int layer_idx, int expert_idx) {
+void FetchScheduleWorker::enqueue_clear_demand_protection(
+    int layer_idx,
+    int expert_idx) {
+  if (layer_idx < 0 || layer_idx >= metas->num_layer) {
+    return;
+  }
+  CHECK(expert_idx >= 0 && expert_idx < metas->num_expert)
+      << "expert index out of range for demand protection clear: " << expert_idx;
+  AtomicQueueLockGuard guard(cache_policy_update_lock);
+  ensure_cache_policy_pending_initialized();
+  auto& pending = pending_cache_policy_updates[layer_idx];
+  if (pending.clear_demand_protection_mask.empty()) {
+    pending.clear_demand_protection_mask.assign(metas->num_expert, 0);
+  }
+  pending.clear_demand_protection_mask[expert_idx] = 1;
+  note_pending_cache_policy_layer_locked(layer_idx);
+  has_pending_cache_policy_updates.store(true, std::memory_order_release);
+}
+
+void FetchScheduleWorker::enqueue_expert_reclaimable(
+    int layer_idx,
+    int expert_idx,
+    bool clear_demand_protection) {
   if (!metas->is_encoder_layer(layer_idx)) {
     return;
   }
   CHECK(expert_idx >= 0 && expert_idx < metas->num_expert)
       << "expert index out of range for reclaimable update: " << expert_idx;
-  AtomicQueueLockGuard guard(reclaimable_update_lock);
-  ensure_reclaimable_pending_initialized();
-  auto& pending = pending_reclaimable_updates[layer_idx];
-  if (pending.mode == PendingReclaimableUpdate::kLayerAll) {
+  AtomicQueueLockGuard guard(cache_policy_update_lock);
+  ensure_cache_policy_pending_initialized();
+  auto& pending = pending_cache_policy_updates[layer_idx];
+  if (clear_demand_protection) {
+    if (pending.clear_demand_protection_mask.empty()) {
+      pending.clear_demand_protection_mask.assign(metas->num_expert, 0);
+    }
+    pending.clear_demand_protection_mask[expert_idx] = 1;
+  }
+  if (pending.mode == PendingCachePolicyUpdate::kLayerAll) {
+    note_pending_cache_policy_layer_locked(layer_idx);
+    has_pending_cache_policy_updates.store(true, std::memory_order_release);
     return;
   }
-  if (pending.mode == PendingReclaimableUpdate::kLayerExcept) {
+  if (pending.mode == PendingCachePolicyUpdate::kLayerExcept) {
     if (expert_idx >= 0 && expert_idx < static_cast<int>(pending.needed_mask.size())) {
       pending.needed_mask[expert_idx] = 0;
     }
@@ -270,63 +313,69 @@ void FetchScheduleWorker::enqueue_expert_reclaimable(int layer_idx, int expert_i
     if (pending.expert_mask.empty()) {
       pending.expert_mask.assign(metas->num_expert, 0);
     }
-    pending.mode = PendingReclaimableUpdate::kSomeExperts;
+    pending.mode = PendingCachePolicyUpdate::kSomeExperts;
     pending.expert_mask[expert_idx] = 1;
   }
-  note_pending_reclaimable_layer_locked(layer_idx);
-  has_pending_reclaimable_updates.store(true, std::memory_order_release);
+  note_pending_cache_policy_layer_locked(layer_idx);
+  has_pending_cache_policy_updates.store(true, std::memory_order_release);
 }
 
 void FetchScheduleWorker::enqueue_layer_reclaimable(int layer_idx) {
   if (!metas->is_encoder_layer(layer_idx)) {
     return;
   }
-  AtomicQueueLockGuard guard(reclaimable_update_lock);
-  ensure_reclaimable_pending_initialized();
-  auto& pending = pending_reclaimable_updates[layer_idx];
-  pending.mode = PendingReclaimableUpdate::kLayerAll;
+  AtomicQueueLockGuard guard(cache_policy_update_lock);
+  ensure_cache_policy_pending_initialized();
+  auto& pending = pending_cache_policy_updates[layer_idx];
+  pending.mode = PendingCachePolicyUpdate::kLayerAll;
   pending.expert_mask.clear();
   pending.needed_mask.clear();
-  note_pending_reclaimable_layer_locked(layer_idx);
-  has_pending_reclaimable_updates.store(true, std::memory_order_release);
+  note_pending_cache_policy_layer_locked(layer_idx);
+  has_pending_cache_policy_updates.store(true, std::memory_order_release);
 }
 
-void FetchScheduleWorker::drain_reclaimable_updates(int max_updates) {
-  if (!has_pending_reclaimable_updates.load(std::memory_order_acquire)) {
+void FetchScheduleWorker::drain_cache_policy_updates(int max_updates) {
+  if (!has_pending_cache_policy_updates.load(std::memory_order_acquire)) {
     return;
   }
 
-  std::vector<PendingReclaimableUpdate> local_updates;
+  std::vector<PendingCachePolicyUpdate> local_updates;
   std::vector<int> local_layers;
 
   {
-    AtomicQueueLockGuard guard(reclaimable_update_lock);
-    ensure_reclaimable_pending_initialized();
+    AtomicQueueLockGuard guard(cache_policy_update_lock);
+    ensure_cache_policy_pending_initialized();
 
     int drained = 0;
     std::vector<int> remaining_layers;
-    for (int layer_idx : pending_reclaimable_layers) {
+    for (int layer_idx : pending_cache_policy_layers) {
       if (max_updates >= 0 && drained >= max_updates) {
         remaining_layers.push_back(layer_idx);
         continue;
       }
       local_layers.push_back(layer_idx);
-      local_updates.push_back(std::move(pending_reclaimable_updates[layer_idx]));
-      pending_reclaimable_updates[layer_idx] = PendingReclaimableUpdate();
-      pending_reclaimable_layer_mask[layer_idx] = 0;
+      local_updates.push_back(std::move(pending_cache_policy_updates[layer_idx]));
+      pending_cache_policy_updates[layer_idx] = PendingCachePolicyUpdate();
+      pending_cache_policy_layer_mask[layer_idx] = 0;
       drained += 1;
     }
 
-    pending_reclaimable_layers.swap(remaining_layers);
-    has_pending_reclaimable_updates.store(!pending_reclaimable_layers.empty(),
+    pending_cache_policy_layers.swap(remaining_layers);
+    has_pending_cache_policy_updates.store(!pending_cache_policy_layers.empty(),
                                           std::memory_order_release);
   }
 
   for (size_t i = 0; i < local_layers.size(); i++) {
     const int layer_idx = local_layers[i];
     const auto& update = local_updates[i];
+    for (int expert_idx = 0; expert_idx < metas->num_expert; expert_idx++) {
+      if (expert_idx < static_cast<int>(update.clear_demand_protection_mask.size()) &&
+          update.clear_demand_protection_mask[expert_idx]) {
+        cache->clear_demand_protected(layer_idx, expert_idx);
+      }
+    }
     switch (update.mode) {
-      case PendingReclaimableUpdate::kSomeExperts: {
+      case PendingCachePolicyUpdate::kSomeExperts: {
         for (int expert_idx = 0; expert_idx < metas->num_expert; expert_idx++) {
           if (expert_idx < static_cast<int>(update.expert_mask.size()) &&
               update.expert_mask[expert_idx]) {
@@ -335,15 +384,15 @@ void FetchScheduleWorker::drain_reclaimable_updates(int max_updates) {
         }
         break;
       }
-      case PendingReclaimableUpdate::kLayerExcept: {
+      case PendingCachePolicyUpdate::kLayerExcept: {
         cache->mark_layer_reclaimable_except(layer_idx, update.needed_mask);
         break;
       }
-      case PendingReclaimableUpdate::kLayerAll: {
+      case PendingCachePolicyUpdate::kLayerAll: {
         cache->mark_layer_reclaimable(layer_idx);
         break;
       }
-      case PendingReclaimableUpdate::kNone: {
+      case PendingCachePolicyUpdate::kNone: {
         break;
       }
     }
@@ -1037,6 +1086,7 @@ void FetchScheduleWorker::start_forward_epoch(
     int64_t forward_epoch,
     DecoderWarmupAction decoder_warmup_action) {
   if (forward_epoch > current_forward_epoch) {
+    cache->clear_all_demand_protected();
     current_forward_epoch = forward_epoch;
     current_layer = -1;
     clear_encoder_jit_state();
@@ -1062,6 +1112,7 @@ void FetchScheduleWorker::start_forward_epoch(
 
 void FetchScheduleWorker::advance_actual_layer(int64_t forward_epoch, int layer_idx) {
   if (forward_epoch > current_forward_epoch) {
+    cache->clear_all_demand_protected();
     current_forward_epoch = forward_epoch;
     current_layer = -1;
     clear_encoder_jit_state();
@@ -1070,6 +1121,9 @@ void FetchScheduleWorker::advance_actual_layer(int64_t forward_epoch, int layer_
     precise_job_queue.clear();
   }
   if (forward_epoch == current_forward_epoch && layer_idx > current_layer) {
+    if (current_layer >= 0) {
+      cache->clear_demand_protected_for_layer(current_layer);
+    }
     current_layer = layer_idx;
   }
   if (metas->is_decoder_layer(layer_idx)) {
@@ -1082,6 +1136,7 @@ void FetchScheduleWorker::preempt_one_expert(int layer_idx, int64_t expert_idx) 
   TRACE_EVENT_GURAD(kFetchScheduler, "preemot_one_expert");
 
   auto e = model_loader->get_source(layer_idx, expert_idx);
+  cache->mark_demand_protected(e);
 
   if (cache->is_in_cache(e) == false) {
     // a completely missed expert
@@ -1139,6 +1194,7 @@ void FetchScheduleWorker::preempt_one_layer_without_reorder_(int layer_idx, int6
       LOG(TRACE) << "scheduler: skip duplicate demand expert " << e->toString();
       continue;
     }
+    cache->mark_demand_protected(e);
 
     // a completely missed expert
     if (cache->is_in_cache(e) == false) {
@@ -1229,8 +1285,25 @@ void FetchScheduleWorker::add_separate_tasks_for_one_expert(int layer_idx, int e
   }
 }
 
+void FetchScheduleWorker::requeue_precise_task_front(CopyTask* task) {
+  CHECK(task != nullptr);
+  TaskQueue reordered;
+  reordered.push(*task);
+  while (!precise_job_queue.empty()) {
+    CopyTask queued = precise_job_queue.front();
+    precise_job_queue.pop();
+    reordered.push(queued);
+  }
+  while (!reordered.empty()) {
+    CopyTask queued = reordered.front();
+    reordered.pop();
+    precise_job_queue.push(queued);
+  }
+}
+
 void FetchScheduleWorker::pop_next_task(CopyTask &task, bool &found) {
   found = false;
+  drain_cache_policy_updates();
   // Runtime priority: demand > ERPP encoder prefetch > normal predictor
   // prefetch > decoder warmup overlap.
   if (!precise_job_queue.empty()) {
@@ -1245,8 +1318,7 @@ void FetchScheduleWorker::pop_next_task(CopyTask &task, bool &found) {
     }
     return;
   }
-  drain_reclaimable_updates();
-  if (log_prefetch_decision_enabled()) {
+  if (log_prefetch_decision_enabled() && should_log_prefetch_scan_decision()) {
     LOG(INFO) << "prefetch_decision: scan phase=" << phase
               << " current_layer=" << current_layer
               << " forward_epoch=" << current_forward_epoch
@@ -1494,7 +1566,7 @@ bool FetchScheduleWorker::pop_next_prefetch_for_class(PrefetchClass cls, CopyTas
   }
 
   if (cls == PrefetchClass::kEncoderPredictor || cls == PrefetchClass::kDecoderWarmup) {
-    drain_reclaimable_updates();
+    drain_cache_policy_updates();
   }
   prune_prefetch_class(cls);
   if (!has_pending_prefetch_for_class(cls)) {
@@ -2186,12 +2258,13 @@ void PrefetchMngr::one_expert_done(int layer_id, int expert_id) {
   TRACE_EVENT_GURAD(kHook, "one_expert_done");
   NVTX_RANGE("hook/one_expert_done L" + std::to_string(layer_id) + " E" + std::to_string(expert_id));
   mark_expert_using(layer_id, expert_id);
+  fetch_schedule_thread->enqueue_clear_demand_protection(layer_id, expert_id);
   if (metas->is_encoder_layer(layer_id)) {
     if (log_prefetch_decision_enabled()) {
       LOG(INFO) << "erpp_encoder_prefetch: encoder expert reclaimable L"
                 << layer_id << " E" << expert_id;
     }
-    fetch_schedule_thread->enqueue_expert_reclaimable(layer_id, expert_id);
+    fetch_schedule_thread->enqueue_expert_reclaimable(layer_id, expert_id, false);
   }
 }
 
@@ -2201,6 +2274,13 @@ void PrefetchMngr::wait_expert(int layer_id, int expert_id) {
   LOG(TRACE) << "waiting expert " << expert->toString();
   // model_loader->get_source(layer_id, expert_id)->expert_status.wait(kReady, kLaunching);
   auto current_status = expert->expert_status.get();;
+  if (log_demand_fetch_enabled()) {
+    LOG(INFO) << "demand_wait: begin L" << layer_id << " E" << expert_id
+              << " status=" << current_status
+              << " num_ready=" << expert->num_ready
+              << " forward_epoch=" << forward_epoch
+              << " generate_epoch=" << generate_epoch;
+  }
   if (current_status == kLaunching) {
     cache_stats->hit();
     profiler->add(TimeProfiler::kReadyCnt, 1);
@@ -2211,10 +2291,25 @@ void PrefetchMngr::wait_expert(int layer_id, int expert_id) {
     cache_stats->miss();
     profiler->add(TimeProfiler::kUnreadyCnt, 1);
     // todo: add timing of waiting expert ready
+    if (log_demand_fetch_enabled()) {
+      LOG(INFO) << "demand_wait: wait_status begin L" << layer_id << " E" << expert_id
+                << " from_status=" << current_status;
+    }
     expert->expert_status.wait(kLaunching);
     auto dur = timer.dur_us();
+    if (log_demand_fetch_enabled()) {
+      LOG(INFO) << "demand_wait: wait_status done L" << layer_id << " E" << expert_id
+                << " wait_us=" << dur
+                << " status=" << expert->expert_status.get()
+                << " num_ready=" << expert->num_ready;
+    }
     profiler->add(TimeProfiler::kWaitTime, dur);
     log_encoder_layer_use_stats(layer_id, expert_id, false, true, dur, int(current_status));
+  }
+  if (log_demand_fetch_enabled()) {
+    LOG(INFO) << "demand_wait: ready L" << layer_id << " E" << expert_id
+              << " status=" << expert->expert_status.get()
+              << " num_ready=" << expert->num_ready;
   }
   LOG(TRACE) << "waiting expert " << expert->toString() << " success";
 }
@@ -2588,7 +2683,7 @@ void FetchScheduleWorker::do_one_task_impl(PreemptTask *task) {
   }
 
   clear_prefetch_class_for_layer(PrefetchClass::kDecoderPredictor, task->forward_epoch, task->layer_idx);
-  drain_reclaimable_updates();
+  drain_cache_policy_updates();
   maybe_enqueue_encoder_jit_refill();
 }
 void FetchScheduleWorker::do_one_task_impl(ForwardEpochStartTask *task) {
@@ -2604,7 +2699,8 @@ void FetchScheduleWorker::do_one_task_impl(ResetTask *task) {
   clear_decoder_warmup_plan_queue();
   clear_encoder_jit_state();
   clear_encoder_prefetch_metrics();
-  reset_pending_reclaimable_updates();
+  reset_pending_cache_policy_updates();
+  cache->clear_all_demand_protected();
   current_layer = -1;
   current_forward_epoch = task->next_forward_epoch;
   current_generate_epoch = task->next_generate_epoch;
@@ -2622,7 +2718,7 @@ void FetchScheduleWorker::do_one_task_impl(PreemptOneExpertTask *task) {
   TRACE_EVENT_GURAD(kFetchScheduler, "do preempt one expert");
   NVTX_RANGE("sched/preempt_one L" + std::to_string(task->layer_id) + " E" + std::to_string(task->expert_id));
   this->preempt_one_expert(task->layer_id, task->expert_id);
-  drain_reclaimable_updates();
+  drain_cache_policy_updates();
 }
 
 void FetchScheduleWorker::init(ModuleMeta *metas, ModelLoader *model_loader,
@@ -2639,10 +2735,10 @@ void FetchScheduleWorker::init(ModuleMeta *metas, ModelLoader *model_loader,
   prefetch_queues.decoder_predictor_by_layer.resize(metas->num_layer);
   initialize_encoder_jit_enabled_layer_mask();
   clear_encoder_prefetch_metrics();
-  pending_reclaimable_updates.assign(metas->num_layer, PendingReclaimableUpdate());
-  pending_reclaimable_layers.clear();
-  pending_reclaimable_layer_mask.assign(metas->num_layer, 0);
-  has_pending_reclaimable_updates.store(false, std::memory_order_release);
+  pending_cache_policy_updates.assign(metas->num_layer, PendingCachePolicyUpdate());
+  pending_cache_policy_layers.clear();
+  pending_cache_policy_layer_mask.assign(metas->num_layer, 0);
+  has_pending_cache_policy_updates.store(false, std::memory_order_release);
   this->add_one_task(&this->idle_task);
 }
 void FetchScheduleWorker::do_one_task_impl(FetchDoneTask *_) {
@@ -2807,10 +2903,9 @@ bool FetchScheduleWorker::send_one_job(CopyTask *task) {
   // not nullptr and not 0: normal
   CacheMngr::CacheLineOccupancyWaiter lambda_wait = [](){};
   if (task->expert->gpu_data == nullptr) {
-    if ((task->request_type == kCacheRequestEncoderPredictorPrefetch ||
-         task->request_type == kCacheRequestEncoderJitRefill ||
-         task->request_type == kCacheRequestDecoderWarmupPrefetch) &&
-        task->start_mem_buf_idx > 0) {
+    if (task->start_mem_buf_idx > 0) {
+      LOG(TRACE) << "scheduler: skip task whose partial cache line was evicted before launch: "
+                 << task->toString();
       return false;
     }
     CHECK(task->start_mem_buf_idx == 0);
@@ -2818,6 +2913,24 @@ bool FetchScheduleWorker::send_one_job(CopyTask *task) {
     // a missed task
     LOG(TRACE) << "scheduler: assigning gpu mem for expert " << task->toString();
     lambda_wait = cache_miss(task->expert, task->is_precise, task->request_type);
+    if (task->request_type == kCacheRequestDemand &&
+        task->is_precise &&
+        task->expert->gpu_data == nullptr) {
+      drain_cache_policy_updates();
+      lambda_wait = cache->miss(task->expert, task->is_precise, task->request_type);
+      if (task->expert->gpu_data == nullptr) {
+        if (log_prefetch_decision_enabled() || log_demand_fetch_enabled()) {
+          LOG(INFO) << "prefetch_decision: retry precise demand without legal victim L"
+                    << task->expert->layer_idx
+                    << " E" << task->expert->expert_idx
+                    << " P" << task->start_mem_buf_idx << "-" << task->stop_mem_buf_idx
+                    << " current_layer=" << current_layer
+                    << " forward_epoch=" << current_forward_epoch;
+        }
+        requeue_precise_task_front(task);
+        return false;
+      }
+    }
     if ((task->request_type == kCacheRequestEncoderPredictorPrefetch ||
          task->request_type == kCacheRequestEncoderJitRefill ||
          task->request_type == kCacheRequestDecoderWarmupPrefetch) &&
@@ -2860,12 +2973,8 @@ bool FetchScheduleWorker::send_one_job(CopyTask *task) {
       LOG(TRACE) << "scheduler: a duplicated task is partially done, skip duplicated part: " << task->toString();
       task->start_mem_buf_idx = task->expert->num_ready;
     } else if (task->expert->num_ready < task->start_mem_buf_idx) {
-      LOG(TRACE) << "scheduler: a stale partial task was reset before launch: " << task->toString();
-      if (task->is_precise) {
-        task->start_mem_buf_idx = task->expert->num_ready;
-      } else {
-        return false;
-      }
+      LOG(TRACE) << "scheduler: skip stale partial task reset before launch: " << task->toString();
+      return false;
     } else {
       CHECK(task->expert->num_ready == task->start_mem_buf_idx);
     }

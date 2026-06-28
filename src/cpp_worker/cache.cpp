@@ -556,6 +556,49 @@ int CacheMngr::encoder_layer_cache_occupancy(int layer_idx) const {
   }
   return encoder_layer_cached_count[layer_idx];
 }
+
+void CacheMngr::mark_demand_protected(ExpertHandler* expert) {
+  if (expert == nullptr) {
+    return;
+  }
+  cache_slots->to_slot(expert)->policy->mark_demand_protected(expert);
+}
+
+void CacheMngr::clear_demand_protected(ExpertHandler* expert) {
+  if (expert == nullptr) {
+    return;
+  }
+  cache_slots->to_slot(expert)->policy->clear_demand_protected(expert);
+}
+
+void CacheMngr::clear_demand_protected(int layer_idx, int expert_idx) {
+  if (layer_idx < 0 || layer_idx >= metas->num_layer ||
+      expert_idx < 0 || expert_idx >= metas->num_expert) {
+    return;
+  }
+  clear_demand_protected(model_loader->get_source(layer_idx, expert_idx));
+}
+
+void CacheMngr::clear_demand_protected_for_layer(int layer_idx) {
+  if (layer_idx < 0 || layer_idx >= metas->num_layer) {
+    return;
+  }
+  cache_slots->to_slot(layer_idx)->policy->clear_demand_protected_for_layer(layer_idx);
+}
+
+void CacheMngr::clear_all_demand_protected() {
+  for (auto& slot : cache_slots->slots) {
+    slot.policy->clear_all_demand_protected();
+  }
+}
+
+bool CacheMngr::is_demand_protected(ExpertHandler* expert) const {
+  if (expert == nullptr) {
+    return false;
+  }
+  return cache_slots->to_slot(expert)->policy->is_demand_protected(expert);
+}
+
 ExpertMemHanlderBase* CacheMngr::evict(ExpertHandler *e_to_evict, ExpertHandler *incoming_e, bool reserve_mem) {
   CHECK(false) << "Deprecated";
   TRACE_EVENT_GURAD(kCache, "evict " + e_to_evict->toString());
@@ -640,6 +683,13 @@ CacheMngr::CacheLineOccupancyWaiter CacheMngr::miss(
   } else {
     auto e_to_evict = cache_slot->policy->select_for_evict(incoming_e, request_type);
     if (e_to_evict == nullptr) {
+      if (request_type == kCacheRequestDemand && is_precise) {
+        if (log_prefetch_decision_enabled() || std::getenv("SPARSE_CACHE_LOG_DEMAND_FETCH") != nullptr) {
+          LOG(INFO) << "cache_miss: demand miss has no legal victim"
+                    << " incoming=" << incoming_e->toString();
+        }
+        return [](){};
+      }
       CHECK(is_reclaimable_only_request(request_type))
           << "only reclaimable-only requests may skip eviction";
       if (log_prefetch_decision_enabled()) {
@@ -681,6 +731,16 @@ CacheMngr::CacheLineOccupancyWaiter CacheMngr::miss(
 
 
       auto orig_status = e_to_evict->expert_status.transfer(kReady, kIdle, false);
+      if (log_prefetch_decision_enabled() || std::getenv("SPARSE_CACHE_LOG_DEMAND_FETCH") != nullptr) {
+        LOG(INFO) << "cache_miss: evict victim oldL" << e_to_evict->layer_idx
+                  << " oldE" << e_to_evict->expert_idx
+                  << " old_status=" << orig_status
+                  << " old_num_ready=" << e_to_evict->num_ready
+                  << " incomingL" << incoming_e->layer_idx
+                  << " incomingE" << incoming_e->expert_idx
+                  << " request_type=" << request_type
+                  << " is_precise=" << is_precise;
+      }
       if (orig_status == kUsing || orig_status == kLaunching) {
         lambda_to_wait_expert_occupancy = [e_to_evict]() {
           TRACE_EVENT_GURAD(kFetcher, "waiting " + e_to_evict->toString());
@@ -775,6 +835,7 @@ CachePolicySchedulerAware::~CachePolicySchedulerAware() {
   encoder_map.clear();
   decoder_map.clear();
   reclaimable_map.clear();
+  demand_protected_map.clear();
   node_free_buffer.clear();
 
   auto reset_list = [](LL& list) {
@@ -788,6 +849,7 @@ CachePolicySchedulerAware::~CachePolicySchedulerAware() {
   reset_list(encoder_lru);
   reset_list(decoder_lru);
   reset_list(reclaimable_encoder_lru);
+  reset_list(demand_protected_lru);
 }
 
 bool CachePolicySchedulerAware::reset_for_cache_reset() {
@@ -795,6 +857,7 @@ bool CachePolicySchedulerAware::reset_for_cache_reset() {
   encoder_map.clear();
   decoder_map.clear();
   reclaimable_map.clear();
+  demand_protected_map.clear();
   node_free_buffer.clear();
 
   auto reset_list = [](LL& list) {
@@ -808,6 +871,7 @@ bool CachePolicySchedulerAware::reset_for_cache_reset() {
   reset_list(encoder_lru);
   reset_list(decoder_lru);
   reset_list(reclaimable_encoder_lru);
+  reset_list(demand_protected_lru);
   return true;
 }
 
@@ -871,6 +935,51 @@ void CachePolicySchedulerAware::mark_reclaimable(ExpertHandler* expert) {
   touch(reclaimable_map, reclaimable_encoder_lru, expert);
 }
 
+void CachePolicySchedulerAware::mark_demand_protected(ExpertHandler* expert) {
+  if (expert == nullptr) {
+    return;
+  }
+  touch(demand_protected_map, demand_protected_lru, expert);
+}
+
+void CachePolicySchedulerAware::clear_demand_protected(ExpertHandler* expert) {
+  if (expert == nullptr) {
+    return;
+  }
+  auto it = demand_protected_map.find(expert);
+  if (it == demand_protected_map.end()) {
+    return;
+  }
+  auto node = demand_protected_lru.remove(it->second);
+  recycle_node(node);
+  demand_protected_map.erase(it);
+}
+
+void CachePolicySchedulerAware::clear_demand_protected_for_layer(int layer_idx) {
+  std::vector<ExpertHandler*> to_clear;
+  for (auto& pair : demand_protected_map) {
+    auto expert = pair.first;
+    if (expert != nullptr && expert->layer_idx == layer_idx) {
+      to_clear.push_back(expert);
+    }
+  }
+  for (auto expert : to_clear) {
+    clear_demand_protected(expert);
+  }
+}
+
+void CachePolicySchedulerAware::clear_all_demand_protected() {
+  for (auto& pair : demand_protected_map) {
+    auto node = demand_protected_lru.remove(pair.second);
+    recycle_node(node);
+  }
+  demand_protected_map.clear();
+}
+
+bool CachePolicySchedulerAware::is_demand_protected(ExpertHandler* expert) const {
+  return expert != nullptr && demand_protected_map.find(expert) != demand_protected_map.end();
+}
+
 void CachePolicySchedulerAware::evict(ExpertHandler* expert) {
   auto erase_from = [this, expert](std::unordered_map<ExpertHandler*, LL::Node*>& map, LL& list) {
     auto it = map.find(expert);
@@ -885,6 +994,7 @@ void CachePolicySchedulerAware::evict(ExpertHandler* expert) {
   erase_from(encoder_map, encoder_lru);
   erase_from(decoder_map, decoder_lru);
   erase_from(reclaimable_map, reclaimable_encoder_lru);
+  erase_from(demand_protected_map, demand_protected_lru);
 }
 
 ExpertHandler* CachePolicySchedulerAware::first_loaded_candidate(
@@ -892,9 +1002,17 @@ ExpertHandler* CachePolicySchedulerAware::first_loaded_candidate(
     LL& list) {
   for (auto node = list.front(); node != &list.guard_tail; node = node->next) {
     auto expert = node->data;
-    if (map.find(expert) != map.end() && cache->is_in_cache_ptr(expert)) {
-      return expert;
+    if (map.find(expert) == map.end() || !cache->is_in_cache_ptr(expert)) {
+      continue;
     }
+    auto status = expert->expert_status.get();
+    if (status == kLaunching || status == kUsing) {
+      continue;
+    }
+    if (is_demand_protected(expert)) {
+      continue;
+    }
+    return expert;
   }
   return nullptr;
 }
@@ -930,6 +1048,10 @@ ExpertHandler* CachePolicySchedulerAware::select_for_evict(
   if (auto victim = first_loaded_candidate(global_map, global_lru)) {
     return victim;
   }
+  // demand miss has no legal victim because the cache capacity is not enough for all demand experts
+  if (request_type == kCacheRequestDemand) {
+    return nullptr;
+  }
   CHECK(false) << "scheduler_aware policy could not choose victim for incoming "
                << incoming->toString();
   return nullptr;
@@ -941,6 +1063,7 @@ std::string CachePolicySchedulerAware::toString() {
      << ",encoder=" << encoder_map.size()
      << ",decoder=" << decoder_map.size()
      << ",reclaimable=" << reclaimable_map.size()
+     << ",protected=" << demand_protected_map.size()
      << ")";
   return ss.str();
 }
@@ -952,6 +1075,67 @@ void CachePolicyFIFO::access_on_miss(ExpertHandler *e) { fifo_queue.push(e); }
 ExpertHandler *CachePolicyFIFO::select_for_evict(ExpertHandler *) {
   return fifo_queue.front();
 }
+ExpertHandler *CachePolicyLRU::select_for_evict(ExpertHandler *) {
+  for (auto node = linked_list.front(); node != &linked_list.guard_tail; node = node->next) {
+    auto e = node->data;
+    if (map.find(e) == map.end() || !cache->is_in_cache_ptr(e)) {
+      continue;
+    }
+    auto status = e->expert_status.get();
+    if (status == kLaunching || status == kUsing) {
+      continue;
+    }
+    if (is_demand_protected(e)) {
+      continue;
+    }
+    return e;
+  }
+  return nullptr;
+}
+
+void CachePolicyLRU::evict(ExpertHandler *e) {
+  auto it = map.find(e);
+  CHECK(it != map.end()) << "evict missing LRU expert " << e->toString();
+  auto n = linked_list.remove(it->second);
+  linked_list_node_free_buffer.push_back(n);
+  map.erase(it);
+  demand_protected_experts.erase(e);
+}
+
+void CachePolicyLRU::mark_demand_protected(ExpertHandler* expert) {
+  if (expert == nullptr) {
+    return;
+  }
+  demand_protected_experts.insert(expert);
+}
+
+void CachePolicyLRU::clear_demand_protected(ExpertHandler* expert) {
+  if (expert == nullptr) {
+    return;
+  }
+  demand_protected_experts.erase(expert);
+}
+
+void CachePolicyLRU::clear_demand_protected_for_layer(int layer_idx) {
+  std::vector<ExpertHandler*> experts_to_clear;
+  for (auto expert : demand_protected_experts) {
+    if (expert != nullptr && expert->layer_idx == layer_idx) {
+      experts_to_clear.push_back(expert);
+    }
+  }
+  for (auto expert : experts_to_clear) {
+    clear_demand_protected(expert);
+  }
+}
+
+void CachePolicyLRU::clear_all_demand_protected() {
+  demand_protected_experts.clear();
+}
+
+bool CachePolicyLRU::is_demand_protected(ExpertHandler* expert) const {
+  return demand_protected_experts.find(expert) != demand_protected_experts.end();
+}
+
 void CachePolicyLRU::access_on_hit(ExpertHandler *e) {
   CHECK(map.find(e) != map.end());
   auto n = map[e];

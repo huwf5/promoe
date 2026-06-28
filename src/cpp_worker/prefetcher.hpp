@@ -160,7 +160,7 @@ class FetchScheduleWorker : public WorkerThread<FetchScheduleTaskBase*> {
   };
   SchedulerPhase phase = kEncoderPhase;
   std::unordered_set<int64_t> decoder_warmup_seen;
-  struct PendingReclaimableUpdate {
+  struct PendingCachePolicyUpdate {
     enum Mode {
       kNone = 0,
       kSomeExperts,
@@ -171,12 +171,13 @@ class FetchScheduleWorker : public WorkerThread<FetchScheduleTaskBase*> {
     Mode mode = kNone;
     std::vector<uint8_t> expert_mask;
     std::vector<uint8_t> needed_mask;
+    std::vector<uint8_t> clear_demand_protection_mask;
   };
-  AtomicQueueLock reclaimable_update_lock;
-  std::vector<PendingReclaimableUpdate> pending_reclaimable_updates;
-  std::vector<int> pending_reclaimable_layers;
-  std::vector<uint8_t> pending_reclaimable_layer_mask;
-  std::atomic<bool> has_pending_reclaimable_updates{false};
+  AtomicQueueLock cache_policy_update_lock;
+  std::vector<PendingCachePolicyUpdate> pending_cache_policy_updates;
+  std::vector<int> pending_cache_policy_layers;
+  std::vector<uint8_t> pending_cache_policy_layer_mask;
+  std::atomic<bool> has_pending_cache_policy_updates{false};
   std::vector<std::vector<int64_t>> encoder_jit_rankings;
   std::vector<int> encoder_jit_budgets;
   std::vector<std::vector<uint8_t>> encoder_jit_submitted_mask;
@@ -234,6 +235,7 @@ class FetchScheduleWorker : public WorkerThread<FetchScheduleTaskBase*> {
   void do_one_task_impl(ErppEncoderJitRankingsTask *task);
 
   void pop_next_task(CopyTask &task, bool &found);
+  void requeue_precise_task_front(CopyTask* task);
 
   void add_single_tasks_for_one_expert(int layer_idx, int expert_idx, TaskQueue* queue, int start_mem_buf_idx, int stop_mem_buf_idx, bool is_precise, int64_t forward_epoch, CacheRequestType request_type);
   void add_separate_tasks_for_one_expert(int layer_idx, int expert_idx, TaskQueue *queue, int start_mem_buf_idx, int stop_mem_buf_idx, bool is_precise, int64_t forward_epoch, CacheRequestType request_type);
@@ -270,9 +272,9 @@ class FetchScheduleWorker : public WorkerThread<FetchScheduleTaskBase*> {
   void clear_prefetch_class_up_to_layer(PrefetchClass cls, int layer_idx);
   void clear_prefetch_class_for_layer(PrefetchClass cls, int64_t forward_epoch, int layer_idx);
   int64_t flatten_expert(int layer_idx, int expert_idx) const;
-  void ensure_reclaimable_pending_initialized();
-  void reset_pending_reclaimable_updates();
-  void note_pending_reclaimable_layer_locked(int layer_idx);
+  void ensure_cache_policy_pending_initialized();
+  void reset_pending_cache_policy_updates();
+  void note_pending_cache_policy_layer_locked(int layer_idx);
   bool is_idle();
   void store_erpp_encoder_jit_rankings(const ErppEncoderJitRankingsTask& task);
   void clear_encoder_jit_state() {
@@ -364,6 +366,14 @@ class FetchScheduleWorker : public WorkerThread<FetchScheduleTaskBase*> {
       std::fill(encoder_jit_enabled_layer_mask.begin(),
                 encoder_jit_enabled_layer_mask.end(),
                 1);
+      return;
+    }
+    if (spec == "non_first") {
+      if (encoder_jit_enabled_layer_mask.size() > 1) {
+        std::fill(encoder_jit_enabled_layer_mask.begin() + 1,
+                  encoder_jit_enabled_layer_mask.end(),
+                  1);
+      }
       return;
     }
 
@@ -474,9 +484,10 @@ class FetchScheduleWorker : public WorkerThread<FetchScheduleTaskBase*> {
   void add_one_layer_task(int layer_idx, torch::Tensor experts);
   #endif
   void enqueue_layer_reclaimable_except(int layer_idx, const std::vector<uint8_t>& needed_mask);
-  void enqueue_expert_reclaimable(int layer_idx, int expert_idx);
+  void enqueue_clear_demand_protection(int layer_idx, int expert_idx);
+  void enqueue_expert_reclaimable(int layer_idx, int expert_idx, bool clear_demand_protection);
   void enqueue_layer_reclaimable(int layer_idx);
-  void drain_reclaimable_updates(int max_updates = -1);
+  void drain_cache_policy_updates(int max_updates = -1);
   void init(ModuleMeta *metas, ModelLoader *model_loader, CacheMngr *cache, FetchWorker *fetch_thread, PredictWorker *predict_thread, CacheStatistics *cache_stats, TimeProfiler* profiler);
   void begin_reset_for_generate() {
     reset_requested.store(true, std::memory_order_release);

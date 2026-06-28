@@ -235,6 +235,9 @@ def _resolve_initial_cache_inputs(
   else:
     raise ValueError(f"unsupported initial_cache_policy={initial_cache_policy!r}")
 
+  if per_layer_cache is True:
+    raise ValueError("deterministic initial cache requires per_layer_cache=False")
+
   return {
     # Hot policies also use manual initial plan loading in cpp.
     "initial_cache_policy": "manual",
@@ -243,6 +246,22 @@ def _resolve_initial_cache_inputs(
     "reset_cache_on_generate_start": True,
     "per_layer_cache": False,
   }
+
+def _validate_global_cache_feature_compatibility(
+    per_layer_cache,
+    enable_decoder_warmup_overlap,
+    enable_erpp_encoder_prefetch,
+    enable_erpp_encoder_jit_refill,
+):
+  if per_layer_cache is not True:
+    return
+  if enable_decoder_warmup_overlap:
+    raise ValueError("decoder warmup overlap requires per_layer_cache=False")
+  if enable_erpp_encoder_jit_refill:
+    raise ValueError("ERPP encoder JIT refill requires per_layer_cache=False")
+  if enable_erpp_encoder_prefetch:
+    raise ValueError("ERPP encoder prefetch requires per_layer_cache=False")
+
 
 def _resolve_cache_device_index(cache_device):
   device = torch.device(cache_device)
@@ -408,6 +427,12 @@ def inject_model(
   initial_hot_expert_file = initial_inputs["initial_hot_expert_file"]
   reset_cache_on_generate_start = initial_inputs["reset_cache_on_generate_start"]
   per_layer_cache = initial_inputs["per_layer_cache"]
+  _validate_global_cache_feature_compatibility(
+    per_layer_cache,
+    enable_decoder_warmup_overlap,
+    enable_erpp_encoder_prefetch,
+    enable_erpp_encoder_jit_refill,
+  )
 
   adapter.configure_module_meta(meta)
   initial_plan = None
@@ -569,11 +594,8 @@ def inject_model(
     prefetch_mngr.cache.cache_oracle.load_from_tensor(entry_to_metas, prefill_expert_len, prefill_expert_selection, decode_expert_selection)
 
   if enable_erpp_encoder_prefetch:
-    encoder_blocks = getattr(getattr(model, "encoder", None), "block", None)
-    if encoder_blocks is None or len(encoder_blocks) == 0:
-      raise ValueError("ERPP encoder prefetch requires model.encoder.block[0].layer[0]")
     hooks.add_hook_to_module(
-      encoder_blocks[0].layer[0],
+      adapter.erpp_encoder_prefetch_module(),
       hooks.ErppEncoderPrefetchHook(prefetch_mngr),
       append=True,
     )

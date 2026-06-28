@@ -71,13 +71,33 @@ def prepare_argparser(parser = None):
 
   parser.add_argument("--max_num_batch",                type=int, default=20)
   parser.add_argument("--max_new_tokens",               type=int, default=128)
+  parser.add_argument("--do_sample",                    action=CustomBooleanAction, default=False)
+  parser.add_argument("--num_beams",                    type=int, default=1)
   parser.add_argument("--batch_size",                   type=int, default=1)
   parser.add_argument("--dataset",                      type=str, default='chatgpt-prompts-small')
   return parser
+
+def _validate_per_layer_cache_args(args, parser):
+  if getattr(args, "per_layer_cache", None) is not True:
+    return
+  if getattr(args, "initial_cache_policy", None) is not None:
+    parser.error("deterministic initial cache requires per_layer_cache=False")
+  if getattr(args, "initial_layer_budgets", None):
+    parser.error("deterministic initial cache requires per_layer_cache=False")
+  if getattr(args, "initial_hot_expert_file", None):
+    parser.error("deterministic initial cache requires per_layer_cache=False")
+  if getattr(args, "enable_decoder_warmup_overlap", None):
+    parser.error("decoder warmup overlap requires per_layer_cache=False")
+  if getattr(args, "enable_erpp_encoder_jit_refill", None):
+    parser.error("ERPP encoder JIT refill requires per_layer_cache=False")
+  if getattr(args, "enable_erpp_encoder_prefetch", None):
+    parser.error("ERPP encoder prefetch requires per_layer_cache=False")
+
 
 def parse_args(args = None, parser = None):
   if parser is None:
     parser = prepare_argparser()
   args = parser.parse_args(args)
+  _validate_per_layer_cache_args(args, parser)
 
   return vars(args)

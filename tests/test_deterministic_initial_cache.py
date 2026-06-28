@@ -5,7 +5,7 @@ import pytest
 
 from sparse_llm_cache.model_adapters.base import ModelAdapter
 from sparse_llm_cache.utils.runner_util import parse_args
-from sparse_llm_cache.utils import inject_model, wrap_generate_with_initial_cache, _resolve_initial_cache_inputs
+from sparse_llm_cache.utils import inject_model, wrap_generate_with_initial_cache, _resolve_initial_cache_inputs, _validate_global_cache_feature_compatibility
 
 
 class DummyPrefetchMngr:
@@ -117,7 +117,29 @@ def test_runner_util_rejects_removed_initial_cache_knobs():
     parse_args(["--initial_cache_ready_barrier", "False"])
 
 
+def test_runner_util_rejects_per_layer_cache_global_feature_conflicts():
+  parsed = parse_args(["--per_layer_cache", "True"])
+  assert parsed["per_layer_cache"] is True
+
+  with pytest.raises(SystemExit):
+    parse_args([
+      "--per_layer_cache", "True",
+      "--initial_cache_policy", "hot_expert",
+      "--initial_hot_expert_file", "/tmp/hot.json",
+    ])
+  with pytest.raises(SystemExit):
+    parse_args(["--per_layer_cache", "True", "--enable_decoder_warmup_overlap", "True"])
+  with pytest.raises(SystemExit):
+    parse_args(["--per_layer_cache", "True", "--enable_erpp_encoder_prefetch", "True"])
+  with pytest.raises(SystemExit):
+    parse_args(["--per_layer_cache", "True", "--enable_erpp_encoder_jit_refill", "True"])
+
+
 def test_resolve_initial_cache_inputs_validates_policy_specific_args():
+  default = _resolve_initial_cache_inputs(None, None, None, True)
+  assert default["reset_cache_on_generate_start"] is False
+  assert default["per_layer_cache"] is True
+
   manual = _resolve_initial_cache_inputs("manual", "0:2", None, None)
   assert manual["reset_cache_on_generate_start"] is True
   assert manual["initial_layer_budgets"] == "0:2"
@@ -138,6 +160,41 @@ def test_resolve_initial_cache_inputs_validates_policy_specific_args():
     _resolve_initial_cache_inputs("hot_expert", "0:2", "/tmp/hot.json", None)
   with pytest.raises(ValueError, match="initial_hot_expert_file requires initial_cache_policy=hot_expert"):
     _resolve_initial_cache_inputs(None, None, "/tmp/hot.json", None)
+  with pytest.raises(ValueError, match="deterministic initial cache requires per_layer_cache=False"):
+    _resolve_initial_cache_inputs("manual", "0:2", None, True)
+  with pytest.raises(ValueError, match="deterministic initial cache requires per_layer_cache=False"):
+    _resolve_initial_cache_inputs("hot_expert", None, "/tmp/hot.json", True)
+
+
+def test_validate_global_cache_feature_compatibility_rejects_per_layer_conflicts():
+  _validate_global_cache_feature_compatibility(
+    per_layer_cache=False,
+    enable_decoder_warmup_overlap=True,
+    enable_erpp_encoder_prefetch=True,
+    enable_erpp_encoder_jit_refill=True,
+  )
+
+  with pytest.raises(ValueError, match="decoder warmup overlap requires per_layer_cache=False"):
+    _validate_global_cache_feature_compatibility(
+      per_layer_cache=True,
+      enable_decoder_warmup_overlap=True,
+      enable_erpp_encoder_prefetch=False,
+      enable_erpp_encoder_jit_refill=False,
+    )
+  with pytest.raises(ValueError, match="ERPP encoder prefetch requires per_layer_cache=False"):
+    _validate_global_cache_feature_compatibility(
+      per_layer_cache=True,
+      enable_decoder_warmup_overlap=False,
+      enable_erpp_encoder_prefetch=True,
+      enable_erpp_encoder_jit_refill=False,
+    )
+  with pytest.raises(ValueError, match="ERPP encoder JIT refill requires per_layer_cache=False"):
+    _validate_global_cache_feature_compatibility(
+      per_layer_cache=True,
+      enable_decoder_warmup_overlap=False,
+      enable_erpp_encoder_prefetch=False,
+      enable_erpp_encoder_jit_refill=True,
+    )
 
 
 def test_resolve_initial_cache_inputs_accepts_hot_encoder_coverage():

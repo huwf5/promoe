@@ -11,6 +11,7 @@ CACHE_HPP = REPO_ROOT / "src/cpp_worker/cache.hpp"
 CACHE_CPP = REPO_ROOT / "src/cpp_worker/cache.cpp"
 RUN_SWITCH = REPO_ROOT / "performance/run_switch_mmlu_validation.sh"
 COMPARE_RUN = REPO_ROOT / "performance_baseline/compare/run.sh"
+OUR_RUN_ALL = REPO_ROOT / "experiment/baseline/LSP/our/run_all.sh"
 
 
 def _text(path):
@@ -62,6 +63,76 @@ def test_erpp_layer_parser_supports_all_positive_and_negative_ids():
   assert "empty ERPP encoder layer entry" in body
   assert "normalized.back() != ','" in body
   assert "all" in compact and "cannot be mixed" in compact
+
+def test_erpp_layer_parser_supports_non_first_alias():
+  cpp = _text(ERPP_CPP)
+  body = _function_body(
+    cpp,
+    "std::vector<uint8_t> ErppEncoderPredictor::parse_enabled_layers",
+  )
+  compact = _compact(body)
+
+  assert 'normalized == "non_first"' in body
+  assert "std::fill(enabled.begin() + 1, enabled.end(), 1)" in compact
+  assert "enabled.size() > 1" in body
+
+
+def test_scheduler_jit_refill_layer_parser_supports_non_first_alias():
+  hpp = _text(PREFETCHER_HPP)
+  body = _function_body(hpp, "void initialize_encoder_jit_enabled_layer_mask()")
+  compact = _compact(body)
+
+  assert 'spec == "non_first"' in body
+  assert "std::fill(encoder_jit_enabled_layer_mask.begin() + 1," in compact
+  assert "encoder_jit_enabled_layer_mask.end(), 1)" in compact
+
+
+def test_our_run_all_defaults_erpp_encoder_layers_to_non_first():
+  text = _text(OUR_RUN_ALL)
+
+  assert "ERPP_ENCODER_LAYERS=" in text
+  assert ":-non_first}" in text
+  assert ":-2,3,4,5}" not in text
+  assert "--erpp_encoder_layers" in text
+  assert "ERPP_ENCODER_LAYERS" in text
+
+
+def test_our_run_all_defaults_jit_refill_layers_to_non_first():
+  text = _text(OUR_RUN_ALL)
+
+  assert "ERPP_ENCODER_JIT_REFILL_LAYERS=" in text
+  assert "ERPP_ENCODER_JIT_REFILL_LAYERS:-non_first" in text
+  assert "ERPP_ENCODER_JIT_REFILL_WINDOW:-1" in text
+  assert "ENABLE_ERPP_ENCODER_JIT_TOPK_COVER:-True" in text
+  assert "--erpp_encoder_jit_refill_layers" in text
+  assert "--enable_erpp_encoder_jit_topk_cover" in text
+
+
+def test_our_run_all_does_not_pass_unsupported_erpp_timing_args():
+  text = _text(OUR_RUN_ALL)
+
+  assert "--erpp_encoder_expert_copy_us" not in text
+  assert "--erpp_encoder_expert_compute_us" not in text
+
+
+def test_our_run_all_uses_hidden_only_switch_base_128_ble_predictor():
+  text = _text(OUR_RUN_ALL)
+
+  assert "performance_predictor/encoder/ERPP/implement/model/sida-gru-sa-hard-ce/erpp_encoder_predictor_v2.ts" not in text
+  assert "switch-base-128/sparse-cache-b1-longest-v1/ble/noisyor-from-src-simplenn-token-hardce-h384-l1-drop0p5-lr1e4-bs2-seed0-validtrim/encoder_predictor_ble.ts" in text
+
+
+def test_our_run_all_default_sweep_uses_all_explicit_gpu_profiles_without_default():
+  text = _text(OUR_RUN_ALL)
+  gpu_line = next(line for line in text.splitlines() if line.startswith("GPU_CONFIGS="))
+  model_line = next(line for line in text.splitlines() if line.startswith("MODELS="))
+
+  assert ":-default" not in gpu_line
+  for profile in ("gpu4gb", "gpu8gb", "gpu12gb", "gpu16gb", "gpu24gb", "gpu40gb", "gpu48gb"):
+    assert profile in gpu_line
+  for model in ("switch-base-128", "switch-base-256", "switch-large-128", "nllb"):
+    assert model in model_line
+
 
 def test_cache_request_type_uses_explicit_predictor_prefetch_names():
   hpp = _text(CACHE_HPP)
@@ -125,6 +196,30 @@ def test_erpp_predictor_skips_topk_and_predicted_log_for_disabled_layers():
   disabled_block = body[body.index("!should_prefetch_layer(layer)"):body.index(".topk(limit, -1, true, true)")]
   assert "erpp_encoder_prefetch: predicted layer L" not in disabled_block
   assert "array_to_str" not in disabled_block
+
+
+def test_erpp_predictor_is_hidden_only_and_does_not_use_attention_mask():
+  hpp = _text(ERPP_HPP)
+  cpp = _text(ERPP_CPP)
+  load_body = _function_body(cpp, "void ErppEncoderPredictor::load_model_from")
+  record_body = _function_body(cpp, "void ErppEncoderPredictor::record_encoder_layer0")
+  predict_body = _function_body(cpp, "ErppEncoderPrediction ErppEncoderPredictor::predict_from_cpu_tensors")
+  compact_predict = _compact(predict_body)
+
+  assert "forward_accepts_attention_mask" not in hpp
+  assert "attention_mask_buffer" not in hpp
+  assert "normalize_attention_mask" not in hpp
+  assert 'model.get_method("forward")' in load_body
+  assert "getSchema()" in load_body
+  assert "arguments().size()" in load_body
+  assert "forward_arg_count == 2" in load_body
+  assert "forward(hidden)" in load_body
+  assert "attention_mask_buffer" not in record_body
+  assert "attention_mask_d2h" not in record_body
+  assert "normalize_attention_mask" not in predict_body
+  assert "inputs.push_back(mask)" not in predict_body
+  assert "std::vector<torch::jit::IValue> inputs{hidden_float_cpu}" in predict_body
+  assert compact_predict.index("inputs{hidden_float_cpu}") < compact_predict.index("model.forward(inputs)")
 
 
 def test_erpp_worker_sets_zero_jit_budget_for_disabled_layers():
@@ -485,6 +580,18 @@ def test_erpp_encoder_prefetch_wait_keeps_original_polling_behavior():
   assert "blocked_on_encoder_predictor_prefetch_reclaimable = false" in cpp
   assert "usleep(50)" not in idle_body
   assert "this->add_one_task(&this->idle_task)" in idle_body
+
+
+
+def test_prefetch_scan_decision_log_is_rate_limited():
+  cpp = _text(PREFETCHER_CPP)
+  body = _function_body(cpp, "void FetchScheduleWorker::pop_next_task")
+
+  assert "bool should_log_prefetch_scan_decision()" in cpp
+  assert "kScanLogEveryCalls = 10000" in cpp
+  assert "std::atomic<int64_t> scan_log_counter" in cpp
+  assert "log_prefetch_decision_enabled() && should_log_prefetch_scan_decision()" in body
+  assert 'LOG(INFO) << "prefetch_decision: scan phase="' in body
 
 
 def test_scheduler_prioritizes_erpp_encoder_prefetch_before_other_prefetches():

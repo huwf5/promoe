@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import re
+from pathlib import Path
 
 from sparse_llm_cache.utils.filter import Filter, RegexFilter
 
@@ -153,14 +155,106 @@ class NllbMoeAdapter(ModelAdapter):
     meta.num_decoder_moe_layer = self.num_decoder_sparse_layers
     meta.predictor_num_layer = self.num_moe_layer
 
+  def predictor_layer_id(self, stage: str, global_layer_id: int) -> int:
+    if stage != "decoder":
+      raise ValueError("encoder predictor is not implemented")
+    return global_layer_id
+
+  def should_report_moe_layer_to_predictor(self, stage: str | None, global_layer_id: int) -> bool:
+    return stage == "decoder"
+
+  def should_report_predictor_pre_forward(self, stage: str | None, global_layer_id: int) -> bool:
+    return stage == "decoder" and global_layer_id == self.num_encoder_sparse_layers
+
+  def predictor_input_id_before_layer(self, stage: str | None, global_layer_id: int) -> int:
+    if stage != "decoder":
+      raise ValueError("encoder predictor is not implemented")
+    return global_layer_id
+
+  def predictor_input_id_after_layer(self, stage: str | None, global_layer_id: int) -> int:
+    if stage != "decoder":
+      raise ValueError("encoder predictor is not implemented")
+    return global_layer_id + 1
+
+  def extract_moe_layer_output_for_predictor(self, output):
+    return output[0]
+
   def validate_predictor_path(
     self,
     predictor_model_path: str | None,
     num_predict_expert_per_layer: int | None,
     predictor_type: str | None = None,
   ) -> None:
-    if num_predict_expert_per_layer:
-      raise ValueError("NLLB MoE predictor prefetch is not implemented")
+    if not num_predict_expert_per_layer:
+      return
+    if predictor_model_path is None:
+      raise ValueError("NLLB decoder predictor prefetch requires predictor_model_path")
+    path = Path(predictor_model_path)
+    if not path.exists():
+      raise FileNotFoundError(f"NLLB decoder predictor path does not exist: {path}")
+    metas_path = path / "metas.json"
+    if not metas_path.exists():
+      raise FileNotFoundError(f"NLLB decoder predictor metas.json does not exist: {metas_path}")
+    with metas_path.open() as f:
+      metas = json.load(f)
+    if not isinstance(metas, dict) or int(metas.get("schema_version", 1)) != 2 or metas.get("id_space") != "global":
+      raise ValueError("NLLB decoder predictor requires global v2 metas.json; retrain predictor with global ids")
+    outputs = metas.get("outputs")
+    if not isinstance(outputs, dict):
+      raise ValueError("global v2 predictor metas.json missing outputs")
+
+    first_decoder = self.num_encoder_sparse_layers
+    num_layer = self.num_moe_layer
+    required_sources = {str(i) for i in range(first_decoder, num_layer + 1)}
+    missing = sorted(required_sources - set(outputs.keys()), key=int)
+    if missing:
+      raise ValueError(f"global predictor metas.json missing decoder source layers: {missing}")
+
+    use_legacy_files = predictor_type == "legacy"
+    for src_layer, span in outputs.items():
+      src_layer_id = int(src_layer)
+      if src_layer_id < first_decoder or src_layer_id > num_layer:
+        raise ValueError(
+          f"predictor source id {src_layer_id} outside decoder global boundary range "
+          f"[{first_decoder}, {num_layer}]"
+        )
+      if not isinstance(span, (list, tuple)) or len(span) != 2:
+        raise ValueError(f"global predictor output range for source {src_layer_id} must be [start, stop]")
+      start_layer, stop_layer = int(span[0]), int(span[1])
+      if start_layer < first_decoder or start_layer > stop_layer or stop_layer > num_layer:
+        raise ValueError(
+          f"predictor output range [{start_layer}, {stop_layer}) outside decoder global range "
+          f"[{first_decoder}, {num_layer})"
+        )
+      if start_layer == num_layer and start_layer != stop_layer:
+        raise ValueError(
+          f"predictor output range [{start_layer}, {stop_layer}) outside decoder global range "
+          f"[{first_decoder}, {num_layer})"
+        )
+      if use_legacy_files:
+        if start_layer == stop_layer:
+          continue
+        model_file = path / f"{src_layer_id}.pt"
+        if not model_file.exists():
+          raise FileNotFoundError(f"NLLB decoder predictor model file does not exist: {model_file}")
+        continue
+      for dst_layer_id in range(start_layer, stop_layer):
+        model_file = path / f"{src_layer_id}-{dst_layer_id}.pt"
+        if not model_file.exists():
+          raise FileNotFoundError(f"NLLB decoder predictor model file does not exist: {model_file}")
+
+  def erpp_encoder_prefetch_module(self):
+    encoder = None
+    if hasattr(self.model, "get_encoder"):
+      encoder = self.model.get_encoder()
+    if encoder is None:
+      encoder = getattr(getattr(self.model, "model", None), "encoder", None)
+    if encoder is None:
+      encoder = getattr(self.model, "encoder", None)
+    encoder_layers = getattr(encoder, "layers", None)
+    if encoder_layers is None or len(encoder_layers) == 0:
+      raise ValueError("NLLB ERPP encoder prefetch requires model.get_encoder().layers[0]")
+    return encoder_layers[0]
 
   def should_patch_report_experts(self, module) -> bool:
     return hasattr(module, "report_experts")

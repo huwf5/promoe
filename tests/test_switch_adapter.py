@@ -74,6 +74,35 @@ def test_switch_layer_mapping_is_config_driven_for_other_expert_counts():
     assert adapter.global_layer_id("decoder", 3) == 9
 
 
+def test_switch_adapter_defaults_missing_num_selected_experts_to_top1():
+    config = _switch_config()
+    delattr(config, "num_selected_experts")
+    model = SimpleNamespace(config=config)
+
+    adapter = SwitchAdapter(model, "google/switch-large-128")
+
+    assert adapter.num_expert_per_token == 1
+    assert model.config.num_selected_experts == 1
+
+
+def test_switch_adapter_supports_switch_large_sparse_layout_without_num_selected_experts():
+    config = _switch_config(
+        num_sparse_encoder_layers=12,
+        num_sparse_decoder_layers=12,
+        num_layers=24,
+        num_decoder_layers=24,
+    )
+    delattr(config, "num_selected_experts")
+
+    adapter = SwitchAdapter(SimpleNamespace(config=config), "google/switch-large-128")
+
+    assert adapter.encoder_sparse_layer_ids == [1, 3, 5, 7, 9, 11, 13, 15, 17, 19, 21, 23]
+    assert adapter.decoder_sparse_layer_ids == [1, 3, 5, 7, 9, 11, 13, 15, 17, 19, 21, 23]
+    assert adapter.num_moe_layer == 24
+    assert adapter.global_layer_id("decoder", 0) == 12
+    assert adapter.global_layer_id("decoder", 11) == 23
+
+
 def test_switch_adapter_rejects_non_top1_switch():
     model = SimpleNamespace(config=_switch_config(num_selected_experts=2))
     with pytest.raises(ValueError, match="top-1"):

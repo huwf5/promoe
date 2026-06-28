@@ -5,7 +5,9 @@ import pytest
 import torch
 
 from sparse_llm_cache.model_adapters.switch import SwitchAdapter
+from sparse_llm_cache.model_adapters.nllb_moe import NllbMoeAdapter
 from sparse_llm_cache.utils.hooks import MoeLayerHook
+from tests.test_nllb_moe_adapter import _nllb_config
 from tests.test_switch_adapter import _switch_config
 
 
@@ -140,3 +142,43 @@ def test_switch_validate_predictor_path_accepts_empty_legacy_output_range_withou
     (tmp_path / "12.pt").unlink()
 
     adapter.validate_predictor_path(str(tmp_path), num_predict_expert_per_layer=2, predictor_type="legacy")
+
+
+def test_nllb_moe_layer_hook_reports_decoder_only_global_ids():
+    adapter = NllbMoeAdapter(SimpleNamespace(config=_nllb_config()), "facebook/nllb-moe-54b")
+    prefetch = RecordingPrefetchMngr()
+    hook = MoeLayerHook(prefetch, adapter=adapter)
+    encoder_module = SimpleNamespace(_stage="encoder", _layer_id=1)
+    first_decoder = SimpleNamespace(_stage="decoder", _layer_id=6)
+    later_decoder = SimpleNamespace(_stage="decoder", _layer_id=7)
+    x = torch.zeros(1, 1, 4)
+    out = torch.ones(1, 1, 4)
+
+    hook.pre_forward(encoder_module, x)
+    hook.post_forward(encoder_module, out)
+    hook.pre_forward(first_decoder, x)
+    hook.post_forward(later_decoder, (out,))
+
+    assert len(prefetch.logit_reports) == 2
+    assert prefetch.logit_reports[0][0] == 6
+    assert prefetch.logit_reports[0][1] is x
+    assert prefetch.logit_reports[1][0] == 8
+    assert prefetch.logit_reports[1][1] is out
+    assert prefetch.done_layers == [7]
+
+
+def test_nllb_validate_predictor_path_accepts_global_decoder_v2(tmp_path):
+    adapter = NllbMoeAdapter(SimpleNamespace(config=_nllb_config()), "facebook/nllb-moe-54b")
+    _write_global_predictor_dir(tmp_path)
+
+    adapter.validate_predictor_path(str(tmp_path), num_predict_expert_per_layer=2, predictor_type="sep")
+
+
+def test_nllb_validate_predictor_path_rejects_local_v1(tmp_path):
+    adapter = NllbMoeAdapter(SimpleNamespace(config=_nllb_config()), "facebook/nllb-moe-54b")
+    tmp_path.mkdir(exist_ok=True)
+    (tmp_path / "metas.json").write_text(json.dumps({"0": [0, 2], "1": [1, 3]}))
+    (tmp_path / "0-0.pt").write_bytes(b"placeholder")
+
+    with pytest.raises(ValueError, match="global"):
+        adapter.validate_predictor_path(str(tmp_path), num_predict_expert_per_layer=2, predictor_type="sep")

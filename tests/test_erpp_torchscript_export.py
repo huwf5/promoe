@@ -417,6 +417,102 @@ def test_export_sida_noisy_or_torchscript_writes_loadable_artifact(tmp_path: Pat
   assert torch.allclose(empty_scores, empty_expected, atol=1e-5, rtol=1e-5)
 
 
+@pytest.mark.parametrize("model_name", ["sida-gru-sa", "src-simplenn-token"])
+def test_export_token_level_raw_logits_torchscript_matches_eager_blte(
+  tmp_path: Path, model_name: str
+) -> None:
+  model_dir = write_tiny_token_baseline_model_dir(tmp_path, model_name)
+  output_path = model_dir / "raw_blte.ts"
+
+  subprocess.run(
+    [
+      sys.executable,
+      "performance_predictor/encoder/ERPP/implement/model/export_erpp_encoder_torchscript.py",
+      "--model-dir",
+      str(model_dir),
+      "--output",
+      str(output_path),
+      "--example-tokens",
+      "3",
+      "--check-tokens",
+      "2",
+      "--export-mode",
+      "token-logits",
+    ],
+    check=True,
+  )
+
+  loaded = torch.jit.load(str(output_path), map_location="cpu")
+  loaded.eval()
+  eager = build_eager_sida_noisy_or(model_dir)
+  hidden = torch.tensor(
+    [
+      [
+        [0.10, -0.20, 0.30, -0.40],
+        [0.50, 0.60, -0.70, -0.80],
+        [0.90, -1.00, 1.10, -1.20],
+      ]
+    ],
+    dtype=torch.float32,
+  )
+
+  with torch.no_grad():
+    eager_logits = eager.token_model(hidden)
+    loaded_logits = loaded(hidden)
+
+  assert tuple(loaded_logits.shape) == (1, 2, 3, 5)
+  assert torch.allclose(loaded_logits, eager_logits, atol=1e-5, rtol=1e-5)
+
+
+@pytest.mark.parametrize("model_name", ["sida-gru-sa", "src-simplenn-token"])
+def test_export_token_level_no_mask_noisy_or_torchscript_matches_all_valid_tokens(
+  tmp_path: Path, model_name: str
+) -> None:
+  model_dir = write_tiny_token_baseline_model_dir(tmp_path, model_name)
+  output_path = model_dir / "no_mask_noisy_or.ts"
+
+  subprocess.run(
+    [
+      sys.executable,
+      "performance_predictor/encoder/ERPP/implement/model/export_erpp_encoder_torchscript.py",
+      "--model-dir",
+      str(model_dir),
+      "--output",
+      str(output_path),
+      "--example-tokens",
+      "3",
+      "--check-tokens",
+      "2",
+      "--export-mode",
+      "noisy-or",
+    ],
+    check=True,
+  )
+
+  loaded = torch.jit.load(str(output_path), map_location="cpu")
+  loaded.eval()
+  eager = build_eager_sida_noisy_or(model_dir)
+  hidden = torch.tensor(
+    [
+      [
+        [0.10, -0.20, 0.30, -0.40],
+        [0.50, 0.60, -0.70, -0.80],
+        [0.90, -1.00, 1.10, -1.20],
+      ]
+    ],
+    dtype=torch.float32,
+  )
+  all_valid = torch.ones(1, 3, dtype=torch.long)
+
+  with torch.no_grad():
+    token_logits = eager.token_model(hidden)
+    loaded_scores = loaded(hidden)
+    expected_scores = explicit_noisy_or(token_logits, all_valid)
+
+  assert tuple(loaded_scores.shape) == (1, 2, 5)
+  assert torch.allclose(loaded_scores, expected_scores, atol=1e-5, rtol=1e-5)
+
+
 def test_merged_router_token_model_matches_original_sida_token_logits(tmp_path: Path) -> None:
   model_dir = write_tiny_sida_model_dir(tmp_path)
   eager = build_eager_sida_noisy_or(model_dir)

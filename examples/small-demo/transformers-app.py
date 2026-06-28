@@ -1,5 +1,6 @@
 import contextlib
 import csv
+import gc
 import os
 from pathlib import Path
 
@@ -29,7 +30,11 @@ from sparse_llm_cache.utils.model_loading import (
 from sparse_llm_cache.utils.runner_util import parse_args
 cache_configs = parse_args()
 gpu_mem_limit_gb = cache_configs.pop('gpu_mem_limit_gb', None)
+generate_do_sample = cache_configs.pop('do_sample')
+generate_num_beams = cache_configs.pop('num_beams')
 for k, v in cache_configs.items(): print(k,v)
+print('do_sample', generate_do_sample)
+print('num_beams', generate_num_beams)
 
 
 @contextlib.contextmanager
@@ -83,9 +88,33 @@ torch_dtype = 'auto'
 if 'GPTQ' in model_id:
   torch_dtype = None
 print("dtype is", torch_dtype)
-tokenizer = AutoTokenizer.from_pretrained(model_load_id, trust_remote_code=True)
+nllb_src_lang = None
+nllb_tgt_lang = None
+nllb_forced_bos_token_id = None
+tokenizer_kwargs = {"trust_remote_code": True}
+if is_nllb_moe_model_id(model_id):
+  nllb_src_lang = os.environ.get("SRC_LANG", "eng_Latn")
+  nllb_tgt_lang = os.environ.get("TGT_LANG", "zho_Hans")
+  tokenizer_kwargs["src_lang"] = nllb_src_lang
+tokenizer = AutoTokenizer.from_pretrained(model_load_id, **tokenizer_kwargs)
 if tokenizer.pad_token is None:
   tokenizer.pad_token = tokenizer.eos_token
+if is_nllb_moe_model_id(model_id):
+  if hasattr(tokenizer, "lang_code_to_id"):
+    nllb_forced_bos_token_id = tokenizer.lang_code_to_id.get(nllb_tgt_lang)
+  else:
+    nllb_forced_bos_token_id = tokenizer.convert_tokens_to_ids(nllb_tgt_lang)
+  if nllb_forced_bos_token_id is None or nllb_forced_bos_token_id == tokenizer.unk_token_id:
+    raise ValueError(
+      f"TGT_LANG={nllb_tgt_lang!r} is not a valid NLLB language code; "
+      f"set TGT_LANG to a valid NLLB language code"
+    )
+  print(
+    f"nllb language config: src_lang={nllb_src_lang} "
+    f"tgt_lang={nllb_tgt_lang} "
+    f"forced_bos_token_id={nllb_forced_bos_token_id}",
+    flush=True,
+  )
 with _nvtx_range("promoe/model_load"):
   model = model_cls.from_pretrained(
     model_load_id,
@@ -293,8 +322,8 @@ class _ForwardEndCollector:
   def _post_hook(self, module, args, kwargs, output):
     if not self._active:
       return
-    self._ends.append(self._sync_time())
-
+    now = self._sync_time()
+    self._ends.append(now)
   def attach(self):
     if self._handles:
       return
@@ -371,8 +400,14 @@ def gen_batch(text_list, do_print=False, max_new_tokens=100, batch_idx=None, sam
     generate_fn = model._sparse_cache_old_generate
   _explicit_timing.begin_generate()
   try:
+    generate_kwargs = {
+      "do_sample": generate_do_sample,
+      "num_beams": generate_num_beams,
+    }
+    if nllb_forced_bos_token_id is not None:
+      generate_kwargs["forced_bos_token_id"] = nllb_forced_bos_token_id
     with _nvtx_range("promoe/gen/generate_forward_loop"):
-      outputs = generate_fn(**inputs, max_new_tokens=max_new_tokens)
+      outputs = generate_fn(**inputs, max_new_tokens=max_new_tokens, **generate_kwargs)
   finally:
     _explicit_timing.end_generate()
   if getattr(model.config, "is_encoder_decoder", False):
@@ -380,6 +415,10 @@ def gen_batch(text_list, do_print=False, max_new_tokens=100, batch_idx=None, sam
   else:
     generated_tokens = outputs[:, input_len:]
   output_len = generated_tokens.shape[1]
+  generated_tokens_cpu = generated_tokens.detach().cpu()
+  del outputs, generated_tokens, inputs
+  if torch.cuda.is_available():
+    torch.cuda.empty_cache()
   ttft_s, tpot_excl_s = _explicit_timing.compute(output_len)
   _explicit_agg.add(
     ttft_s,
@@ -403,7 +442,8 @@ def gen_batch(text_list, do_print=False, max_new_tokens=100, batch_idx=None, sam
       f"(gen_forward_steps:{n_steps} new_tokens:{output_len})",
       flush=True,
     )
-  output_str = tokenizer.batch_decode(generated_tokens, skip_special_tokens=True)
+  output_str = tokenizer.batch_decode(generated_tokens_cpu, skip_special_tokens=True)
+  del generated_tokens_cpu
   if do_print:
     print(text_list, output_str, flush=True)
   return input_len, output_len
@@ -482,6 +522,21 @@ with _nvtx_range("promoe/eval_all_batches"):
       )
 eval_time = time.time() - eval_time_start
 
+def _release_model_before_summary():
+  global model
+  if os.environ.get("PROMOE_RELEASE_MODEL_BEFORE_SUMMARY", "1") in ("", "0", "false", "False"):
+    return
+  print("releasing model before summary...", flush=True)
+  _explicit_timing.remove()
+  _explicit_timing._root = None
+  del model
+  gc.collect()
+  if torch.cuda.is_available():
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize()
+  print("releasing model before summary...done", flush=True)
+
+_release_model_before_summary()
 maybe_log_time_profiler(time_profiler)
 _explicit_agg.report()
 _explicit_agg.write_samples_csv()

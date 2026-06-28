@@ -1,6 +1,7 @@
 #pragma once
 #include "utils.hpp"
 #include "model_loader.hpp"
+#include <unordered_set>
 
 class CacheMngr;
 enum CacheRequestType {
@@ -29,6 +30,11 @@ class CachePolicy {
   virtual void access_on_miss(ExpertHandler*) {}
   virtual void access_on_miss(ExpertHandler* e, bool is_precise) { return access_on_miss(e); }
   virtual void mark_reclaimable(ExpertHandler*) {}
+  virtual void mark_demand_protected(ExpertHandler*) {}
+  virtual void clear_demand_protected(ExpertHandler*) {}
+  virtual void clear_demand_protected_for_layer(int) {}
+  virtual void clear_all_demand_protected() {}
+  virtual bool is_demand_protected(ExpertHandler*) const { return false; }
   virtual bool has_reclaimable_encoder() const { return false; }
   virtual bool reset_for_cache_reset() { return false; }
   virtual void update_all_priority() {}
@@ -51,6 +57,7 @@ class CachePolicyLRU : public CachePolicy {
   std::vector<LL::Node*> linked_list_node_free_buffer;
   LL linked_list;
   std::unordered_map<ExpertHandler*, LL::Node*> map;
+  std::unordered_set<ExpertHandler*> demand_protected_experts;
  public:
   using CachePolicy::CachePolicy;
   ~CachePolicyLRU() {
@@ -59,16 +66,15 @@ class CachePolicyLRU : public CachePolicy {
       linked_list_node_free_buffer.pop_back();
     }
   }
-  ExpertHandler *select_for_evict(ExpertHandler *) override {
-    return linked_list.front()->data;
-  }
-  void evict(ExpertHandler *e) override {
-    auto n = linked_list.remove(map[e]);
-    linked_list_node_free_buffer.push_back(n);
-    map.erase(e);
-  }
+  ExpertHandler *select_for_evict(ExpertHandler *) override;
+  void evict(ExpertHandler *e) override;
   void access_on_hit(ExpertHandler *e) override;
   void access_on_miss(ExpertHandler *e) override;
+  void mark_demand_protected(ExpertHandler* expert) override;
+  void clear_demand_protected(ExpertHandler* expert) override;
+  void clear_demand_protected_for_layer(int layer_idx) override;
+  void clear_all_demand_protected() override;
+  bool is_demand_protected(ExpertHandler* expert) const override;
 };
 class CachePolicyStatic : public CachePolicy {
   using LL = DoubleLinkedList<ExpertHandler*>;
@@ -250,6 +256,8 @@ class CachePolicySchedulerAware : public CachePolicy {
   std::unordered_map<ExpertHandler*, LL::Node*> encoder_map;
   std::unordered_map<ExpertHandler*, LL::Node*> decoder_map;
   std::unordered_map<ExpertHandler*, LL::Node*> reclaimable_map;
+  LL demand_protected_lru;
+  std::unordered_map<ExpertHandler*, LL::Node*> demand_protected_map;
 
   LL::Node* new_node(ExpertHandler* expert);
   void recycle_node(LL::Node* node);
@@ -264,6 +272,11 @@ class CachePolicySchedulerAware : public CachePolicy {
   void access_on_hit(ExpertHandler* expert) override;
   void access_on_miss(ExpertHandler* expert) override;
   void mark_reclaimable(ExpertHandler* expert) override;
+  void mark_demand_protected(ExpertHandler* expert) override;
+  void clear_demand_protected(ExpertHandler* expert) override;
+  void clear_demand_protected_for_layer(int layer_idx) override;
+  void clear_all_demand_protected() override;
+  bool is_demand_protected(ExpertHandler* expert) const override;
   bool has_reclaimable_encoder() const override;
   bool reset_for_cache_reset() override;
   std::string toString() override;
@@ -366,6 +379,12 @@ class CacheMngr {
   void mark_layer_reclaimable_except(int layer_idx, const std::unordered_set<int>& needed_eids);
   void mark_layer_reclaimable_except(int layer_idx, const std::vector<uint8_t>& needed_mask);
   bool has_reclaimable_encoder() const;
+  void mark_demand_protected(ExpertHandler* expert);
+  void clear_demand_protected(ExpertHandler* expert);
+  void clear_demand_protected(int layer_idx, int expert_idx);
+  void clear_demand_protected_for_layer(int layer_idx);
+  void clear_all_demand_protected();
+  bool is_demand_protected(ExpertHandler* expert) const;
   bool has_unused_slot_for(ExpertHandler* expert) const;
   int encoder_layer_cache_occupancy(int layer_idx) const;
 
