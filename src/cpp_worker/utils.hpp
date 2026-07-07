@@ -161,6 +161,7 @@ class ModuleMeta {
   std::string initial_layer_budgets = "";
   std::string initial_expert_plan = "";
   bool enable_decoder_warmup_overlap = false;
+  bool enable_encoder_reclaim = true;
   std::string decoder_warmup_expert_plan = "";
   bool enable_erpp_encoder_prefetch = false;
   std::string erpp_encoder_model_path = "";

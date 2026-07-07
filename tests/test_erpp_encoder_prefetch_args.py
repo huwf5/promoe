@@ -112,6 +112,13 @@ def test_erpp_encoder_jit_refill_budget_floor_mode_arg_parse():
   assert args.erpp_encoder_jit_refill_floor_mode == "budget"
 
 
+def test_enable_encoder_reclaim_arg_parse():
+  parser = prepare_argparser()
+  args = parser.parse_args(["--enable_encoder_reclaim", "false"])
+
+  assert args.enable_encoder_reclaim is False
+
+
 def test_erpp_prefetch_args_parse_into_module_meta():
   meta = cpp_worker.ModuleMeta(12, 128)
   meta.init_param_list([])
@@ -135,6 +142,35 @@ def test_erpp_prefetch_args_parse_into_module_meta():
   assert meta.erpp_encoder_model_path == "/tmp/erpp.ts"
   assert meta.erpp_encoder_budgets == "70,49,56,55,55,51"
   assert meta.erpp_encoder_layers == "-1,-2"
+
+
+def test_enable_encoder_reclaim_parses_into_module_meta_and_defaults_true():
+  default_meta = cpp_worker.ModuleMeta(12, 128)
+  default_meta.init_param_list([])
+  default_meta.init_from_map(
+    {
+      "model_arch_string": "google/switch-base-128",
+      "num_expert_per_token": "1",
+      "num_encoder_moe_layer": "6",
+      "num_decoder_moe_layer": "6",
+    }
+  )
+  default_meta.handle_uninited_configs()
+  assert default_meta.enable_encoder_reclaim is True
+
+  disabled_meta = cpp_worker.ModuleMeta(12, 128)
+  disabled_meta.init_param_list([])
+  disabled_meta.init_from_map(
+    {
+      "model_arch_string": "google/switch-base-128",
+      "num_expert_per_token": "1",
+      "num_encoder_moe_layer": "6",
+      "num_decoder_moe_layer": "6",
+      "enable_encoder_reclaim": "false",
+    }
+  )
+  disabled_meta.handle_uninited_configs()
+  assert disabled_meta.enable_encoder_reclaim is False
 
 
 def test_erpp_encoder_dynamic_noisy_or_budget_arg_passes_to_module_meta():

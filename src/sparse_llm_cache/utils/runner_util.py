@@ -50,6 +50,7 @@ def prepare_argparser(parser = None):
   parser.add_argument("--initial_layer_budgets",          type=str) # manual only
   parser.add_argument("--initial_hot_expert_file",        type=str) # hot_expert/hot_encoder_coverage/hot_encoder_balanced_coverage only
   parser.add_argument("--enable_decoder_warmup_overlap",  action=CustomBooleanAction)
+  parser.add_argument("--enable_encoder_reclaim", action=CustomBooleanAction)
 
   parser.add_argument("--enable_erpp_encoder_prefetch", action=CustomBooleanAction)
   parser.add_argument("--erpp_encoder_model_path")

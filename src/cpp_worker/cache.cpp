@@ -14,10 +14,20 @@ std::vector<std::shared_ptr<CachePolicy>>& retired_scheduler_aware_policies() {
   return *policies;
 }
 
-bool is_reclaimable_only_request(CacheRequestType request_type) {
+bool is_turnover_prefetch_request(CacheRequestType request_type) {
   return request_type == kCacheRequestEncoderPredictorPrefetch ||
          request_type == kCacheRequestEncoderJitRefill ||
          request_type == kCacheRequestDecoderWarmupPrefetch;
+}
+
+bool is_prefetch_request(CacheRequestType request_type) {
+  return is_turnover_prefetch_request(request_type) ||
+         request_type == kCacheRequestDecoderPredictorPrefetch;
+}
+
+bool is_reclaimable_only_request(CacheRequestType request_type, const ModuleMeta* metas) {
+  return metas != nullptr && metas->enable_encoder_reclaim &&
+         is_turnover_prefetch_request(request_type);
 }
 
 bool log_prefetch_decision_enabled() {
@@ -673,7 +683,7 @@ CacheMngr::CacheLineOccupancyWaiter CacheMngr::miss(
   CacheLineOccupancyWaiter lambda_to_wait_expert_occupancy = [](){};
   if (cache_slot->unused_mems.size() > 0 &&
       (request_type == kCacheRequestEncoderJitRefill ||
-       !is_reclaimable_only_request(request_type))) {
+       !is_reclaimable_only_request(request_type, metas.get()))) {
     auto gpu_data = cache_slot->unused_mems.back();
     incoming_e->gpu_data = gpu_data;
     cache_slot->unused_mems.pop_back();
@@ -690,8 +700,9 @@ CacheMngr::CacheLineOccupancyWaiter CacheMngr::miss(
         }
         return [](){};
       }
-      CHECK(is_reclaimable_only_request(request_type))
-          << "only reclaimable-only requests may skip eviction";
+      CHECK(is_reclaimable_only_request(request_type, metas.get()) ||
+            (!metas->enable_encoder_reclaim && is_prefetch_request(request_type)))
+          << "only reclaimable-only or no-reclaim prefetch requests may skip eviction";
       if (log_prefetch_decision_enabled()) {
         LOG(INFO) << "cache_miss: reclaimable-only request has no victim"
                   << " request_type=" << request_type
@@ -1033,10 +1044,16 @@ ExpertHandler* CachePolicySchedulerAware::select_for_evict(ExpertHandler* incomi
 ExpertHandler* CachePolicySchedulerAware::select_for_evict(
     ExpertHandler* incoming,
     CacheRequestType request_type) {
+  if (!cache->metas->enable_encoder_reclaim) {
+    if (auto victim = first_loaded_candidate(global_map, global_lru)) {
+      return victim;
+    }
+    return nullptr;
+  }
   if (auto victim = first_loaded_candidate(reclaimable_map, reclaimable_encoder_lru)) {
     return victim;
   }
-  if (is_reclaimable_only_request(request_type)) {
+  if (is_reclaimable_only_request(request_type, cache->metas.get())) {
     return nullptr;
   }
   if (auto victim = first_loaded_candidate(encoder_map, encoder_lru)) {

@@ -128,7 +128,7 @@ def test_our_run_all_default_sweep_uses_all_explicit_gpu_profiles_without_defaul
   model_line = next(line for line in text.splitlines() if line.startswith("MODELS="))
 
   assert ":-default" not in gpu_line
-  for profile in ("gpu4gb", "gpu8gb", "gpu12gb", "gpu16gb", "gpu24gb", "gpu40gb", "gpu48gb"):
+  for profile in ("gpu4gb", "gpu8gb", "gpu12gb", "gpu16gb", "gpu24gb", "gpu32gb", "gpu40gb", "gpu48gb"):
     assert profile in gpu_line
   for model in ("switch-base-128", "switch-base-256", "switch-large-128", "nllb"):
     assert model in model_line
@@ -312,10 +312,11 @@ def test_scheduler_aware_encoder_prefetch_is_reclaimable_only():
   )
   compact = _compact(body)
 
-  assert "is_reclaimable_only_request(request_type)" in body
+  assert "cache->metas->enable_encoder_reclaim" in body
+  assert "is_reclaimable_only_request(request_type" in body
   assert "return nullptr" in body
   reclaimable_idx = compact.index("first_loaded_candidate(reclaimable_map, reclaimable_encoder_lru)")
-  helper_idx = compact.index("is_reclaimable_only_request(request_type)")
+  helper_idx = compact.index("is_reclaimable_only_request(request_type, cache->metas.get())")
   encoder_fallback_idx = compact.index("first_loaded_candidate(encoder_map, encoder_lru)")
   assert reclaimable_idx < helper_idx
   assert helper_idx < encoder_fallback_idx
@@ -378,7 +379,7 @@ def test_cache_miss_skips_encoder_prefetch_without_reclaimable_victim():
   end = cpp.index("void CacheMngr::mark_reclaimable", start)
   body = cpp[start:end]
 
-  assert "is_reclaimable_only_request(request_type)" in body
+  assert "is_reclaimable_only_request(request_type, metas.get())" in body
   assert "may skip eviction" in body
 
 def test_prefetch_layer_task_carries_request_type():
@@ -666,7 +667,7 @@ def test_erpp_encoder_prefetch_does_not_use_unused_cache_slots():
   end = cpp.index("void CacheMngr::mark_reclaimable", start)
   body = cpp[start:end]
 
-  assert "!is_reclaimable_only_request(request_type)" in body
+  assert "!is_reclaimable_only_request(request_type, metas.get())" in body
 
 
 def test_validation_script_passes_erpp_encoder_layers():

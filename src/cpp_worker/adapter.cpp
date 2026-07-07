@@ -41,6 +41,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     .def_readwrite("initial_layer_budgets",        &ModuleMeta::initial_layer_budgets)
     .def_readwrite("initial_expert_plan",          &ModuleMeta::initial_expert_plan)
     .def_readwrite("enable_decoder_warmup_overlap", &ModuleMeta::enable_decoder_warmup_overlap)
+    .def_readwrite("enable_encoder_reclaim",       &ModuleMeta::enable_encoder_reclaim)
     .def_readwrite("decoder_warmup_expert_plan",   &ModuleMeta::decoder_warmup_expert_plan)
     .def_readwrite("enable_erpp_encoder_prefetch", &ModuleMeta::enable_erpp_encoder_prefetch)
     .def_readwrite("erpp_encoder_model_path",      &ModuleMeta::erpp_encoder_model_path)

@@ -374,6 +374,9 @@ void FetchScheduleWorker::drain_cache_policy_updates(int max_updates) {
         cache->clear_demand_protected(layer_idx, expert_idx);
       }
     }
+    if (!metas->enable_encoder_reclaim) {
+      continue;
+    }
     switch (update.mode) {
       case PendingCachePolicyUpdate::kSomeExperts: {
         for (int expert_idx = 0; expert_idx < metas->num_expert; expert_idx++) {
@@ -415,6 +418,9 @@ bool FetchScheduleWorker::encoder_jit_can_dispatch(const CopyTask& task) const {
     return true;
   }
   if (task.expert->gpu_data != nullptr || cache->has_unused_slot_for(task.expert)) {
+    return true;
+  }
+  if (!metas->enable_encoder_reclaim) {
     return true;
   }
   return cache->has_reclaimable_encoder();
@@ -1376,6 +1382,9 @@ bool FetchScheduleWorker::requires_encoder_phase(PrefetchClass cls) const {
 }
 
 bool FetchScheduleWorker::requires_reclaimable_encoder(PrefetchClass cls) const {
+  if (!metas->enable_encoder_reclaim) {
+    return false;
+  }
   return cls == PrefetchClass::kEncoderPredictor || cls == PrefetchClass::kDecoderWarmup;
 }
 
@@ -1615,7 +1624,8 @@ bool FetchScheduleWorker::pop_next_prefetch_for_class(PrefetchClass cls, CopyTas
           }
           continue;
         }
-        if (candidate.request_type == kCacheRequestEncoderPredictorPrefetch &&
+        if (metas->enable_encoder_reclaim &&
+            candidate.request_type == kCacheRequestEncoderPredictorPrefetch &&
             !cache->has_reclaimable_encoder()) {
           legacy_waiting_for_reclaimable = true;
           queue.push(candidate);
@@ -2180,7 +2190,7 @@ void PrefetchMngr::report_one_layer(int layer_id, int64_t* experts, int64_t num_
     LOG(INFO) << "prefetcher: consume prefetch layer progress at layer " << layer_id << " done " << progress_idx;
   }
 
-  if (metas->is_encoder_layer(layer_id)) {
+  if (metas->enable_encoder_reclaim && metas->is_encoder_layer(layer_id)) {
     std::vector<uint8_t> needed_mask(metas->num_expert, 0);
     for (int64_t i = 0; i < num_expert; i++) {
       const int expert_idx = int(experts[i]);
@@ -2198,9 +2208,11 @@ void PrefetchMngr::report_one_layer(int layer_id, int64_t* experts, int64_t num_
 void PrefetchMngr::one_moe_layer_done(int layer_id) {
   TRACE_EVENT_GURAD(kHook, "one_moe_layer_done");
   NVTX_RANGE("hook/one_moe_layer_done L" + std::to_string(layer_id));
-  if (metas->is_encoder_layer(layer_id)) {
+  if (metas->enable_encoder_reclaim && metas->is_encoder_layer(layer_id)) {
     log_encoder_layer_done_stats(layer_id);
     fetch_schedule_thread->enqueue_layer_reclaimable(layer_id);
+  } else if (metas->is_encoder_layer(layer_id)) {
+    log_encoder_layer_done_stats(layer_id);
   }
   if (metas->early_preempt == false) {
     LOG(INFO) << "prefetcher: one moe layer done, add prefetch layer budget : " << layer_id;
@@ -2259,7 +2271,7 @@ void PrefetchMngr::one_expert_done(int layer_id, int expert_id) {
   NVTX_RANGE("hook/one_expert_done L" + std::to_string(layer_id) + " E" + std::to_string(expert_id));
   mark_expert_using(layer_id, expert_id);
   fetch_schedule_thread->enqueue_clear_demand_protection(layer_id, expert_id);
-  if (metas->is_encoder_layer(layer_id)) {
+  if (metas->enable_encoder_reclaim && metas->is_encoder_layer(layer_id)) {
     if (log_prefetch_decision_enabled()) {
       LOG(INFO) << "erpp_encoder_prefetch: encoder expert reclaimable L"
                 << layer_id << " E" << expert_id;
@@ -2931,12 +2943,9 @@ bool FetchScheduleWorker::send_one_job(CopyTask *task) {
         return false;
       }
     }
-    if ((task->request_type == kCacheRequestEncoderPredictorPrefetch ||
-         task->request_type == kCacheRequestEncoderJitRefill ||
-         task->request_type == kCacheRequestDecoderWarmupPrefetch) &&
-        task->expert->gpu_data == nullptr) {
+    if (!task->is_precise && task->expert->gpu_data == nullptr) {
       if (log_prefetch_decision_enabled()) {
-        LOG(INFO) << "prefetch_decision: skip reclaimable-only request without victim "
+        LOG(INFO) << "prefetch_decision: skip prefetch request without victim "
                   << request_label << " L" << task->expert->layer_idx
                   << " E" << task->expert->expert_idx
                   << " P" << task->start_mem_buf_idx << "-" << task->stop_mem_buf_idx

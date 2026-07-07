@@ -765,13 +765,13 @@ def test_precise_demand_without_legal_victim_retries_instead_of_fatal():
     )
     select_compact = _compact(select_body)
 
-    reclaimable_only_pos = select_compact.index("is_reclaimable_only_request(request_type)")
-    encoder_pos = select_compact.index("first_loaded_candidate(encoder_map, encoder_lru)")
-    decoder_pos = select_compact.index("first_loaded_candidate(decoder_map, decoder_lru)")
-    global_pos = select_compact.index("first_loaded_candidate(global_map, global_lru)")
-    demand_pos = select_compact.index("request_type == kCacheRequestDemand")
+    reclaimable_only_pos = select_compact.index("is_reclaimable_only_request(request_type, cache->metas.get())")
+    encoder_pos = select_compact.index("first_loaded_candidate(encoder_map, encoder_lru)", reclaimable_only_pos)
+    decoder_pos = select_compact.index("first_loaded_candidate(decoder_map, decoder_lru)", encoder_pos)
+    global_pos = select_compact.index("first_loaded_candidate(global_map, global_lru)", decoder_pos)
+    demand_pos = select_compact.index("request_type == kCacheRequestDemand", global_pos)
     null_return_pos = select_compact.index("return nullptr", demand_pos)
-    check_pos = select_compact.index("CHECK(false)")
+    check_pos = select_compact.index("CHECK(false)", null_return_pos)
     assert reclaimable_only_pos < encoder_pos < decoder_pos < global_pos < demand_pos < null_return_pos < check_pos
 
     miss_body = _function_body(
@@ -792,8 +792,8 @@ def test_precise_demand_without_legal_victim_retries_instead_of_fatal():
     )
     assert demand_precise_branch
     assert "demand miss has no legal victim" in miss_body
-    assert "CHECK(is_reclaimable_only_request(request_type))" in miss_body
-    assert demand_precise_branch.start() < compact.index("CHECK(is_reclaimable_only_request(request_type))")
+    assert "CHECK(is_reclaimable_only_request(request_type, metas.get())" in miss_body
+    assert demand_precise_branch.start() < compact.index("CHECK(is_reclaimable_only_request(request_type, metas.get())")
 
     prefetcher_cpp = _text(PREFETCHER_CPP)
     send_body = _function_body(prefetcher_cpp, "bool FetchScheduleWorker::send_one_job(CopyTask *task)")
@@ -810,4 +810,75 @@ def test_precise_demand_without_legal_victim_retries_instead_of_fatal():
         send_compact,
     )
     assert send_compact.index("requeue_precise_task_front(task)") < send_compact.index("task->expert->expert_status.transfer(kIdle, kFetching)")
+
+def test_enable_encoder_reclaim_gates_encoder_reclaim_updates():
+    cpp = _text(PREFETCHER_CPP)
+
+    report_body = _function_body(cpp, "void PrefetchMngr::report_one_layer(int layer_id, int64_t* experts, int64_t num_expert)")
+    assert "metas->enable_encoder_reclaim" in report_body
+    assert "enqueue_layer_reclaimable_except" in report_body
+    assert report_body.index("metas->enable_encoder_reclaim") < report_body.index("enqueue_layer_reclaimable_except")
+
+    layer_done_body = _function_body(cpp, "void PrefetchMngr::one_moe_layer_done")
+    assert "metas->enable_encoder_reclaim" in layer_done_body
+    assert "enqueue_layer_reclaimable(layer_id)" in layer_done_body
+    assert layer_done_body.index("metas->enable_encoder_reclaim") < layer_done_body.index("enqueue_layer_reclaimable(layer_id)")
+
+    expert_done_body = _function_body(cpp, "void PrefetchMngr::one_expert_done")
+    assert "metas->enable_encoder_reclaim" in expert_done_body
+    assert "enqueue_expert_reclaimable" in expert_done_body
+    assert expert_done_body.index("metas->enable_encoder_reclaim") < expert_done_body.index("enqueue_expert_reclaimable")
+
+    drain_body = _function_body(cpp, "void FetchScheduleWorker::drain_cache_policy_updates")
+    assert "if (!metas->enable_encoder_reclaim)" in drain_body
+    assert "cache->mark_reclaimable" in drain_body
+
+
+def test_disable_encoder_reclaim_disables_reclaimable_scheduler_gates():
+    cpp = _text(PREFETCHER_CPP)
+
+    requires_body = _function_body(cpp, "bool FetchScheduleWorker::requires_reclaimable_encoder")
+    assert "!metas->enable_encoder_reclaim" in requires_body
+    assert "return false" in requires_body
+    assert requires_body.index("!metas->enable_encoder_reclaim") < requires_body.index("cls == PrefetchClass::kEncoderPredictor")
+
+    jit_body = _function_body(cpp, "bool FetchScheduleWorker::encoder_jit_can_dispatch")
+    assert "!metas->enable_encoder_reclaim" in jit_body
+    assert "return true" in jit_body
+    assert jit_body.index("!metas->enable_encoder_reclaim") < jit_body.index("cache->has_reclaimable_encoder()")
+
+
+def test_disable_encoder_reclaim_uses_global_lru_without_stage_fallback():
+    cpp = _text(CACHE_CPP)
+    body = _function_body(
+        cpp,
+        "ExpertHandler* CachePolicySchedulerAware::select_for_evict(\n"
+        "    ExpertHandler* incoming,\n"
+        "    CacheRequestType request_type)",
+    )
+    compact = _compact(body)
+
+    assert "!cache->metas->enable_encoder_reclaim" in body
+    no_reclaim_pos = compact.index("!cache->metas->enable_encoder_reclaim")
+    global_pos = compact.index("first_loaded_candidate(global_map, global_lru)", no_reclaim_pos)
+    no_reclaim_null_pos = compact.index("return nullptr", global_pos)
+    encoder_pos = compact.index("first_loaded_candidate(encoder_map, encoder_lru)")
+    decoder_pos = compact.index("first_loaded_candidate(decoder_map, decoder_lru)")
+    assert no_reclaim_pos < global_pos < no_reclaim_null_pos < encoder_pos < decoder_pos
+
+def test_non_precise_prefetch_without_victim_returns_before_fetching():
+    cpp = _text(PREFETCHER_CPP)
+    body = _function_body(cpp, "bool FetchScheduleWorker::send_one_job(CopyTask *task)")
+    compact = _compact(body)
+
+    match = re.search(
+        r"if\s*\(\s*!task->is_precise\s*&&\s*task->expert->gpu_data\s*==\s*nullptr\s*\)",
+        body,
+    )
+    assert match
+    no_victim_pos = match.start()
+    return_pos = body.index("return false", no_victim_pos)
+    fetching_pos = body.index("task->expert->expert_status.transfer(kIdle, kFetching)")
+    assert no_victim_pos < return_pos < fetching_pos
+    assert "skip prefetch request without victim" in body
 

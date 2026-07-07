@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import pytest
 
 from sparse_llm_cache.model_adapters.switch import SwitchAdapter
+from sparse_llm_cache.model_adapters.nllb_moe import NllbMoeAdapter
 from sparse_llm_cache.utils import inject_model, round_like_cpp
 from sparse_llm_cache.utils.hot_experts import (
   build_decoder_warmup_overlap_plan,
@@ -12,6 +13,8 @@ from sparse_llm_cache.utils.hot_experts import (
   build_encoder_coverage_initial_plan,
   build_encoder_hot_initial_plan,
   build_encoder_l0_priority_hot_initial_plan,
+  build_encoder_prefix_hot_initial_plan,
+  _encoder_validation_target_needs,
   build_hot_initial_plan,
 )
 from sparse_llm_cache.utils.runner_util import parse_args
@@ -31,6 +34,71 @@ def _switch_config(**overrides):
   }
   values.update(overrides)
   return SimpleNamespace(**values)
+
+
+
+
+def _nllb_config(**overrides):
+  values = {
+    "model_type": "nllb-moe",
+    "encoder_layers": 12,
+    "decoder_layers": 12,
+    "encoder_sparse_step": 2,
+    "decoder_sparse_step": 2,
+    "num_experts": 128,
+  }
+  values.update(overrides)
+  return SimpleNamespace(**values)
+
+
+def _nllb_hot_payload():
+  summary = {}
+  for block_id in [1, 3, 5, 7, 9, 11]:
+    summary[f"encoder.layers.{block_id}.ffn.router"] = {
+      "top_token_counts": [
+        {"eid": eid, "count": 1000 - eid}
+        for eid in range(128)
+      ],
+      "frozen_top_eids": list(range(128)),
+    }
+  return {"expert_usage_summary": summary}
+
+
+def test_encoder_validation_target_needs_include_switch_trace_models():
+  base128 = SwitchAdapter(
+    SimpleNamespace(config=_switch_config(
+      num_experts=128,
+      num_sparse_encoder_layers=6,
+      num_sparse_decoder_layers=6,
+      num_layers=12,
+      num_decoder_layers=12,
+    )),
+    "google/switch-base-128",
+  )
+  base256 = SwitchAdapter(
+    SimpleNamespace(config=_switch_config(
+      num_experts=256,
+      num_sparse_encoder_layers=6,
+      num_sparse_decoder_layers=6,
+      num_layers=12,
+      num_decoder_layers=12,
+    )),
+    "google/switch-base-256",
+  )
+  large128 = SwitchAdapter(
+    SimpleNamespace(config=_switch_config(
+      num_experts=128,
+      num_sparse_encoder_layers=12,
+      num_sparse_decoder_layers=12,
+      num_layers=24,
+      num_decoder_layers=24,
+    )),
+    "google/switch-large-128",
+  )
+
+  assert _encoder_validation_target_needs(base128, 0.6) == [43, 30, 34, 33, 33, 31]
+  assert _encoder_validation_target_needs(base256, 0.6) == [54, 54, 54, 51, 49, 43]
+  assert _encoder_validation_target_needs(large128, 0.6) == [47, 47, 48, 46, 46, 43, 42, 38, 34, 33, 33, 34]
 
 
 def test_build_encoder_hot_initial_plan_allocates_by_token_count_and_uses_hot_eids(tmp_path):
@@ -81,6 +149,74 @@ def test_build_encoder_hot_initial_plan_falls_back_to_frozen_order_without_count
   plan = build_encoder_hot_initial_plan(path, adapter, total_slots=3)
 
   assert plan == [(1, 5), (0, 7), (0, 6)]
+
+
+def test_build_encoder_prefix_hot_initial_plan_uses_static_nllb_validation_targets(tmp_path):
+  path = tmp_path / "hot.json"
+  path.write_text(json.dumps(_nllb_hot_payload()))
+  adapter = NllbMoeAdapter(
+    SimpleNamespace(config=_nllb_config()),
+    "/mnt/huwf5/promoe/experiment/models/facebook/nllb-moe-54b",
+  )
+
+  plan = build_encoder_prefix_hot_initial_plan(path, adapter, total_slots=77)
+
+  counts = {}
+  for layer_idx, _eid in plan:
+    counts[layer_idx] = counts.get(layer_idx, 0) + 1
+  assert counts == {0: 61, 1: 16}
+
+
+def test_build_encoder_prefix_hot_initial_plan_spills_extra_slots_evenly_to_decoder(tmp_path):
+  payload = {
+    "expert_usage_summary": {
+      "encoder.block.1.layer.1.mlp.router.classifier": {
+        "top_token_counts": [
+          {"eid": 0, "count": 100},
+          {"eid": 1, "count": 90},
+          {"eid": 2, "count": 80},
+          {"eid": 3, "count": 70},
+        ],
+      },
+      "encoder.block.3.layer.1.mlp.router.classifier": {
+        "top_token_counts": [
+          {"eid": 0, "count": 100},
+          {"eid": 1, "count": 90},
+          {"eid": 2, "count": 80},
+          {"eid": 3, "count": 70},
+        ],
+      },
+      "decoder.block.1.layer.2.mlp.router.classifier": {
+        "top_token_counts": [
+          {"eid": 2, "count": 100},
+          {"eid": 3, "count": 90},
+        ],
+      },
+      "decoder.block.3.layer.2.mlp.router.classifier": {
+        "top_token_counts": [
+          {"eid": 1, "count": 100},
+          {"eid": 0, "count": 90},
+        ],
+      },
+    },
+  }
+  path = tmp_path / "hot.json"
+  path.write_text(json.dumps(payload))
+  adapter = SwitchAdapter(SimpleNamespace(config=_switch_config(num_experts=4)), "google/switch-base-128")
+
+  plan = build_encoder_prefix_hot_initial_plan(
+    path,
+    adapter,
+    total_slots=12,
+    allow_sequential_fallback=True,
+  )
+
+  assert plan == [
+    (2, 2), (2, 3),
+    (3, 1), (3, 0),
+    (1, 0), (1, 1), (1, 2), (1, 3),
+    (0, 0), (0, 1), (0, 2), (0, 3),
+  ]
 
 
 def test_build_encoder_hot_initial_plan_rejects_short_hot_snapshot_by_default(tmp_path):
@@ -629,6 +765,16 @@ def test_runner_util_parses_hot_encoder_l0_priority_policy():
   assert parsed["initial_cache_policy"] == "hot_encoder_l0_priority_coverage"
   assert parsed["initial_hot_expert_file"] == "/tmp/hot.json"
 
+def test_runner_util_parses_hot_encoder_prefix_policy():
+  parsed = parse_args([
+    "--initial_cache_policy", "hot_encoder_prefix_coverage",
+    "--initial_hot_expert_file", "/tmp/hot.json",
+  ])
+
+  assert parsed["initial_cache_policy"] == "hot_encoder_prefix_coverage"
+  assert parsed["initial_hot_expert_file"] == "/tmp/hot.json"
+
+
 def test_runner_util_parses_decoder_warmup_overlap_and_scheduler_aware_policy():
   parsed = parse_args([
     "--enable_decoder_warmup_overlap", "True",
@@ -645,3 +791,12 @@ def test_inject_model_exposes_initial_hot_expert_file_parameter():
 
 def test_inject_model_exposes_decoder_warmup_overlap_parameter():
   assert "enable_decoder_warmup_overlap" in inspect.signature(inject_model).parameters
+
+
+def test_inject_model_exposes_and_passes_encoder_reclaim_parameter():
+  signature = inspect.signature(inject_model)
+  assert signature.parameters["enable_encoder_reclaim"].default is True
+
+  source = inspect.getsource(inject_model)
+  assert "'enable_encoder_reclaim'" in source
+  assert "str(enable_encoder_reclaim)" in source

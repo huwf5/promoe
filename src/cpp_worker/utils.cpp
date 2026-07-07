@@ -137,6 +137,7 @@ void ModuleMeta::init_from_map(std::unordered_map<std::string, std::string> conf
   initial_layer_budgets = optional_str("initial_layer_budgets", initial_layer_budgets);
   initial_expert_plan = optional_str("initial_expert_plan", initial_expert_plan);
   enable_decoder_warmup_overlap = optional_bool("enable_decoder_warmup_overlap", enable_decoder_warmup_overlap);
+  enable_encoder_reclaim = optional_bool("enable_encoder_reclaim", enable_encoder_reclaim);
   decoder_warmup_expert_plan = optional_str("decoder_warmup_expert_plan", decoder_warmup_expert_plan);
   enable_erpp_encoder_prefetch = optional_bool("enable_erpp_encoder_prefetch", enable_erpp_encoder_prefetch);
   erpp_encoder_model_path = optional_str("erpp_encoder_model_path", erpp_encoder_model_path);
@@ -233,6 +234,7 @@ void ModuleMeta::log_configs() {
   LOG_CONFIG(initial_layer_budgets);
   LOG_CONFIG(initial_expert_plan);
   LOG_CONFIG_BOOL(enable_decoder_warmup_overlap);
+  LOG_CONFIG_BOOL(enable_encoder_reclaim);
   LOG_CONFIG(decoder_warmup_expert_plan);
   LOG_CONFIG_BOOL(enable_erpp_encoder_prefetch);
   LOG_CONFIG(erpp_encoder_model_path);

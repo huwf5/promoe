@@ -148,6 +148,7 @@ def test_run_all_dry_run_uses_default_profile_for_switch_base_128(tmp_path: Path
       "RUN_ROOT": str(run_root),
       "RUN_ID": "20260616_120000",
       "MODELS": "switch-base-128",
+      "GPU_CONFIGS": "default",
       "PYTHON_BIN": "/usr/bin/python3",
     }
   )
@@ -206,12 +207,19 @@ def test_run_all_dry_run_applies_known_switch_base_128_gpu_cache_rates(tmp_path:
   assert "GPU_MEM_GB=4\n" in gpu4 and "CACHE_RATE=0.125\n" in gpu4
   assert "GPU_MEM_GB=8\n" in gpu8 and "CACHE_RATE=0.25\n" in gpu8
   assert "GPU_MEM_GB=12\n" in gpu12 and "CACHE_RATE=0.375\n" in gpu12
-  assert "GPU_MEM_GB=24\n" in gpu24 and "CACHE_RATE=0.375\n" in gpu24
-  assert "GPU_MEM_GB=48\n" in gpu48 and "CACHE_RATE=0.375\n" in gpu48
+  assert "GPU_MEM_GB=24\n" in gpu24 and "CACHE_RATE=0.8\n" in gpu24
+  assert "GPU_MEM_GB=48\n" in gpu48 and "CACHE_RATE=1.0\n" in gpu48
 
 
 
-def test_run_all_dry_run_errors_for_unmapped_model_gpu_pair(tmp_path: Path):
+def test_run_all_keeps_unmapped_gpu_model_pairs_fatal():
+  root = Path(__file__).resolve().parents[1]
+  text = (root / "experiment/baseline/LSP/promoe/scripts/run_all.sh").read_text()
+
+  assert 'error: no CACHE_RATE mapping for GPU/model pair: ${GPU_PROFILE}/${MODEL_ALIAS}' in text
+
+
+def test_our_run_all_dry_run_applies_gpu32gb_cache_rates(tmp_path: Path):
   root = Path(__file__).resolve().parents[1]
   run_root = tmp_path / "runs"
   env = os.environ.copy()
@@ -219,9 +227,59 @@ def test_run_all_dry_run_errors_for_unmapped_model_gpu_pair(tmp_path: Path):
     {
       "PROMOE_DRY_RUN": "1",
       "RUN_ROOT": str(run_root),
-      "RUN_ID": "20260616_120000",
-      "GPU_CONFIGS": "gpu4gb",
-      "MODELS": "switch-base-256",
+      "RUN_ID": "20260704_120000",
+      "GPU_CONFIGS": "gpu32gb",
+      "GPU32GB_GPU_ID": "3",
+      "MODELS": "switch-base-128 switch-base-256 switch-large-128 nllb",
+      "PYTHON_BIN": "/usr/bin/python3",
+    }
+  )
+
+  script = root / "experiment/baseline/LSP/our/run_all.sh"
+  result = subprocess.run(
+    ["bash", str(script)],
+    cwd=root,
+    env=env,
+    text=True,
+    capture_output=True,
+  )
+
+  assert result.returncode == 0, result.stderr
+  expected = {
+    "google_switch-base-128": "1.0",
+    "google_switch-base-256": "0.55",
+    "google_switch-large-128": "0.625",
+    "facebook_nllb-moe-54b": "0.10",
+  }
+  for model_key, cache_rate in expected.items():
+    config = (
+      run_root
+      / f"mmlu/professional_law/validation/gpu32gb/{model_key}/20260704_120000/config.env"
+    ).read_text()
+    assert "GPU_PROFILE=gpu32gb\n" in config
+    assert "GPU_ID=3\n" in config
+    assert "GPU_MEM_GB=32\n" in config
+    assert f"CACHE_RATE={cache_rate}\n" in config
+
+
+def test_our_run_all_keeps_unmapped_gpu_model_pairs_fatal():
+  root = Path(__file__).resolve().parents[1]
+  text = (root / "experiment/baseline/LSP/our/run_all.sh").read_text()
+
+  assert '*) echo "error: no CACHE_RATE mapping for GPU/model pair: ${GPU_PROFILE}/${MODEL_ALIAS}" >&2; exit 1 ;;' in text
+
+def test_promoe_run_all_dry_run_applies_gpu32gb_cache_rates(tmp_path: Path):
+  root = Path(__file__).resolve().parents[1]
+  run_root = tmp_path / "runs"
+  env = os.environ.copy()
+  env.update(
+    {
+      "PROMOE_DRY_RUN": "1",
+      "RUN_ROOT": str(run_root),
+      "RUN_ID": "20260704_130000",
+      "GPU_CONFIGS": "gpu32gb",
+      "GPU32GB_GPU_ID": "5",
+      "MODELS": "switch-base-128 switch-base-256 switch-large-128 nllb",
       "PYTHON_BIN": "/usr/bin/python3",
     }
   )
@@ -235,5 +293,53 @@ def test_run_all_dry_run_errors_for_unmapped_model_gpu_pair(tmp_path: Path):
     capture_output=True,
   )
 
-  assert result.returncode != 0
-  assert "no CACHE_RATE mapping for GPU/model pair: gpu4gb/switch-base-256" in result.stderr
+  assert result.returncode == 0, result.stderr
+  expected = {
+    "google_switch-base-128": "1.0",
+    "google_switch-base-256": "0.55",
+    "google_switch-large-128": "0.625",
+    "facebook_nllb-moe-54b": "0.10",
+  }
+  for model_key, cache_rate in expected.items():
+    config = (
+      run_root
+      / f"mmlu/professional_law/validation/gpu32gb/{model_key}/20260704_130000/config.env"
+    ).read_text()
+    assert "GPU_PROFILE=gpu32gb\n" in config
+    assert "GPU_ID=5\n" in config
+    assert "GPU_MEM_GB=32\n" in config
+    assert f"CACHE_RATE={cache_rate}\n" in config
+
+def test_our_run_all_dry_run_passes_encoder_reclaim_flag(tmp_path: Path):
+  root = Path(__file__).resolve().parents[1]
+  run_root = tmp_path / "runs"
+  env = os.environ.copy()
+  env.update(
+    {
+      "PROMOE_DRY_RUN": "1",
+      "RUN_ROOT": str(run_root),
+      "RUN_ID": "20260707_120000",
+      "GPU_CONFIGS": "gpu32gb",
+      "MODELS": "switch-large-128",
+      "PYTHON_BIN": "/usr/bin/python3",
+      "ENABLE_ENCODER_RECLAIM": "False",
+    }
+  )
+
+  script = root / "experiment/baseline/LSP/our/run_all.sh"
+  result = subprocess.run(
+    ["bash", str(script)],
+    cwd=root,
+    env=env,
+    text=True,
+    capture_output=True,
+  )
+
+  assert result.returncode == 0, result.stderr
+  run_dir = run_root / "mmlu/professional_law/validation/gpu32gb/google_switch-large-128/20260707_120000"
+  config = (run_dir / "config.env").read_text()
+  command = (run_dir / "command.txt").read_text()
+
+  assert "ENABLE_ENCODER_RECLAIM=False\n" in config
+  assert "--enable_encoder_reclaim False" in command
+
