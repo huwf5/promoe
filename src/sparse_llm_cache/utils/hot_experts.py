@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 from pathlib import Path
 from typing import Any, Iterable, NamedTuple
@@ -508,6 +509,189 @@ def build_encoder_balanced_hot_initial_plan(
       f"balanced hot initial plan has {len(plan)} entries, expected {total_slots}"
     )
   return _order_initial_plan_for_encoder_lru(plan, adapter)
+
+
+_ENCODER_VALIDATION_ACTIVE_EXPERT_MEAN_BY_MODEL = {
+  "nllb-moe-54b": [
+    100.38235473632812,
+    90.5882339477539,
+    86.25882720947266,
+    79.51764678955078,
+    82.04705810546875,
+    87.82353210449219,
+  ],
+  "switch-base-128": [
+    70.13529205322266,
+    49.6588249206543,
+    55.6588249206543,
+    54.83529281616211,
+    54.63529586791992,
+    50.29411697387695,
+  ],
+  "switch-base-256": [
+    88.65293884277344,
+    88.5882339477539,
+    89.01764678955078,
+    84.64705657958984,
+    80.9058837890625,
+    71.61176300048828,
+  ],
+  "switch-large-128": [
+    77.67058563232422,
+    78.188232421875,
+    78.94117736816406,
+    75.17058563232422,
+    75.21176147460938,
+    71.14117431640625,
+    68.4941177368164,
+    62.01764678955078,
+    55.382354736328125,
+    53.541175842285156,
+    54.22941207885742,
+    56.37647247314453,
+  ],
+}
+
+
+def _encoder_validation_target_needs(adapter, coverage_ratio: float) -> list[int]:
+  num_encoder_layers = int(adapter.num_encoder_sparse_layers)
+  num_experts = int(adapter.num_expert_per_layer)
+  model_id = str(getattr(adapter, "model_id", "")).lower()
+  means = None
+  for key, values in _ENCODER_VALIDATION_ACTIVE_EXPERT_MEAN_BY_MODEL.items():
+    if key in model_id:
+      means = values
+      break
+  if means is None:
+    means = [float(num_experts) for _ in range(num_encoder_layers)]
+  if len(means) < num_encoder_layers:
+    means = list(means) + [float(num_experts) for _ in range(num_encoder_layers - len(means))]
+  targets = []
+  for value in means[:num_encoder_layers]:
+    target = int(math.ceil(float(value) * float(coverage_ratio)))
+    targets.append(min(num_experts, max(0, target)))
+  return targets
+
+
+def _encoder_prefix_coverage_quotas(
+    *,
+    total_slots: int,
+    adapter,
+    coverage_ratio: float,
+) -> list[int]:
+  total_slots = max(0, int(total_slots))
+  num_encoder_layers = int(adapter.num_encoder_sparse_layers)
+  num_experts = int(adapter.num_expert_per_layer)
+  if num_encoder_layers <= 0:
+    raise ValueError("adapter has no encoder sparse layers")
+  encoder_capacity = num_encoder_layers * num_experts
+  total_slots = min(total_slots, encoder_capacity)
+  if coverage_ratio < 0.0 or coverage_ratio > 1.0:
+    raise ValueError(f"coverage_ratio must be in [0, 1], got {coverage_ratio}")
+
+  targets = _encoder_validation_target_needs(adapter, coverage_ratio)
+  quotas = [0 for _ in range(num_encoder_layers)]
+  remaining = total_slots
+  for stage_layer, target in enumerate(targets):
+    if remaining <= 0:
+      break
+    quota = min(int(target), remaining, num_experts)
+    quotas[stage_layer] = quota
+    remaining -= quota
+
+  stage_layer = 0
+  while remaining > 0:
+    if quotas[stage_layer] < num_experts:
+      quotas[stage_layer] += 1
+      remaining -= 1
+    stage_layer = (stage_layer + 1) % num_encoder_layers
+    if all(quota >= num_experts for quota in quotas):
+      break
+
+  if sum(quotas) != total_slots:
+    raise ValueError(
+      f"prefix coverage quotas have {sum(quotas)} slots, expected {total_slots}"
+    )
+  return quotas
+
+
+def build_encoder_prefix_hot_initial_plan(
+    hot_expert_file: str | Path,
+    adapter,
+    *,
+    total_slots: int,
+    coverage_ratio: float = 0.6,
+    allow_sequential_fallback: bool = False,
+) -> list[tuple[int, int]]:
+  """Build an encoder-first plan using validation-derived prefix targets.
+
+  Encoder layers are filled to the prefix-coverage quotas first. If the requested
+  budget exceeds encoder capacity, encoder slots are saturated and the remainder
+  is split evenly across decoder layers.
+  """
+  total_slots = max(0, int(total_slots))
+  if total_slots <= 0:
+    return []
+
+  payload = _read_hot_expert_payload(hot_expert_file)
+  by_layer = _encoder_hot_pairs_by_layer(payload, adapter)
+  if not by_layer:
+    raise ValueError(f"hot expert snapshot has no encoder expert entries: {hot_expert_file}")
+
+  encoder_layers = [
+    adapter.global_layer_id("encoder", stage_layer)
+    for stage_layer in range(int(adapter.num_encoder_sparse_layers))
+  ]
+  encoder_capacity = len(encoder_layers) * int(adapter.num_expert_per_layer)
+  encoder_slots = min(total_slots, encoder_capacity)
+  decoder_slots = total_slots - encoder_slots
+
+  quotas = _encoder_prefix_coverage_quotas(
+    total_slots=encoder_slots,
+    adapter=adapter,
+    coverage_ratio=float(coverage_ratio),
+  )
+
+  plan: list[tuple[int, int]] = []
+  for stage_layer, layer_idx in enumerate(encoder_layers):
+    quota = quotas[stage_layer]
+    selected = _select_hot_prefix_with_fallback(
+      layer_idx=layer_idx,
+      pairs=by_layer.get(layer_idx, []),
+      quota=quota,
+      num_experts=int(adapter.num_expert_per_layer),
+      allow_sequential_fallback=allow_sequential_fallback,
+    )
+    if len(selected) != quota:
+      raise ValueError(
+        f"prefix hot initial plan layer {layer_idx} has {len(selected)} entries, "
+        f"expected quota {quota}; pass allow_sequential_fallback=True"
+      )
+    plan.extend(selected)
+
+  if len(plan) != encoder_slots:
+    raise ValueError(
+      f"prefix hot initial plan has {len(plan)} encoder entries, expected {encoder_slots}; "
+      "reduce cache_rate or pass allow_sequential_fallback=True"
+    )
+
+  if decoder_slots > 0:
+    decoder_by_layer, _decoder_token_totals = _hot_pairs_by_layer(payload, adapter, "decoder")
+    plan.extend(
+      _decoder_even_plan(
+        decoder_by_layer,
+        adapter,
+        total_slots=decoder_slots,
+      )
+    )
+
+  if len(plan) != total_slots:
+    raise ValueError(
+      f"prefix hot initial plan has {len(plan)} entries, expected {total_slots}; "
+      "reduce cache_rate or pass allow_sequential_fallback=True"
+    )
+  return _order_initial_plan_for_encoder_lru(plan, adapter)
+
 
 def _encoder_l0_priority_quotas(
     *,

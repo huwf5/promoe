@@ -200,6 +200,7 @@ def _resolve_initial_cache_inputs(
     "hot_encoder_coverage",
     "hot_encoder_balanced_coverage",
     "hot_encoder_l0_priority_coverage",
+    "hot_encoder_prefix_coverage",
   )
   if initial_cache_policy is None:
     if initial_layer_budgets:
@@ -208,7 +209,7 @@ def _resolve_initial_cache_inputs(
       raise ValueError(
         "initial_hot_expert_file requires initial_cache_policy=hot_expert "
         "or hot_encoder_coverage/hot_encoder_balanced_coverage/"
-        "hot_encoder_l0_priority_coverage"
+        "hot_encoder_l0_priority_coverage/hot_encoder_prefix_coverage"
       )
     return {
       "initial_cache_policy": None,
@@ -444,6 +445,7 @@ def inject_model(
       build_encoder_balanced_hot_initial_plan,
       build_encoder_coverage_initial_plan,
       build_encoder_l0_priority_hot_initial_plan,
+      build_encoder_prefix_hot_initial_plan,
       build_hot_initial_plan,
       format_initial_expert_plan,
     )
@@ -488,6 +490,19 @@ def inject_model(
         "hot_encoder_l0_priority_coverage initial cache: "
         f"encoder_layers={adapter.num_encoder_sparse_layers}, "
         f"l0_target={int(int(num_expert_per_layer) * 0.75)}, "
+        f"total_slots={len(initial_plan)}"
+      )
+    elif requested_initial_cache_policy == "hot_encoder_prefix_coverage":
+      initial_plan = build_encoder_prefix_hot_initial_plan(
+        initial_hot_expert_file,
+        adapter,
+        total_slots=initial_total_slots,
+        allow_sequential_fallback=True,
+      )
+      print(
+        "hot_encoder_prefix_coverage initial cache: "
+        f"encoder_layers={adapter.num_encoder_sparse_layers}, "
+        "coverage_ratio=0.6000, "
         f"total_slots={len(initial_plan)}"
       )
     else:
